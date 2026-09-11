@@ -58,6 +58,8 @@ type TVGoEngine struct {
 
 	weights config.TVWeights
 
+	maxSeasons int
+
 	// knownTitles caches a show's TMDB aliases for the process lifetime, not per
 	// run: aliases change rarely, and refetching ~100 shows every run would cost
 	// ~25s of rate-limited calls. A show met for the first time is always fetched.
@@ -102,6 +104,9 @@ type TVEngineConfig struct {
 	InvalidatePath func(string)
 	Language       config.LanguageConfig
 	Weights        config.TVWeights
+	// MaxSeasons caps how many of the most recent seasons are considered.
+	// <= 0 means every season.
+	MaxSeasons     int
 }
 
 // TV thresholds
@@ -185,6 +190,7 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		reExclLang:       CompileLanguageRegex(ExcludedTitleTerms(cfg.Language.ExcludedFlags), cfg.Language.ExcludedFlags),
 		exclLanguages:    ExcludedLanguageSet(cfg.Language.ExcludedFlags),
 		weights:          cfg.Weights,
+		maxSeasons:       cfg.MaxSeasons,
 		tmdbLangs:        TMDBEpisodeLanguages(cfg.Language.PreferredFlags),
 	}
 
@@ -609,7 +615,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	if numSeasons == 0 {
 		numSeasons = 5
 	}
-	maxSeasons := 2
+	maxSeasons := e.seasonWindow(numSeasons)
 	startSeason := numSeasons - maxSeasons + 1
 	if startSeason < 1 {
 		startSeason = 1
@@ -740,13 +746,23 @@ type TVStream struct {
 	Priority      int
 }
 
+// seasonWindow returns how many trailing seasons to consider. A configured
+// value of 0 or less means the whole show, expressed as numSeasons so the
+// caller's startSeason arithmetic still lands on 1.
+func (e *TVGoEngine) seasonWindow(numSeasons int) int {
+	if e.maxSeasons <= 0 {
+		return numSeasons
+	}
+	return e.maxSeasons
+}
+
 func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, showName string, details *tmdb.TVDetail) []TVStream {
 	numSeasons := details.NumberOfSeasons
 	if numSeasons == 0 {
 		numSeasons = 5
 	}
 
-	maxSeasons := 2
+	maxSeasons := e.seasonWindow(numSeasons)
 	startSeason := numSeasons - maxSeasons + 1
 	if startSeason < 1 {
 		startSeason = 1

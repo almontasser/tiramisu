@@ -260,6 +260,16 @@ type Config struct {
 	// --- Media Server ---
 	MediaServerType string `json:"media_server_type"` // "plex" | "jellyfin"
 
+	// --- TV Sync ---
+	// How many of the most recent seasons the TV sync considers per show.
+	// Default 0, meaning every season. Upstream hard-codes a window of 2,
+	// which silently truncates back catalogues: a show is in the library but
+	// only its two newest seasons are. The window does buy real sync time —
+	// every extra season is a full per-episode Torrentio sweep (Coronation
+	// Street: 321 episodes over 2 seasons took 5m20s) — so set a positive
+	// value to cap it where sync duration matters more than completeness.
+	TVMaxSeasons int `json:"tv_max_seasons"`
+
 	// --- Quality Scoring ---
 	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
 
@@ -351,6 +361,7 @@ func LoadConfig() Config {
 		},
 
 		TorrentioURL:     "https://torrentio.strem.fun",
+		TVMaxSeasons:     0,
 		GoStormBaseURL:   "http://127.0.0.1:8090",
 		ProxyListenPort:  8080,
 		MetricsPort:      9080,

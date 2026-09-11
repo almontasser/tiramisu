@@ -4470,6 +4470,7 @@ func main() {
 				ProwlarrCfg:     gc().Prowlarr,
 				Language:        gc().Language,
 				QualityScoring:  gc().QualityScoringConfig,
+				MaxSeasons:      gc().TVMaxSeasons,
 				DB:              stateDB,
 				InvalidatePath:  invalidateSyncRemovedPath,
 			}),

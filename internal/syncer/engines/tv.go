@@ -31,6 +31,7 @@ type TVSyncerConfig struct {
 	ProwlarrCfg     prowlarr.ConfigProwlarr
 	Language        config.LanguageConfig
 	QualityScoring  config.QualityScoringConfig
+	MaxSeasons      int
 	DB              *metadb.DB // V1.7.1: Optional SQLite backend
 	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
@@ -69,6 +70,7 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		ProwlarrCfg:     cfg.ProwlarrCfg,
 		Language:        cfg.Language,
 		Weights:         cfg.QualityScoring.TVWeights(),
+		MaxSeasons:      cfg.MaxSeasons,
 		InvalidatePath:  cfg.InvalidatePath,
 	}
 
