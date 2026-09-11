@@ -26,6 +26,10 @@ type TVSyncerConfig struct {
 	MediaServerType string
 	PlexTVLib       int
 	TVDir           string
+	AnimeDir        string
+	AnimeEnabled    bool
+	AnimeGenreIDs   []int
+	AnimeLanguages  []string
 	StateDir        string
 	LogsDir         string
 	ProwlarrCfg     prowlarr.ConfigProwlarr
@@ -65,6 +69,10 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		MediaServerType: cfg.MediaServerType,
 		PlexTVLib:       cfg.PlexTVLib,
 		TVDir:           tvDir,
+		AnimeDir:        cfg.AnimeDir,
+		AnimeEnabled:    cfg.AnimeEnabled,
+		AnimeGenreIDs:   cfg.AnimeGenreIDs,
+		AnimeLanguages:  cfg.AnimeLanguages,
 		StateDir:        stateDir,
 		LogsDir:         logsDir,
 		ProwlarrCfg:     cfg.ProwlarrCfg,

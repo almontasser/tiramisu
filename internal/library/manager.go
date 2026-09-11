@@ -37,8 +37,14 @@ type EpisodeRegistry interface {
 
 // Config wires the manager to the on-disk layout and the engine.
 type Config struct {
-	MoviesDir  string
-	TVDir      string
+	MoviesDir string
+	TVDir     string
+	// AnimeDir is the anime tree. Anime is filed exactly like TV - same folder
+	// shape, same episode registry keys - and differs only in which root it
+	// lands under, which is why the series-shaped branches below test
+	// isSeriesKind rather than kind == "tv". Empty means the split is off and
+	// an anime request is rejected rather than silently filed as tv.
+	AnimeDir   string
 	GoStormURL string
 	GoStorm    GoStorm
 	Registry   EpisodeRegistry
@@ -217,7 +223,7 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	// file names and the requested season does not bound them; a single episode only
 	// shares the show and locks its own key, so filing a season episode by episode
 	// still runs in parallel.
-	if kind == "tv" {
+	if isSeriesKind(kind) {
 		show := "show:" + EpisodeKey(req.Title, 0, 0)
 		if req.Episode > 0 {
 			defer m.showLocks.RLock(show)()
@@ -276,8 +282,8 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	}
 
 	var files []AddedFile
-	if kind == "tv" {
-		files, err = m.addEpisodes(ctx, req, hash, magnet, info, dropped)
+	if isSeriesKind(kind) {
+		files, err = m.addEpisodes(ctx, kind, req, hash, magnet, info, dropped)
 	} else {
 		files, err = m.addMovie(req, hash, magnet, info)
 	}
@@ -295,13 +301,13 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 // A TV pack is never short-circuited: which episodes it holds is only known once the
 // file list arrives.
 func (m *Manager) alreadyPresent(kind, hash string, req AddRequest) ([]AddedFile, error) {
-	if kind != "tv" {
+	if !isSeriesKind(kind) {
 		return m.findByHash(kind, hash)
 	}
 	if req.Episode <= 0 {
 		return nil, nil
 	}
-	path := filepath.Join(m.cfg.TVDir, ShowFolderName(req.Title, req.FirstAirDate),
+	path := filepath.Join(m.dirFor(kind), ShowFolderName(req.Title, req.FirstAirDate),
 		fmt.Sprintf("Season.%02d", req.Season),
 		EpisodeFilename(req.Title, req.Season, req.Episode, hash[:8]))
 	if _, err := os.Stat(path); err != nil {
@@ -325,8 +331,16 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 		kind = "movie"
 	case "tv", "show", "series", "episode":
 		kind = "tv"
+	case "anime":
+		// Rejected rather than folded into tv: filing anime into the TV tree
+		// when the caller asked for anime would put it in the wrong library
+		// with no way to tell afterwards.
+		if m.cfg.AnimeDir == "" {
+			return "", "", errf(http.StatusBadRequest, "anime tree is not configured")
+		}
+		kind = "anime"
 	default:
-		return "", "", errf(http.StatusBadRequest, "unknown type %q: use movie or tv", req.Type)
+		return "", "", errf(http.StatusBadRequest, "unknown type %q: use movie, tv or anime", req.Type)
 	}
 
 	req.Title = strings.TrimSpace(req.Title)
@@ -355,7 +369,7 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 		return "", "", errf(http.StatusBadRequest, "malformed info hash %q", hash)
 	}
 
-	if kind == "tv" {
+	if isSeriesKind(kind) {
 		if req.Episode <= 0 && req.FileIndex > 0 {
 			return "", "", errf(http.StatusBadRequest,
 				"file_index needs an episode: a season pack files every file it can name")
@@ -367,8 +381,8 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 			return "", "", errf(http.StatusServiceUnavailable,
 				"the episode registry is unavailable: a tv stub added now would be deleted by the next sync")
 		}
-		if m.cfg.TVDir == "" {
-			return "", "", errf(http.StatusServiceUnavailable, "no tv directory configured")
+		if m.dirFor(kind) == "" {
+			return "", "", errf(http.StatusServiceUnavailable, "no %s directory configured", kind)
 		}
 	} else if m.cfg.MoviesDir == "" {
 		return "", "", errf(http.StatusServiceUnavailable, "no movies directory configured")
@@ -428,7 +442,10 @@ func (m *Manager) pickFile(index int, files []FileStat) (*FileStat, error) {
 	return best, nil
 }
 
-func (m *Manager) addEpisodes(ctx context.Context, req AddRequest, hash, magnet string, info *TorrentStats, dropped map[string]bool) ([]AddedFile, error) {
+// kind is passed rather than re-derived from req.Type: validate normalises the
+// caller's spelling ("show", "series", "episode") into a local kind and never
+// writes it back, so req.Type here may still hold any of the aliases.
+func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, hash, magnet string, info *TorrentStats, dropped map[string]bool) ([]AddedFile, error) {
 	type episodeFile struct {
 		file    FileStat
 		season  int
@@ -482,7 +499,7 @@ func (m *Manager) addEpisodes(ctx context.Context, req AddRequest, hash, magnet 
 		return wanted[i].episode < wanted[j].episode
 	})
 
-	showDir := filepath.Join(m.cfg.TVDir, ShowFolderName(req.Title, req.FirstAirDate))
+	showDir := filepath.Join(m.dirFor(kind), ShowFolderName(req.Title, req.FirstAirDate))
 	var out []AddedFile
 	// What this call found already in place. The stubs it overwrote must survive a
 	// rollback, and the episodes a previous release left elsewhere are only deleted
@@ -605,7 +622,7 @@ func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) {
 	}
 	defer unlock()
 
-	for _, kind := range []string{"movie", "tv"} {
+	for _, kind := range []string{"movie", "tv", "anime"} {
 		found, err := m.findByHash(kind, hash)
 		if err != nil {
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: keeping torrent %s, cannot check its stubs: %v", hash, err)
@@ -637,17 +654,40 @@ func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileSta
 }
 
 func (m *Manager) section(kind string) int {
-	if kind == "tv" {
+	if isSeriesKind(kind) {
 		return m.cfg.TVSection
 	}
 	return m.cfg.MovieSection
 }
 
-// kindOf tells which media directory a path belongs to.
+// isSeriesKind reports whether a kind is filed the TV way: show folder, season
+// subdirectory, episode registry key, 8-char hash suffix. Anime is.
+func isSeriesKind(kind string) bool { return kind == "tv" || kind == "anime" }
+
+// dirFor is the tree a kind is filed under. An unconfigured tree returns "",
+// which callers treat as "nothing of that kind exists".
+func (m *Manager) dirFor(kind string) string {
+	switch kind {
+	case "tv":
+		return m.cfg.TVDir
+	case "anime":
+		return m.cfg.AnimeDir
+	default:
+		return m.cfg.MoviesDir
+	}
+}
+
+// kindOf tells which media directory a path belongs to. Anime is tested before
+// tv: the two trees are siblings, so a path under the anime root must not come
+// back as tv or a remove would go looking for it in the wrong one.
 func (m *Manager) kindOf(path string) string {
-	if m.cfg.TVDir != "" {
-		if rel, err := filepath.Rel(filepath.Clean(m.cfg.TVDir), path); err == nil && !strings.HasPrefix(rel, "..") {
-			return "tv"
+	for _, k := range []string{"anime", "tv"} {
+		dir := m.dirFor(k)
+		if dir == "" {
+			continue
+		}
+		if rel, err := filepath.Rel(filepath.Clean(dir), path); err == nil && !strings.HasPrefix(rel, "..") {
+			return k
 		}
 	}
 	return "movie"
@@ -676,16 +716,24 @@ func (m *Manager) mediaDirs() []string {
 	if m.cfg.TVDir != "" {
 		dirs = append(dirs, filepath.Clean(m.cfg.TVDir))
 	}
+	if m.cfg.AnimeDir != "" {
+		dirs = append(dirs, filepath.Clean(m.cfg.AnimeDir))
+	}
 	return dirs
 }
 
 // findByHash returns the stubs already on disk for this info hash. Movie stubs carry the
 // last 8 hash chars, episode stubs the first 8: both conventions predate this API.
 func (m *Manager) findByHash(kind, hash string) ([]AddedFile, error) {
-	dir := m.cfg.MoviesDir
+	dir := m.dirFor(kind)
+	if dir == "" {
+		// An unconfigured tree holds nothing. Returning early matters because
+		// the callers below sweep every kind, and Walk("") is an error that
+		// would abort a remove rather than report "not here".
+		return nil, nil
+	}
 	suffix := HashSuffix(hash)
-	if kind == "tv" {
-		dir = m.cfg.TVDir
+	if isSeriesKind(kind) {
 		suffix = hash[:8]
 	}
 	var out []AddedFile
@@ -729,7 +777,7 @@ func (m *Manager) Remove(ctx context.Context, req RemoveRequest) (*RemoveRespons
 		if !reInfoHash.MatchString(hash) {
 			return nil, errf(http.StatusBadRequest, "malformed info hash %q", hash)
 		}
-		for _, kind := range []string{"movie", "tv"} {
+		for _, kind := range []string{"movie", "tv", "anime"} {
 			found, err := m.findByHash(kind, hash)
 			if err != nil {
 				return nil, err
@@ -848,10 +896,19 @@ func (m *Manager) insideMediaDirs(clean string) bool {
 // List reports the stubs on disk. It is how a client with no filesystem access knows
 // what the library already holds.
 func (m *Manager) List(kind string) ([]Item, error) {
-	dir := m.cfg.MoviesDir
-	if strings.HasPrefix(strings.ToLower(kind), "tv") {
-		dir = m.cfg.TVDir
+	// Anime is tested first: "anime" does not start with "tv", but leaving the
+	// order to chance here is how a list of the anime tree quietly becomes a
+	// list of movies.
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch {
+	case strings.HasPrefix(k, "anime"):
+		k = "anime"
+	case strings.HasPrefix(k, "tv"):
+		k = "tv"
+	default:
+		k = "movie"
 	}
+	dir := m.dirFor(k)
 	items := []Item{}
 	if dir == "" {
 		return items, nil

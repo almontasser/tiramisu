@@ -36,9 +36,12 @@ type TVGoEngine struct {
 	plexTVLib int
 	mediasrv  mediaserver.Client
 	tvDir     string
-	stateDir  string
-	limiter   *rate.Limiter
-	logger    *log.Logger
+	// animeDir is the anime tree, a sibling of tvDir. Empty disables the split
+	// and every series is filed under tvDir, which is upstream's behaviour.
+	animeDir string
+	stateDir string
+	limiter  *rate.Limiter
+	logger   *log.Logger
 
 	registry     map[string]TVEpisodeEntry
 	registryFile string
@@ -59,6 +62,13 @@ type TVGoEngine struct {
 	weights config.TVWeights
 
 	maxSeasons int
+
+	// Anime routing. A show passing every configured test is filed under
+	// animeDir rather than tvDir. The tests are ANDed on purpose: TMDB genre 16
+	// alone is "Animation", which is as true of The Simpsons as of Cowboy Bebop.
+	animeEnabled   bool
+	animeGenreIDs  map[int]bool
+	animeLanguages map[string]bool
 
 	// knownTitles caches a show's TMDB aliases for the process lifetime, not per
 	// run: aliases change rarely, and refetching ~100 shows every run would cost
@@ -96,9 +106,15 @@ type TVEngineConfig struct {
 	MediaServerType string
 	PlexTVLib       int
 	TVDir           string
-	StateDir        string
-	LogsDir         string
-	ProwlarrCfg     prowlarr.ConfigProwlarr
+	// AnimeDir is the anime tree. Empty means no split: every series is filed
+	// under TVDir, exactly as upstream does.
+	AnimeDir       string
+	AnimeEnabled   bool
+	AnimeGenreIDs  []int
+	AnimeLanguages []string
+	StateDir       string
+	LogsDir        string
+	ProwlarrCfg    prowlarr.ConfigProwlarr
 	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
@@ -106,7 +122,7 @@ type TVEngineConfig struct {
 	Weights        config.TVWeights
 	// MaxSeasons caps how many of the most recent seasons are considered.
 	// <= 0 means every season.
-	MaxSeasons     int
+	MaxSeasons int
 }
 
 // TV thresholds
@@ -153,6 +169,79 @@ var (
 
 var tvExcludedGenreIDs = map[int]bool{99: true, 10763: true, 10764: true, 10767: true, 16: true}
 
+// tmdbGenreAnimation is TMDB's "Animation". It sits in the excluded set above
+// because upstream has nowhere to file anime — every series lands in tv/ — not
+// because animation is unwanted. An anime tree is what makes it admissible.
+const tmdbGenreAnimation = 16
+
+// isAnimeShow reports whether a show belongs in the anime tree. Every configured
+// test must pass: the genre alone is "Animation", which is as true of The
+// Simpsons as of Cowboy Bebop, so the original language is what separates the
+// two. An empty rule set means that test is not applied.
+func (e *TVGoEngine) isAnimeShow(show tmdb.TVShow) bool {
+	if !e.animeEnabled {
+		return false
+	}
+	if len(e.animeLanguages) > 0 && !e.animeLanguages[strings.ToLower(show.Language)] {
+		return false
+	}
+	if len(e.animeGenreIDs) == 0 {
+		return true
+	}
+	for _, gid := range show.GenreIDs {
+		if e.animeGenreIDs[gid] {
+			return true
+		}
+	}
+	return false
+}
+
+// showDir is the tree a show's stubs belong in.
+func (e *TVGoEngine) showDir(show tmdb.TVShow) string {
+	if e.isAnimeShow(show) {
+		return e.animeDir
+	}
+	return e.tvDir
+}
+
+// roots is every tree this engine writes into. Walks that reconcile the
+// registry against disk must cover all of them: one that walked only tvDir
+// would find every anime stub unregistered and delete it as orphaned.
+func (e *TVGoEngine) roots() []string {
+	if e.animeEnabled && e.animeDir != "" && e.animeDir != e.tvDir {
+		return []string{e.tvDir, e.animeDir}
+	}
+	return []string{e.tvDir}
+}
+
+// walkRoots walks every tree the engine writes into, skipping any that does not
+// exist yet. Every reconciliation pass must go through this rather than walking
+// tvDir directly: cleanupOrphanedFiles deletes each .mkv it finds that is not in
+// the registry, so a walk that missed the anime tree would be harmless, but one
+// that missed it while the registry held its episodes would not — and
+// populateRegistryFromExisting would silently rebuild a registry with no anime
+// in it at all.
+func (e *TVGoEngine) walkRoots(fn filepath.WalkFunc) {
+	for _, root := range e.roots() {
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		filepath.Walk(root, fn)
+	}
+}
+
+// isRoot reports whether path is one of the trees themselves, as opposed to
+// something inside one. The empty-directory sweep uses it so it never removes a
+// tree root that happens to be empty.
+func (e *TVGoEngine) isRoot(path string) bool {
+	for _, r := range e.roots() {
+		if path == r {
+			return true
+		}
+	}
+	return false
+}
+
 // NewTVGoEngine creates a new Go TV sync engine.
 func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	var prowlarrClient *prowlarr.Client
@@ -167,6 +256,17 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	regFile := filepath.Join(cfg.StateDir, "tv_episode_registry.json")
 	blFile := filepath.Join(cfg.StateDir, "blacklist.json")
 
+	// Anime routing rules, resolved once. The split stays off unless a tree is
+	// configured: with no AnimeDir there is nowhere to file to.
+	animeGenres := make(map[int]bool, len(cfg.AnimeGenreIDs))
+	for _, g := range cfg.AnimeGenreIDs {
+		animeGenres[g] = true
+	}
+	animeLangs := make(map[string]bool, len(cfg.AnimeLanguages))
+	for _, l := range cfg.AnimeLanguages {
+		animeLangs[strings.ToLower(strings.TrimSpace(l))] = true
+	}
+
 	e := &TVGoEngine{
 		gostorm:          NewGoStormClient(cfg.GoStormURL),
 		tmdb:             tmdb.NewClient(cfg.TMDBAPIKey),
@@ -177,6 +277,10 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		plexTVLib:        cfg.PlexTVLib,
 		mediasrv:         mediaserver.New(cfg.MediaServerType, cfg.PlexURL, cfg.PlexToken),
 		tvDir:            cfg.TVDir,
+		animeDir:         cfg.AnimeDir,
+		animeEnabled:     cfg.AnimeEnabled && cfg.AnimeDir != "",
+		animeGenreIDs:    animeGenres,
+		animeLanguages:   animeLangs,
 		stateDir:         cfg.StateDir,
 		limiter:          rate.NewLimiter(rate.Every(500*time.Millisecond), 1),
 		logger:           logger,
@@ -355,14 +459,10 @@ func (e *TVGoEngine) saveRegistry() {
 }
 
 func (e *TVGoEngine) populateRegistryFromExisting() {
-	if _, err := os.Stat(e.tvDir); err != nil {
-		return
-	}
-
 	var torrents []TorrentStats
 	var tsLoaded bool
 
-	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
+	e.walkRoots(func(path string, info os.FileInfo, err error) error {
 		if err != nil || !strings.HasSuffix(strings.ToLower(path), ".mkv") {
 			return nil
 		}
@@ -543,11 +643,20 @@ func isShowRecent(details *tmdb.TVDetail) bool {
 }
 
 func (e *TVGoEngine) passesShowFilters(show tmdb.TVShow) bool {
-	// Genre filter
+	// Genre filter. Animation is exempt for a show this engine would file as
+	// anime: excluding it is only right while there is nowhere to put it, and
+	// with an anime tree configured the exclusion would keep that library
+	// permanently empty. Documentary, news, talk and reality stay excluded
+	// either way.
+	isAnime := e.isAnimeShow(show)
 	for _, gid := range show.GenreIDs {
-		if tvExcludedGenreIDs[gid] {
-			return false
+		if !tvExcludedGenreIDs[gid] {
+			continue
 		}
+		if isAnime && gid == tmdbGenreAnimation {
+			continue
+		}
+		return false
 	}
 
 	// Language: explicitly excluded languages are a hard reject regardless of
@@ -691,7 +800,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		}
 
 		t2 := time.Now()
-		count := e.processFullpack(ctx, showName, stream, show.FirstAirDate, knownTitles)
+		count := e.processFullpack(ctx, showName, e.showDir(show), stream, show.FirstAirDate, knownTitles)
 		e.logger.Printf("    fullpack S%02d: %d created in %v (%s)", stream.Season, count, time.Since(t2).Round(time.Millisecond), stream.Title[:min(60, len(stream.Title))])
 		if count > 0 {
 			created += count
@@ -722,7 +831,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 			continue
 		}
 
-		count := e.processSingle(ctx, showName, stream, show.FirstAirDate, knownTitles)
+		count := e.processSingle(ctx, showName, e.showDir(show), stream, show.FirstAirDate, knownTitles)
 		created += count
 		singlesProcessed++
 	}
@@ -1081,7 +1190,10 @@ func (e *TVGoEngine) extractSeeders(title string) int {
 	return 0
 }
 
-func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, stream TVStream, firstAirDate string, knownTitles []string) int {
+// targetDir is the tree this show's stubs go in: tvDir, or animeDir when the
+// show is anime. It is passed rather than read from the engine because the
+// choice is per show, and processShow is the only place that knows which.
+func (e *TVGoEngine) processFullpack(ctx context.Context, showName, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
 	magnet := BuildMagnet(stream.Hash, stream.Title, DefaultTrackers())
 	hash, err := e.gostorm.AddTorrent(ctx, magnet, stream.Title)
 	if err != nil || hash == "" {
@@ -1140,7 +1252,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 			}
 		}
 
-		seasonDir := filepath.Join(e.tvDir, cleanShow, fmt.Sprintf("Season.%02d", season))
+		seasonDir := filepath.Join(targetDir, cleanShow, fmt.Sprintf("Season.%02d", season))
 		epFilename := e.buildFilename(showName, season, episode, hash[:8])
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
@@ -1167,7 +1279,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName string, strea
 	return created
 }
 
-func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream TVStream, firstAirDate string, knownTitles []string) int {
+func (e *TVGoEngine) processSingle(ctx context.Context, showName, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
 	title := stream.Title
 	m := reTVEpNum.FindStringSubmatch(title)
 	if len(m) < 3 {
@@ -1224,7 +1336,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName string, stream 
 	}
 
 	cleanShow := e.getShowFolderName(showName, firstAirDate)
-	seasonDir := filepath.Join(e.tvDir, cleanShow, fmt.Sprintf("Season.%02d", season))
+	seasonDir := filepath.Join(targetDir, cleanShow, fmt.Sprintf("Season.%02d", season))
 	epFilename := e.buildFilename(showName, season, episode, hash[:8])
 	epPath := filepath.Join(seasonDir, epFilename)
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
@@ -1296,16 +1408,12 @@ func (e *TVGoEngine) reconcileRegistry() {
 }
 
 func (e *TVGoEngine) cleanupOrphanedFiles(ctx context.Context) {
-	if _, err := os.Stat(e.tvDir); err != nil {
-		return
-	}
-
 	regPaths := make(map[string]bool)
 	for _, entry := range e.registry {
 		regPaths[entry.FilePath] = true
 	}
 
-	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
+	e.walkRoots(func(path string, info os.FileInfo, err error) error {
 		if err != nil || !strings.HasSuffix(strings.ToLower(path), ".mkv") {
 			return nil
 		}
@@ -1317,8 +1425,8 @@ func (e *TVGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 
 	// Remove empty season and show directories (deepest first)
 	var dirs []string
-	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
-		if err == nil && info.IsDir() && path != e.tvDir {
+	e.walkRoots(func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.IsDir() && !e.isRoot(path) {
 			dirs = append(dirs, path)
 		}
 		return nil
@@ -1341,14 +1449,10 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 		activeHashes[t.Hash] = true
 	}
 
-	if _, err := os.Stat(e.tvDir); err != nil {
-		return
-	}
-
 	rehydrated := 0
 	e.logger.Printf("Scanning for missing torrents to rehydrate...")
 
-	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
+	e.walkRoots(func(path string, info os.FileInfo, err error) error {
 		if err != nil || !strings.HasSuffix(strings.ToLower(path), ".mkv") {
 			return nil
 		}
@@ -1426,7 +1530,7 @@ func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) {
 
 	// Also collect hashes from disk files
 	diskHashes := make(map[string]bool)
-	filepath.Walk(e.tvDir, func(path string, info os.FileInfo, err error) error {
+	e.walkRoots(func(path string, info os.FileInfo, err error) error {
 		if err != nil || !strings.HasSuffix(strings.ToLower(path), ".mkv") {
 			return nil
 		}

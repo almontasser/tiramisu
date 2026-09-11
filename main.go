@@ -4465,6 +4465,10 @@ func main() {
 				PlexTVLib:       gc().Plex.TVLibraryID,
 				MediaServerType: gc().MediaServerType,
 				TVDir:           filepath.Join(gc().PhysicalSourcePath, "tv"),
+				AnimeDir:        filepath.Join(gc().PhysicalSourcePath, "anime"),
+				AnimeEnabled:    gc().AnimeEnabled,
+				AnimeGenreIDs:   gc().AnimeGenreIDs,
+				AnimeLanguages:  gc().AnimeLanguages,
 				StateDir:        GetStateDir(),
 				LogsDir:         logsDir,
 				ProwlarrCfg:     gc().Prowlarr,
@@ -4539,8 +4543,16 @@ func main() {
 			registry = stateDB
 		}
 		libMgr := library.New(library.Config{
-			MoviesDir:      filepath.Join(gc().PhysicalSourcePath, "movies"),
-			TVDir:          filepath.Join(gc().PhysicalSourcePath, "tv"),
+			MoviesDir: filepath.Join(gc().PhysicalSourcePath, "movies"),
+			TVDir:     filepath.Join(gc().PhysicalSourcePath, "tv"),
+			// Left empty when the split is off, which is what makes the Library
+			// API reject an anime request rather than file it into tv/.
+			AnimeDir: func() string {
+				if !gc().AnimeEnabled {
+					return ""
+				}
+				return filepath.Join(gc().PhysicalSourcePath, "anime")
+			}(),
 			GoStormURL:     gc().GoStormBaseURL,
 			GoStorm:        engines.NewGoStormClient(gc().GoStormBaseURL),
 			Registry:       registry,

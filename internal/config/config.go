@@ -270,6 +270,19 @@ type Config struct {
 	// value to cap it where sync duration matters more than completeness.
 	TVMaxSeasons int `json:"tv_max_seasons"`
 
+	// --- Anime ---
+	// Anime series are filed into their own tree, anime/, beside movies/ and
+	// tv/, so a media server can carry them as a separate library with its own
+	// metadata providers. Upstream has no such split: every series lands in tv/.
+	//
+	// Detection deliberately takes genre AND original language together. TMDB
+	// genre 16 on its own is "Animation", which is equally true of The Simpsons
+	// and Bluey; requiring the original language is what separates anime from
+	// Western animation. A show matching neither test stays in tv/.
+	AnimeEnabled   bool     `json:"anime_enabled"`
+	AnimeGenreIDs  []int    `json:"anime_genre_ids"`
+	AnimeLanguages []string `json:"anime_languages"`
+
 	// --- Quality Scoring ---
 	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
 
@@ -362,6 +375,9 @@ func LoadConfig() Config {
 
 		TorrentioURL:     "https://torrentio.strem.fun",
 		TVMaxSeasons:     0,
+		AnimeEnabled:     true,
+		AnimeGenreIDs:    []int{16},      // TMDB "Animation"
+		AnimeLanguages:   []string{"ja"}, // original_language
 		GoStormBaseURL:   "http://127.0.0.1:8090",
 		ProxyListenPort:  8080,
 		MetricsPort:      9080,
