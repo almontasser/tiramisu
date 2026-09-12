@@ -363,6 +363,13 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	// processedThisRun and stats are long-lived struct fields, not local vars.
 	e.processedThisRun = make(map[string]bool)
 	e.stats = TVSyncStats{}
+	// The Library API writes episodes to the StateDB while this engine keeps
+	// the copy it loaded at startup. Working from that copy, reconcile drops
+	// the row of an episode the API re-filed under a new path, because the
+	// old path is gone, and cleanup then deletes the new stub as an orphan.
+	// Start every run from the database, and from the current blacklist.
+	e.registry = e.loadRegistry()
+	e.blacklist = e.loadBlacklist()
 	e.populateRegistryFromExisting()
 	e.reconcileRegistry()
 
