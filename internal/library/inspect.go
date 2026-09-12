@@ -142,6 +142,15 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 		return nil, errf(http.StatusBadGateway, "engine returned no files for %s", hash)
 	}
 
+	// The engine reports a torrent-level length of 0 for some torrents even
+	// though every file length is right, which showed as "0 B" next to a 9 GB
+	// season pack. The files are the authority.
+	if out.Size <= 0 {
+		for _, f := range out.Files {
+			out.Size += f.Size
+		}
+	}
+
 	for s := range seasonSet {
 		out.Seasons = append(out.Seasons, s)
 	}

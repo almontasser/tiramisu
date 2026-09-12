@@ -185,3 +185,42 @@ func TestInspectPackHasNoEpisode(t *testing.T) {
 		t.Fatalf("pack reported Episode = %d, want 0", got.Episode)
 	}
 }
+
+// GoStorm reports Length 0 for some torrents while the per-file lengths are
+// correct, which showed a 9 GB season pack as "0 B".
+func TestInspectFallsBackToSummedFileSizes(t *testing.T) {
+	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{
+		stats: TorrentStats{
+			Hash: testHash, Title: "Show.S01.1080p", Length: 0,
+			FileStats: []FileStat{
+				{ID: 1, Path: "Show.S01E01.mkv", Length: 700},
+				{ID: 2, Path: "Show.S01E02.mkv", Length: 300},
+			},
+		},
+	}}}
+	got, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Size != 1000 {
+		t.Fatalf("Size = %d, want 1000 (summed from files)", got.Size)
+	}
+}
+
+// A reported length must win over the sum, since a multi-file torrent's total
+// legitimately exceeds what the selected files add up to.
+func TestInspectKeepsReportedSize(t *testing.T) {
+	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{
+		stats: TorrentStats{
+			Hash: testHash, Title: "Film.2020.1080p", Length: 4242,
+			FileStats: []FileStat{{ID: 1, Path: "Film.mkv", Length: 10}},
+		},
+	}}}
+	got, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Size != 4242 {
+		t.Fatalf("Size = %d, want 4242 (reported)", got.Size)
+	}
+}
