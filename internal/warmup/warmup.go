@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"tiramisu/internal/gostorm/settings"
+	"tiramisu/internal/library"
 )
 
 // FileSize is the per-file head cache cap. Set at init from config, default 64 MB.
@@ -192,6 +193,10 @@ func InitDiskWarmup(quotaGB int64) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return
 	}
+	// The cache dir and its contents are written by this process, which may be
+	// running as root. Hand them to the same owner the stub tree uses so the
+	// operator can prune the cache without sudo.
+	library.ApplyOwner(dir)
 
 	DiskWarmup = &DiskWarmupCache{
 		dir:     dir,
@@ -376,6 +381,7 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 			logf.Printf("[DiskWarmup] Error creating file: %v", err)
 			return
 		}
+		library.ApplyOwner(path)
 		newCh := &cachedHandle{f: f}
 		newCh.lastUsedNano.Store(time.Now().UnixNano())
 		d.handles.Store(path, newCh)
@@ -570,6 +576,7 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 		if err != nil {
 			return
 		}
+		library.ApplyOwner(path)
 		tailCh := &cachedHandle{f: f}
 		tailCh.lastUsedNano.Store(time.Now().UnixNano())
 		d.handles.Store(path, tailCh)
