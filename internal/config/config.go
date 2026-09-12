@@ -283,6 +283,16 @@ type Config struct {
 	AnimeGenreIDs  []int    `json:"anime_genre_ids"`
 	AnimeLanguages []string `json:"anime_languages"`
 
+	// --- File ownership ---
+	// Who the stubs and directories written into the source tree belong to.
+	// The process runs as root because mounting FUSE requires it, but files
+	// left owned by root cannot be managed by the media server or by the owner
+	// of the data directory — pruning an emptied show then needs a privileged
+	// container. 0 for either means "inherit from physical_source_path", which
+	// is right whenever that path is a bind mount from the host.
+	FileUID int `json:"file_uid"`
+	FileGID int `json:"file_gid"`
+
 	// --- Quality Scoring ---
 	QualityScoringConfig QualityScoringConfig `json:"quality_scoring"`
 

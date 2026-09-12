@@ -22,6 +22,7 @@ import (
 	"tiramisu/internal/catalog/tmdb"
 	"tiramisu/internal/catalog/torrentio"
 	"tiramisu/internal/config"
+	"tiramisu/internal/library"
 	"tiramisu/internal/prowlarr"
 )
 
@@ -533,6 +534,10 @@ func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, f
 	if err := os.WriteFile(path, jsonData, 0644); err != nil {
 		return "", err
 	}
+	// This engine assembles the stub inline rather than calling WriteStub, so
+	// it has to apply the ownership itself; without this its stubs would be the
+	// one remaining thing left owned by root.
+	library.ApplyOwner(path)
 
 	return path, nil
 }

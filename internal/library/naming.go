@@ -163,8 +163,12 @@ func WriteStub(path, streamURL string, size int64, magnet, imdbID string) error 
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := mkdirAllOwned(filepath.Dir(path)); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+	chownPath(path)
+	return nil
 }

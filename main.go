@@ -3936,6 +3936,16 @@ func main() {
 	if source == "" {
 		source = gc().PhysicalSourcePath
 	}
+
+	// Decide who the stubs belong to before anything writes one. The process
+	// stays root because mounting FUSE requires it, but the files it creates
+	// should belong to whoever owns the source tree — otherwise the media
+	// server and the host user, both ordinary users, cannot prune the library
+	// these files make up.
+	library.SetOwner(gc().FileUID, gc().FileGID, source)
+	if uid, gid := library.Owner(); uid >= 0 {
+		logger.Printf("[Startup] writing stubs as %d:%d", uid, gid)
+	}
 	if mount == "" {
 		mount = gc().FuseMountPath
 	}
