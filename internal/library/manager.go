@@ -644,14 +644,26 @@ func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileSta
 	if req.FileIndex > 0 {
 		return m.pickFile(req.FileIndex, files)
 	}
+	videos := 0
 	for i := range files {
 		if !IsVideoFile(files[i].Path) {
 			continue
 		}
+		videos++
 		if season, episode := ParseSeasonEpisode(filepath.Base(files[i].Path)); episode == req.Episode &&
 			(season == req.Season || season == 0) {
 			return &files[i], nil
 		}
+	}
+	// No file names this episode. A torrent with one video file is that
+	// episode whatever the file is called. With several, the largest file is
+	// a guess, and a wrong one: a batch that numbers episodes absolutely
+	// ("One Piece - 0096") carries no SxxExx to match, and the largest file
+	// went into every episode asked of it - 219 stubs of one series pointing
+	// at a single file. Refuse, and let the caller name the file.
+	if videos > 1 {
+		return nil, errf(http.StatusUnprocessableEntity,
+			"no file in this torrent is named S%02dE%02d; pass file_index to choose one", req.Season, req.Episode)
 	}
 	return m.pickFile(0, files)
 }
