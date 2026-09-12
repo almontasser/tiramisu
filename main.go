@@ -236,6 +236,11 @@ var fuseShortReadCount atomic.Int64
 var fuseShortReadRepaired atomic.Int64
 var fuseShortReadFailed atomic.Int64
 
+// fuseReadTimeouts counts reads abandoned by FuseReadTimeoutSeconds. A rising
+// count means torrents in the library have no seeders left, not that the
+// timeout is too tight - a healthy swarm answers a 128KB read in milliseconds.
+var fuseReadTimeouts atomic.Int64
+
 // A blocked FUSE read puts smbd in D-state, which is why fetch timeouts were cut to 8s in
 // V283; the refill must stay well inside that budget rather than stacking another 8s on top.
 const (
@@ -1950,7 +1955,29 @@ func shortAwayFromEOF(n, want int, off, size int64) bool {
 // refetched; if they still cannot be produced, EIO is returned, which the kernel does not
 // cache, so the read is retried instead of a hole being made permanent.
 func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	res, errno := h.readInner(fuseCtx, dest, off)
+	// A read against a swarm with no seeders never returns on its own, and the
+	// caller inherits that: a media scanner's probe blocks forever, the scanner
+	// retries, and the blocked probes pile up until nothing else gets a slot.
+	// One dead torrent then stalls a whole library scan. Bound the wait instead.
+	ctx := fuseCtx
+	if d := time.Duration(gc().FuseReadTimeoutSeconds) * time.Second; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(fuseCtx, d)
+		defer cancel()
+	}
+
+	res, errno := h.readInner(ctx, dest, off)
+
+	// Distinguish our own deadline from the caller going away. readInner reports
+	// both as EINTR, but only one of them means "this file cannot be served":
+	// EINTR invites a retry, which is what built the pile-up, so answer EIO and
+	// let the caller mark the item unreadable and move on.
+	if errno != 0 && fuseCtx.Err() == nil && ctx.Err() == context.DeadlineExceeded {
+		fuseReadTimeouts.Add(1)
+		logger.Printf("[ReadTimeout] No data in %ds at offset %d for %s - EIO (swarm cannot serve it)",
+			gc().FuseReadTimeoutSeconds, off, filepath.Base(h.path))
+		return nil, syscall.EIO
+	}
 	if errno != 0 || res == nil {
 		return res, errno
 	}
@@ -1972,7 +1999,7 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		if time.Now().After(deadline) {
 			break // a blocked FUSE read puts smbd in D-state; bail out rather than hang
 		}
-		sub, subErrno := h.readInner(fuseCtx, dest[total:], off+int64(total))
+		sub, subErrno := h.readInner(ctx, dest[total:], off+int64(total))
 		if subErrno != 0 || sub == nil {
 			break
 		}

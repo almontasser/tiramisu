@@ -211,6 +211,14 @@ type Config struct {
 	// Fallback when CLI args are omitted. CLI args always take precedence.
 	PhysicalSourcePath string `json:"physical_source_path"` // Real MKV dir (e.g. /mnt/torrserver)
 	FuseMountPath      string `json:"fuse_mount_path"`      // FUSE virtual mount (e.g. /mnt/torrserver-go)
+	// FuseReadTimeoutSeconds bounds a single FUSE read. A swarm with no seeders
+	// never answers, and the blocked read is inherited by whatever asked for it:
+	// a media scanner's probe hangs, the scanner retries, and the stuck probes
+	// accumulate until one dead torrent has stalled the entire scan. Past this
+	// the read returns EIO, so the caller fails that one file and continues.
+	// Generous by default - a cold swarm can legitimately take a minute to
+	// produce its first bytes. 0 disables the bound and restores blocking.
+	FuseReadTimeoutSeconds int `json:"fuse_read_timeout_seconds"`
 
 	// --- Legacy Compatibility Fields (populated from above) ---
 	DefaultFileSize         int64         `json:"-"`
@@ -360,7 +368,10 @@ func LoadConfig() Config {
 		PreloadWorkersCount:   4,
 		PreloadInitialDelayMS: 1000,
 		WarmStartIdleSeconds:  6,
-		MaxConcurrentPrefetch: 3,
+		// Well past a legitimate cold start (measured at 30-80s on this library),
+		// so only a swarm that cannot serve at all trips it.
+		FuseReadTimeoutSeconds: 120,
+		MaxConcurrentPrefetch:  3,
 
 		CacheCleanupIntervalMin: 5,
 		MaxCacheEntries:         10000,
