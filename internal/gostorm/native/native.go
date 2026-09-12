@@ -435,6 +435,13 @@ func (r *NativeReader) IsIdle(d time.Duration) bool {
 // 60s smbd D-state watchdog.
 const fetchBlockTimeout = 8 * time.Second
 
+// FetchReadyTimeout bounds how long a single block fetch may wait for its first
+// bytes before the read is abandoned with an error. It exists because a swarm
+// with no seeders never produces those bytes and the wait is otherwise
+// unbounded. Generous on purpose - a cold but live swarm here has taken 42s to
+// answer - and set from config at startup.
+var FetchReadyTimeout = 60 * time.Second
+
 // streamRangeFn opens a byte stream for [offset, offset+length) into pw and closes pw when the
 // stream ends. A var so FetchAhead can be exercised without a live torrent, the same injection
 // seam used by startStreamFn.
@@ -563,8 +570,30 @@ func (c *NativeClient) FetchAhead(hash string, fileID int, offset int64, buf, de
 		finish(total, nil)
 	}()
 
-	r := <-ready
-	return r.n, r.err
+	// Bound the wait. fetchBlockTimeout already cancels ctx, and func1 closes pr
+	// when it fires, which normally unblocks the fill goroutine - but observed on
+	// a swarm with no seeders, that chain does not always complete and this
+	// receive waits forever. The caller inherits it: a media scanner's probe sat
+	// here for ten minutes with its read counter frozen, the scanner started
+	// another on the same file, and the stalled probes piled up until one dead
+	// torrent had stalled an entire library scan.
+	select {
+	case r := <-ready:
+		return r.n, r.err
+	case <-time.After(FetchReadyTimeout):
+		// Close the reader ourselves rather than trusting ctx to have done it,
+		// then wait for the fill goroutine to actually finish. Returning while it
+		// is still live would race the caller's reuse of dest, and Close is what
+		// guarantees the wait is short: a closed PipeReader fails pending and
+		// future reads immediately.
+		cancel()
+		pr.Close()
+		r := <-ready
+		if r.err == nil {
+			r.err = fmt.Errorf("fetch stalled for %s at offset %d", FetchReadyTimeout, offset)
+		}
+		return r.n, r.err
+	}
 }
 
 // FetchBlock performs an atomic, stateless read from the Torrent Core.

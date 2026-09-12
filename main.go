@@ -3971,6 +3971,13 @@ func main() {
 	// server and the host user, both ordinary users, cannot prune the library
 	// these files make up.
 	library.SetOwner(gc().FileUID, gc().FileGID, source)
+
+	// Same bound the FUSE read uses, applied where the wait actually happens: a
+	// block fetch that never receives its first bytes. Wrapping the read in a
+	// context achieves nothing on its own, because the fetch does not consult one.
+	if d := time.Duration(gc().FuseReadTimeoutSeconds) * time.Second; d > 0 {
+		native.FetchReadyTimeout = d
+	}
 	if uid, gid := library.Owner(); uid >= 0 {
 		logger.Printf("[Startup] writing stubs as %d:%d", uid, gid)
 	}
