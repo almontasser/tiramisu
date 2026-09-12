@@ -99,7 +99,10 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
     <div class="flex items-center gap-2"><span id="s-vpn" class="text-base sm:text-lg">&#9679;</span><span id="l-vpn" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-natpmp">
-    <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">NAT-PMP</div>
+    <!-- The forwarded port does not have to come from our own NAT-PMP client:
+         it may be held by the VPN container instead. What matters either way
+         is the port peers can reach, so label it for that. -->
+    <div class="text-xs text-slate-400 uppercase tracking-wider mb-2">PEER PORT</div>
     <div class="flex items-center gap-2"><span id="s-natpmp" class="text-base sm:text-lg">&#9679;</span><span id="l-natpmp" class="text-sm sm:text-base font-bold">--</span></div>
   </div>
   <div class="glass rounded-xl p-4" id="c-mediaserver">

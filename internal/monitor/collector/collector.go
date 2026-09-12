@@ -650,11 +650,55 @@ func (c *Collector) checkVPN() ServiceStatus {
 	return ServiceStatus{OK: true, Message: c.vpnIface + " up"}
 }
 
+// checkNATPMP reports the port peers can actually reach us on.
+//
+// It used to print natpmp.local_port straight from config.json, which is only
+// the internal port the NAT-PMP client would ask the gateway to map — not the
+// port GoStorm binds, and not the external port a gateway hands back. With
+// NAT-PMP disabled and the forwarded port supplied by something else (gluetun
+// holding the ProtonVPN lease), the card showed a green "port 8091" while the
+// listener was on an entirely different port. Report the live value instead,
+// so a mismatch between the forwarded port and the listener is visible here
+// rather than silently costing every inbound peer connection.
 func (c *Collector) checkNATPMP() ServiceStatus {
-	if c.natpmpPort == 0 {
+	port := c.peersListenPort()
+	if port == 0 {
+		// GoStorm defaults PeersListenPort to 0, which means "pick a random
+		// ephemeral port at startup" — nothing upstream can forward to that.
+		if c.natpmpPort != 0 {
+			return ServiceStatus{OK: false, Message: "not listening (configured " + strconv.Itoa(c.natpmpPort) + ")"}
+		}
 		return ServiceStatus{OK: false, Message: "not configured"}
 	}
-	return ServiceStatus{OK: true, Message: "port " + strconv.Itoa(c.natpmpPort)}
+	return ServiceStatus{OK: true, Message: "port " + strconv.Itoa(port)}
+}
+
+// peersListenPort asks GoStorm which port its peer listener is bound to.
+// Returns 0 when GoStorm is unreachable or still on a random port.
+func (c *Collector) peersListenPort() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.gostormURL+"/settings",
+		strings.NewReader(`{"action":"get"}`))
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := catalog.Do(ctx, c.httpClient, req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0
+	}
+	var sets struct {
+		PeersListenPort int `json:"PeersListenPort"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&sets); err != nil {
+		return 0
+	}
+	return sets.PeersListenPort
 }
 
 func diskUsage(path string) (usedPct, freeGB, totalGB float64) {
