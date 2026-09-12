@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 const maxBodyBytes = 1 << 20
@@ -58,17 +60,91 @@ func (h *Handler) Remove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// ListPage is the paged form of a library listing. The bare array returned by
+// List is kept for existing callers; anything with a UI wants a window plus the
+// total, or it ends up shipping every episode in one response.
+type ListPage struct {
+	Items  []Item `json:"items"`
+	Total  int    `json:"total"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
+}
+
+// List serves GET /api/library/list.
+//
+// Without limit it answers exactly as before: the plain array for one kind.
+// With limit (or type=all, or a search term) it answers a ListPage instead, so
+// a browser can page through 6000+ episodes rather than load them at once.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	items, err := h.mgr.List(r.URL.Query().Get("type"))
-	if err != nil {
-		writeAPIError(w, err)
+	q := r.URL.Query()
+	kind := q.Get("type")
+	search := strings.ToLower(strings.TrimSpace(q.Get("search")))
+	limit := atoiDefault(q.Get("limit"), 0)
+	offset := atoiDefault(q.Get("offset"), 0)
+
+	// "all" spans the three trees; anything else keeps List's own normalisation,
+	// including the historical default of "movie" for an empty type.
+	kinds := []string{kind}
+	paged := limit > 0 || search != ""
+	if strings.EqualFold(strings.TrimSpace(kind), "all") {
+		kinds = []string{"movie", "tv", "anime"}
+		paged = true
+	}
+
+	items := []Item{}
+	for _, k := range kinds {
+		part, err := h.mgr.List(k)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		items = append(items, part...)
+	}
+
+	if !paged {
+		writeJSON(w, http.StatusOK, items)
 		return
 	}
-	writeJSON(w, http.StatusOK, items)
+
+	if search != "" {
+		kept := items[:0:0]
+		for _, it := range items {
+			// Match the filename and the infohash: the name is what a person
+			// reads, the hash is what they have when chasing a specific torrent.
+			if strings.Contains(strings.ToLower(it.FusePath), search) ||
+				strings.Contains(strings.ToLower(it.Hash), search) {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
+	}
+
+	total := len(items)
+	if offset > total {
+		offset = total
+	}
+	end := total
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	writeJSON(w, http.StatusOK, ListPage{
+		Items: items[offset:end], Total: total, Offset: offset, Limit: limit,
+	})
+}
+
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
 }
 
 func decode(r *http.Request, dst interface{}) error {

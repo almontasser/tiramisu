@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tiramisu — Library</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      background: #0b1120;
+      color: #e2e8f0;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    .glass {
+      background: rgba(30, 41, 59, .55);
+      border: 1px solid rgba(148, 163, 184, .12);
+      backdrop-filter: blur(8px);
+    }
+
+    input,
+    select,
+    textarea {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: .5rem;
+      padding: .45rem .6rem;
+      color: #e2e8f0;
+      width: 100%;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+    }
+
+    label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #94a3b8;
+      display: block;
+      margin-bottom: .25rem;
+    }
+
+    .btn {
+      border-radius: .5rem;
+      padding: .45rem .9rem;
+      font-size: .8rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+
+    .btn-primary {
+      background: #2563eb;
+      color: #fff;
+    }
+
+    .btn-primary:disabled {
+      background: #1e3a5f;
+      color: #64748b;
+      cursor: not-allowed;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border-color: #334155;
+      color: #cbd5e1;
+    }
+
+    .btn-danger {
+      background: transparent;
+      border-color: #7f1d1d;
+      color: #fca5a5;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th {
+      text-align: left;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #94a3b8;
+      padding: .5rem;
+      border-bottom: 1px solid rgba(148, 163, 184, .15);
+      position: sticky;
+      top: 0;
+      background: #131c31;
+    }
+
+    td {
+      padding: .45rem .5rem;
+      border-bottom: 1px solid rgba(148, 163, 184, .07);
+      font-size: .8rem;
+      vertical-align: middle;
+    }
+
+    tr:hover td {
+      background: rgba(148, 163, 184, .04);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .pill {
+      font-size: 10px;
+      padding: .1rem .4rem;
+      border-radius: 99px;
+      font-weight: 600;
+    }
+
+    dialog {
+      background: #131c31;
+      color: #e2e8f0;
+      border: 1px solid rgba(148, 163, 184, .18);
+      border-radius: .75rem;
+      padding: 0;
+      width: min(620px, 94vw);
+    }
+
+    dialog::backdrop {
+      background: rgba(2, 6, 23, .7);
+    }
+
+    .tmdb-hit {
+      padding: .4rem .6rem;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(148, 163, 184, .08);
+    }
+
+    .tmdb-hit:hover {
+      background: rgba(59, 130, 246, .15);
+    }
+  </style>
+</head>
+
+<body class="p-4 sm:p-6">
+  <div class="max-w-7xl mx-auto space-y-4">
+
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-xl font-bold">Library</h1>
+        <div class="text-xs text-slate-400">Every filed stub, and what the engine is doing with it</div>
+      </div>
+      <div class="flex gap-2">
+        <a href="/dashboard" class="btn btn-ghost no-underline">&larr; Dashboard</a>
+        <button class="btn btn-primary" onclick="openAdd()">+ Add torrent</button>
+      </div>
+    </div>
+
+    <div class="glass rounded-xl p-3 flex flex-wrap gap-3 items-end">
+      <div style="flex:1 1 260px">
+        <label>Search (name or infohash)</label>
+        <input id="q" placeholder="e.g. Supernatural, or an infohash" oninput="debouncedReload()">
+      </div>
+      <div style="width:150px">
+        <label>Type</label>
+        <select id="kind" onchange="reload(0)">
+          <option value="all">All</option>
+          <option value="movie">Movies</option>
+          <option value="tv">TV</option>
+          <option value="anime">Anime</option>
+        </select>
+      </div>
+      <div style="width:110px">
+        <label>Per page</label>
+        <select id="limit" onchange="reload(0)">
+          <option>50</option>
+          <option selected>100</option>
+          <option>250</option>
+          <option>500</option>
+        </select>
+      </div>
+      <button class="btn btn-ghost" onclick="reload(0)">Refresh</button>
+    </div>
+
+    <div class="glass rounded-xl overflow-hidden">
+      <div class="max-h-[65vh] overflow-y-auto">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:38%">Name</th>
+              <th>Type</th>
+              <th>S/E</th>
+              <th>Size</th>
+              <th>Infohash</th>
+              <th>Engine</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="rows">
+            <tr>
+              <td colspan="7" class="text-slate-500 p-4">Loading…</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="flex items-center justify-between p-3 text-xs text-slate-400 border-t border-slate-700/40">
+        <span id="count">—</span>
+        <span class="flex gap-2">
+          <button class="btn btn-ghost" id="prev" onclick="page(-1)">Prev</button>
+          <button class="btn btn-ghost" id="next" onclick="page(1)">Next</button>
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="addDlg">
+    <form method="dialog" onsubmit="return false">
+      <div class="px-4 py-3 border-b border-slate-700/60 flex justify-between items-center">
+        <strong class="text-sm">Add a torrent</strong>
+        <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Close</button>
+      </div>
+      <div class="p-4 space-y-3">
+        <div>
+          <label>Magnet or infohash</label>
+          <textarea id="a_magnet" rows="2" placeholder="magnet:?xt=urn:btih:… or a 40-char infohash"></textarea>
+        </div>
+
+        <div class="flex gap-3">
+          <div style="width:130px">
+            <label>Type</label>
+            <select id="a_type" onchange="onTypeChange()">
+              <option value="movie">Movie</option>
+              <option value="tv">TV</option>
+              <option value="anime">Anime</option>
+            </select>
+          </div>
+          <div style="flex:1">
+            <label>Title (drives the filename &mdash; must match the real title)</label>
+            <input id="a_title" placeholder="Start typing to search TMDB…" oninput="debouncedTmdb()"
+              autocomplete="off">
+            <div id="tmdbBox" class="glass rounded-lg mt-1 hidden max-h-48 overflow-y-auto"></div>
+          </div>
+          <div style="width:90px">
+            <label>Year</label>
+            <input id="a_year" type="number" placeholder="2024">
+          </div>
+        </div>
+
+        <div class="flex gap-3">
+          <div style="flex:1">
+            <label>IMDB id (optional)</label>
+            <input id="a_imdb" placeholder="tt1234567">
+          </div>
+          <div style="width:90px" class="tv-only hidden">
+            <label>Season</label>
+            <input id="a_season" type="number" placeholder="1">
+          </div>
+          <div style="width:110px" class="tv-only hidden">
+            <label>Episode</label>
+            <input id="a_episode" type="number" placeholder="blank = pack">
+          </div>
+          <div style="width:110px">
+            <label>File index</label>
+            <input id="a_fileindex" type="number" placeholder="0 = largest">
+          </div>
+        </div>
+
+        <div class="text-[11px] text-slate-400 leading-relaxed">
+          The stub is written immediately, but Jellyfin only shows it after its next library scan.
+          Leaving <em>Episode</em> blank with a season set files the torrent as a season pack.
+        </div>
+
+        <div id="addMsg" class="text-xs"></div>
+      </div>
+      <div class="px-4 py-3 border-t border-slate-700/60 flex justify-end gap-2">
+        <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Cancel</button>
+        <button class="btn btn-primary" id="addBtn" onclick="submitAdd()">Add to library</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    let offset = 0, total = 0, activeHashes = new Set();
+
+    const el = id => document.getElementById(id);
+    const fmtSize = b => {
+      if (!b || b < 1024) return (b || 0) + ' B';
+      const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, v = b;
+      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
+      return v.toFixed(1) + ' ' + u[i];
+    };
+    const esc = s => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    function debounce(fn, ms) {
+      let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) };
+    }
+    const debouncedReload = debounce(() => reload(0), 300);
+
+    // Name shown to a person: the stub filename minus the directory and the
+    // hash suffix the filer appends.
+    function pretty(fusePath) {
+      const base = (fusePath || '').split('/').pop().replace(/\.mkv$/i, '');
+      return base.replace(/_[0-9a-f]{8}$/, '').replace(/_/g, ' ');
+    }
+
+    function kindOf(fusePath) {
+      const top = (fusePath || '').split('/')[0];
+      return top === 'tv' || top === 'anime' ? top : 'movie';
+    }
+
+    async function loadActive() {
+      try {
+        const r = await fetch('/api/torrents');
+        const d = await r.json();
+        activeHashes = new Set((d || []).map(t => (t.hash || '').toLowerCase()));
+      } catch (e) { activeHashes = new Set(); }
+    }
+
+    async function reload(newOffset) {
+      if (newOffset !== undefined) offset = newOffset;
+      const limit = +el('limit').value;
+      const p = new URLSearchParams({
+        type: el('kind').value, search: el('q').value.trim(),
+        limit: limit, offset: offset
+      });
+      el('rows').innerHTML = '<tr><td colspan="7" class="text-slate-500 p-4">Loading…</td></tr>';
+      await loadActive();
+      let d;
+      try {
+        const r = await fetch('/api/library/list?' + p);
+        d = await r.json();
+      } catch (e) {
+        el('rows').innerHTML = '<tr><td colspan="7" class="text-red-400 p-4">' + esc(String(e)) + '</td></tr>';
+        return;
+      }
+      const items = d.items || [];
+      total = d.total || 0;
+      if (!items.length) {
+        el('rows').innerHTML = '<tr><td colspan="7" class="text-slate-500 p-4">Nothing matches.</td></tr>';
+      } else {
+        el('rows').innerHTML = items.map(it => {
+          const h = (it.hash || '').toLowerCase();
+          const live = activeHashes.has(h);
+          const se = it.season ? 'S' + String(it.season).padStart(2, '0') +
+            (it.episode ? 'E' + String(it.episode).padStart(2, '0') : ' pack') : '—';
+          return '<tr>' +
+            '<td title="' + esc(it.fuse_path) + '">' + esc(pretty(it.fuse_path)) + '</td>' +
+            '<td class="text-slate-400">' + kindOf(it.fuse_path) + '</td>' +
+            '<td class="text-slate-400 mono">' + se + '</td>' +
+            '<td class="mono text-slate-300">' + fmtSize(it.size) + '</td>' +
+            '<td class="mono text-[11px] text-slate-500" title="' + esc(it.hash) + '">' +
+            esc((it.hash || '').slice(0, 12)) + '</td>' +
+            '<td>' + (live
+              ? '<span class="pill bg-green-500/15 text-green-400">active</span>'
+              : '<span class="pill bg-slate-500/10 text-slate-500">idle</span>') + '</td>' +
+            '<td class="text-right"><button class="btn btn-danger" onclick="removeItem(\'' +
+            esc(it.fuse_path) + '\')">Remove</button></td>' +
+            '</tr>';
+        }).join('');
+      }
+      const shown = items.length ? (offset + 1) + '–' + (offset + items.length) : '0';
+      el('count').textContent = shown + ' of ' + total;
+      el('prev').disabled = offset <= 0;
+      el('next').disabled = offset + items.length >= total;
+    }
+
+    function page(dir) {
+      const limit = +el('limit').value;
+      const next = offset + dir * limit;
+      if (next < 0 || next >= total) return;
+      reload(next);
+    }
+
+    async function removeItem(fusePath) {
+      if (!confirm('Remove this stub from the library?\n\n' + fusePath)) return;
+      try {
+        const r = await fetch('/api/library/remove', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: fusePath })
+        });
+        if (!r.ok) alert('Remove failed: ' + r.status + ' ' + (await r.text()).slice(0, 200));
+      } catch (e) { alert(String(e)); }
+      reload();
+    }
+
+    /* ---------- add dialog ---------- */
+
+    function openAdd() {
+      el('addMsg').textContent = '';
+      el('addDlg').showModal();
+      onTypeChange();
+    }
+
+    function onTypeChange() {
+      const isTV = el('a_type').value !== 'movie';
+      document.querySelectorAll('.tv-only').forEach(n => n.classList.toggle('hidden', !isTV));
+    }
+
+    // TMDB lookup goes through the server, which already holds the key - the
+    // browser never sees it, and the page keeps working if no key is set.
+    const debouncedTmdb = debounce(async () => {
+      const q = el('a_title').value.trim();
+      const box = el('tmdbBox');
+      if (q.length < 3) { box.classList.add('hidden'); return; }
+      const kind = el('a_type').value === 'movie' ? 'movie' : 'tv';
+      let hits = [];
+      try {
+        const r = await fetch('/api/tmdb/search?type=' + kind + '&query=' + encodeURIComponent(q));
+        if (r.ok) hits = (await r.json()) || [];
+      } catch (e) { /* leave the field as free text */ }
+      if (!hits.length) { box.classList.add('hidden'); return; }
+      box.innerHTML = hits.slice(0, 8).map(h =>
+        '<div class="tmdb-hit" onclick=\'pickTmdb(' + JSON.stringify(JSON.stringify(h)) + ')\'>' +
+        '<span>' + esc(h.title) + '</span> ' +
+        '<span class="text-slate-500 text-xs">' + (h.year || '') + '</span></div>'
+      ).join('');
+      box.classList.remove('hidden');
+    }, 350);
+
+    function pickTmdb(raw) {
+      const h = JSON.parse(raw);
+      el('a_title').value = h.title || '';
+      if (h.year) el('a_year').value = h.year;
+      if (h.imdb) el('a_imdb').value = h.imdb;
+      el('tmdbBox').classList.add('hidden');
+    }
+
+    async function submitAdd() {
+      const msg = el('addMsg');
+      const magnet = el('a_magnet').value.trim();
+      const title = el('a_title').value.trim();
+      if (!magnet) { msg.innerHTML = '<span class="text-red-400">Paste a magnet or infohash.</span>'; return; }
+      if (!title) { msg.innerHTML = '<span class="text-red-400">Title is required — it becomes the filename.</span>'; return; }
+
+      const body = {
+        type: el('a_type').value,
+        title: title,
+        year: +el('a_year').value || 0,
+        imdb: el('a_imdb').value.trim(),
+        file_index: +el('a_fileindex').value || 0
+      };
+      // A bare infohash is accepted in the same box as a full magnet link.
+      if (/^[0-9a-fA-F]{40}$/.test(magnet)) body.hash = magnet.toLowerCase();
+      else body.magnet = magnet;
+      if (el('a_type').value !== 'movie') {
+        body.season = +el('a_season').value || 0;
+        body.episode = +el('a_episode').value || 0;
+      }
+
+      el('addBtn').disabled = true;
+      msg.innerHTML = '<span class="text-slate-400">Adding… fetching torrent metadata can take a moment.</span>';
+      try {
+        const r = await fetch('/api/library/add', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const txt = await r.text();
+        if (r.ok) {
+          msg.innerHTML = '<span class="text-green-400">Added. Jellyfin will show it after its next library scan.</span>';
+          el('a_magnet').value = '';
+          reload(0);
+        } else {
+          msg.innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' + esc(txt.slice(0, 300)) + '</span>';
+        }
+      } catch (e) {
+        msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
+      } finally {
+        el('addBtn').disabled = false;
+      }
+    }
+
+    reload(0);
+  </script>
+</body>
+
+</html>

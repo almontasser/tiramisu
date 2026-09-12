@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -4370,6 +4371,84 @@ func main() {
 		json.NewEncoder(w).Encode(streams)
 	})
 
+	// Title lookup for the library page's add form. The filename a stub gets is
+	// built from the title and year, and the media server identifies the item by
+	// that filename — so a typo here quietly files a torrent as the wrong title.
+	// Resolving against TMDB makes that much harder to get wrong.
+	//
+	// Proxied rather than called from the browser so the API key stays server
+	// side; with no key configured this answers an empty list and the form falls
+	// back to free text.
+	http.HandleFunc("/api/tmdb/search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		key := gc().TMDBAPIKey
+		query := strings.TrimSpace(r.URL.Query().Get("query"))
+		if key == "" || query == "" {
+			w.Write([]byte(`[]`))
+			return
+		}
+		kind := "movie"
+		if r.URL.Query().Get("type") == "tv" {
+			kind = "tv"
+		}
+		u := fmt.Sprintf("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s",
+			kind, url.QueryEscape(key), url.QueryEscape(query))
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			w.Write([]byte(`[]`))
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			w.Write([]byte(`[]`))
+			return
+		}
+		defer resp.Body.Close()
+		var raw struct {
+			Results []struct {
+				ID           int    `json:"id"`
+				Title        string `json:"title"`
+				Name         string `json:"name"`
+				ReleaseDate  string `json:"release_date"`
+				FirstAirDate string `json:"first_air_date"`
+			} `json:"results"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			w.Write([]byte(`[]`))
+			return
+		}
+		type hit struct {
+			TMDB  int    `json:"tmdb"`
+			Title string `json:"title"`
+			Year  string `json:"year"`
+		}
+		hits := []hit{}
+		for _, it := range raw.Results {
+			title, date := it.Title, it.ReleaseDate
+			if title == "" {
+				title, date = it.Name, it.FirstAirDate
+			}
+			if title == "" {
+				continue
+			}
+			year := ""
+			if len(date) >= 4 {
+				year = date[:4]
+			}
+			hits = append(hits, hit{TMDB: it.ID, Title: title, Year: year})
+			if len(hits) == 8 {
+				break
+			}
+		}
+		json.NewEncoder(w).Encode(hits)
+	})
+
 	// Same-origin proxy to the GoStorm settings API. The Control Panel must not
 	// build an absolute URL of its own: behind a reverse proxy the GoStorm port is
 	// not exposed, and an http:// call from an https:// page is blocked as mixed
@@ -4601,6 +4680,7 @@ func main() {
 	)
 	dashHandler := dashboard.New(monCollector, logsDir)
 	http.HandleFunc("/dashboard", dashHandler.Dashboard)
+	http.HandleFunc("/library", dashHandler.Library)
 	http.HandleFunc("/api/health", dashHandler.Health)
 	http.HandleFunc("/api/torrents", dashHandler.Torrents)
 	http.HandleFunc("/api/speed-history", dashHandler.SpeedHistory)

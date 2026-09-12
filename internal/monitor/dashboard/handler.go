@@ -16,6 +16,9 @@ import (
 //go:embed dashboard.html
 var dashboardHTML []byte
 
+//go:embed library.html
+var libraryHTML []byte
+
 // Handler serves the dashboard and API endpoints.
 type Handler struct {
 	collector *collector.Collector
@@ -31,6 +34,14 @@ func New(c *collector.Collector, logsDir string) *Handler {
 func (h *Handler) Dashboard(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(dashboardHTML)
+}
+
+// Library serves the library browser. The dashboard's torrent panel only ever
+// shows what is streaming right now; this page lists every filed stub and lets
+// one be added by magnet.
+func (h *Handler) Library(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(libraryHTML)
 }
 
 // Health serves the /api/health JSON endpoint.
