@@ -60,6 +60,26 @@ func (h *Handler) Remove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// Missing serves GET /api/library/missing: every series compared with the
+// episodes TMDB says have aired. type is tv, anime, or all. refresh=1 drops
+// the cached TMDB answers first, which makes that one request slow.
+func (h *Handler) Missing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("refresh") == "1" {
+		h.mgr.ResetMissingCache()
+	}
+	rep, err := h.mgr.Missing(r.Context(), q.Get("type"))
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
 // Inspect serves POST /api/library/inspect: what is inside a torrent, and how
 // it looks like it should be filed. Nothing is written.
 func (h *Handler) Inspect(w http.ResponseWriter, r *http.Request) {

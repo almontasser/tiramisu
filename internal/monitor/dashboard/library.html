@@ -158,6 +158,26 @@
     .filerow:hover {
       background: rgba(148, 163, 184, .05);
     }
+    .tab {
+      padding: .5rem .9rem;
+      font-size: .8rem;
+      font-weight: 600;
+      color: #94a3b8;
+      background: transparent;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      cursor: pointer;
+    }
+
+    .tab:focus-visible {
+      outline: 2px solid #3b82f6;
+      outline-offset: 2px;
+    }
+
+    .tab-on {
+      color: #e2e8f0;
+      border-bottom-color: #3b82f6;
+    }
   </style>
 </head>
 
@@ -175,6 +195,12 @@
       </div>
     </div>
 
+    <div class="flex gap-1 border-b border-slate-700/60" role="tablist">
+      <button class="tab tab-on" id="tabStubs" role="tab" aria-selected="true" onclick="showTab('stubs')">Stubs</button>
+      <button class="tab" id="tabMissing" role="tab" aria-selected="false" onclick="showTab('missing')">Missing episodes</button>
+    </div>
+
+    <div id="stubsView" class="space-y-4">
     <div class="glass rounded-xl p-3 flex flex-wrap gap-3 items-end">
       <div style="flex:1 1 260px">
         <label>Search (name or infohash)</label>
@@ -228,6 +254,60 @@
           <button class="btn btn-ghost" id="prev" onclick="page(-1)">Prev</button>
           <button class="btn btn-ghost" id="next" onclick="page(1)">Next</button>
         </span>
+      </div>
+    </div>
+    </div>
+
+    <!-- Every series compared with the episodes TMDB says have aired. -->
+    <div id="missingView" class="space-y-4 hidden">
+      <div class="glass rounded-xl p-3 flex flex-wrap gap-3 items-end">
+        <div style="flex:1 1 240px">
+          <label for="mq">Search show</label>
+          <input id="mq" placeholder="e.g. Supernatural" oninput="renderMissing()">
+        </div>
+        <div style="width:140px">
+          <label for="mkind">Type</label>
+          <select id="mkind" onchange="loadMissing(false)">
+            <option value="all">All</option>
+            <option value="tv">TV</option>
+            <option value="anime">Anime</option>
+          </select>
+        </div>
+        <div style="width:170px">
+          <label for="mcat">Gap kind</label>
+          <select id="mcat" onchange="renderMissing()">
+            <option value="">Any</option>
+            <option value="only_e01">Only E01 filed</option>
+            <option value="whole">Whole season</option>
+            <option value="partial">Partial season</option>
+          </select>
+        </div>
+        <label class="flex items-center gap-2 text-sm text-slate-300" style="text-transform:none;letter-spacing:normal;margin:0 0 .45rem">
+          <input type="checkbox" id="mmis" onchange="renderMissing()"> Include numbering mismatches
+        </label>
+        <button class="btn btn-ghost" onclick="loadMissing(true)">Recheck TMDB</button>
+      </div>
+      <div id="msummary" class="text-xs text-slate-400">—</div>
+      <div class="glass rounded-xl overflow-hidden">
+        <div class="max-h-[65vh] overflow-y-auto">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:30%">Show</th>
+                <th>Type</th>
+                <th>Aired</th>
+                <th>Filed</th>
+                <th>Missing</th>
+                <th>Gaps</th>
+              </tr>
+            </thead>
+            <tbody id="mrows">
+              <tr>
+                <td colspan="6" class="text-slate-500 p-4">Open this tab to build the report.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -647,6 +727,10 @@
       if (el('a_type').value !== 'movie') {
         body.season = +el('a_season').value || 0;
         body.episode = +el('a_episode').value || 0;
+        // The series folder takes its year from first_air_date, not from year.
+        // Without it the stub lands in a folder with no year, next to the one
+        // Seerr and the sync engines file the same show into.
+        if (+el('a_year').value) body.first_air_date = String(+el('a_year').value);
       }
 
       el('addBtn').disabled = true;
@@ -670,6 +754,94 @@
       } catch (e) {
         msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
       } finally { el('addBtn').disabled = false; }
+    }
+
+    /* ---------------------------- missing --------------------------- */
+
+    let missing = null;
+
+    function showTab(name) {
+      const m = name === 'missing';
+      el('stubsView').classList.toggle('hidden', m);
+      el('missingView').classList.toggle('hidden', !m);
+      el('tabStubs').classList.toggle('tab-on', !m);
+      el('tabMissing').classList.toggle('tab-on', m);
+      el('tabStubs').setAttribute('aria-selected', String(!m));
+      el('tabMissing').setAttribute('aria-selected', String(m));
+      if (m && !missing) loadMissing(false);
+    }
+
+    // The first report makes two TMDB requests per show, so it takes a while.
+    // Later reports come from Tiramisu's cache until Recheck TMDB clears it.
+    async function loadMissing(refresh) {
+      el('mrows').innerHTML = '<tr><td colspan="6" class="text-slate-500 p-4">Comparing every show with TMDB…</td></tr>';
+      try {
+        const r = await fetch('/api/library/missing?type=' + el('mkind').value + (refresh ? '&refresh=1' : ''));
+        const txt = await r.text();
+        if (!r.ok) throw new Error(txt.slice(0, 300));
+        missing = JSON.parse(txt);
+      } catch (e) {
+        el('mrows').innerHTML = '<tr><td colspan="6" class="text-red-400 p-4">' + esc(String(e.message || e)) + '</td></tr>';
+        return;
+      }
+      renderMissing();
+    }
+
+    const GAP = {
+      whole: ['Whole season', 'bg-red-500/15 text-red-300'],
+      only_e01: ['Only E01', 'bg-amber-500/15 text-amber-300'],
+      partial: ['Partial', 'bg-sky-500/15 text-sky-300']
+    };
+
+    function epRanges(list) {
+      const code = n => 'E' + String(n).padStart(2, '0');
+      const out = [];
+      let a = list[0], b = list[0];
+      for (const e of list.slice(1).concat([null])) {
+        if (e !== null && e === b + 1) { b = e; continue; }
+        out.push(a === b ? code(a) : code(a) + '–' + String(b).padStart(2, '0'));
+        if (e !== null) { a = b = e; }
+      }
+      return out.join(', ');
+    }
+
+    function renderMissing() {
+      if (!missing) return;
+      const q = el('mq').value.trim().toLowerCase();
+      const cat = el('mcat').value;
+      const withMismatch = el('mmis').checked;
+      const norm = v => (v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const rows = missing.shows.filter(s => {
+        if (!s.missing && !s.error) return false;
+        if (s.mismatch && !withMismatch) return false;
+        if (q && !(s.folder + ' ' + (s.tmdb_name || '')).toLowerCase().includes(q)) return false;
+        if (cat && !(s.seasons || []).some(x => x.category === cat)) return false;
+        return true;
+      });
+      const t = missing.totals, bc = t.by_category || {};
+      el('msummary').textContent = t.shows + ' shows · ' + t.aired + ' episodes aired · ' + t.filed + ' filed · ' +
+        t.missing + ' missing (whole seasons ' + (bc.whole || 0) + ', only E01 ' + (bc.only_e01 || 0) +
+        ', partial ' + (bc.partial || 0) + ') · ' + t.mismatch + ' shows numbered differently from TMDB · checked ' +
+        new Date(missing.generated).toLocaleString();
+      el('mrows').innerHTML = rows.length ? rows.map(s => {
+        const renamed = s.tmdb_name && norm(s.tmdb_name) !== norm(s.title);
+        const gaps = s.error ? '<span class="text-red-400">' + esc(s.error) + '</span>' :
+          (s.seasons || []).filter(x => !cat || x.category === cat).map(x =>
+            '<div class="flex gap-2 items-baseline"><span class="mono text-slate-400">S' + String(x.season).padStart(2, '0') + '</span>' +
+            '<span class="pill ' + GAP[x.category][1] + '">' + GAP[x.category][0] + '</span>' +
+            '<span class="mono text-[11px] text-slate-400">' + (x.category === 'whole' ? 'all ' + x.expected : epRanges(x.missing)) +
+            '</span></div>').join('');
+        return '<tr>' +
+          '<td><div>' + esc(s.folder.replace(/_/g, ' ')) + '</div>' +
+          (renamed ? '<div class="text-[11px] text-slate-500">TMDB: ' + esc(s.tmdb_name) + '</div>' : '') +
+          (s.mismatch ? '<div class="text-[11px] text-amber-300">Numbered differently from TMDB, so these gaps may be wrong</div>' : '') +
+          '</td>' +
+          '<td class="text-slate-400">' + s.tree + '</td>' +
+          '<td class="mono">' + s.aired + '</td>' +
+          '<td class="mono">' + s.filed + '</td>' +
+          '<td class="mono ' + (s.missing ? 'text-red-300' : '') + '">' + s.missing + '</td>' +
+          '<td class="space-y-1">' + gaps + '</td></tr>';
+      }).join('') : '<tr><td colspan="6" class="text-slate-500 p-4">No gaps match these filters.</td></tr>';
     }
 
     reload(0);

@@ -48,6 +48,9 @@ type Config struct {
 	GoStormURL string
 	GoStorm    GoStorm
 	Registry   EpisodeRegistry
+	// Catalog answers how many episodes of each show have aired, for the
+	// missing-episode report. Nil turns the report off.
+	Catalog ShowCatalog
 	// InvalidatePath, when set, drops the FUSE layer's cached state for a removed stub.
 	InvalidatePath func(string)
 	// Blacklist, when set, records a removed release the way the FUSE unlink handler

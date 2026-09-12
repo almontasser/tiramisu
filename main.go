@@ -4692,12 +4692,16 @@ func main() {
 			MediaServer:  mediaserver.New(gc().MediaServerType, gc().Plex.URL, gc().Plex.Token),
 			MovieSection: gc().Plex.LibraryID,
 			TVSection:    gc().Plex.TVLibraryID,
+			// Read through a func so a key changed in config.json applies to the
+			// missing-episode report without a restart.
+			Catalog: library.NewTMDBCatalog(func() string { return gc().TMDBAPIKey }),
 		})
 		libHandler := library.NewHandler(libMgr)
 		http.HandleFunc("/api/library/add", libHandler.Add)
 		http.HandleFunc("/api/library/remove", libHandler.Remove)
 		http.HandleFunc("/api/library/list", libHandler.List)
 		http.HandleFunc("/api/library/inspect", libHandler.Inspect)
+		http.HandleFunc("/api/library/missing", libHandler.Missing)
 	}
 
 	// Health Monitor + Dashboard (Fase 5)
