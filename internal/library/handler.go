@@ -60,6 +60,26 @@ func (h *Handler) Remove(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// Inspect serves POST /api/library/inspect: what is inside a torrent, and how
+// it looks like it should be filed. Nothing is written.
+func (h *Handler) Inspect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var req InspectRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "malformed body")
+		return
+	}
+	resp, err := h.mgr.Inspect(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // ListPage is the paged form of a library listing. The bare array returned by
 // List is kept for existing callers; anything with a UI wants a window plus the
 // total, or it ends up shipping every episode in one response.

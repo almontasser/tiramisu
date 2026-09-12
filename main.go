@@ -4663,6 +4663,7 @@ func main() {
 		http.HandleFunc("/api/library/add", libHandler.Add)
 		http.HandleFunc("/api/library/remove", libHandler.Remove)
 		http.HandleFunc("/api/library/list", libHandler.List)
+		http.HandleFunc("/api/library/inspect", libHandler.Inspect)
 	}
 
 	// Health Monitor + Dashboard (Fase 5)

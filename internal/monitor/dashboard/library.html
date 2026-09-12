@@ -30,6 +30,11 @@
       width: 100%;
     }
 
+    input[type=checkbox],
+    input[type=radio] {
+      width: auto;
+    }
+
     input:focus,
     select:focus,
     textarea:focus {
@@ -60,9 +65,8 @@
       color: #fff;
     }
 
-    .btn-primary:disabled {
-      background: #1e3a5f;
-      color: #64748b;
+    .btn:disabled {
+      opacity: .5;
       cursor: not-allowed;
     }
 
@@ -124,11 +128,11 @@
       border: 1px solid rgba(148, 163, 184, .18);
       border-radius: .75rem;
       padding: 0;
-      width: min(620px, 94vw);
+      width: min(760px, 95vw);
     }
 
     dialog::backdrop {
-      background: rgba(2, 6, 23, .7);
+      background: rgba(2, 6, 23, .72);
     }
 
     .tmdb-hit {
@@ -139,6 +143,20 @@
 
     .tmdb-hit:hover {
       background: rgba(59, 130, 246, .15);
+    }
+
+    .filerow {
+      display: grid;
+      grid-template-columns: 22px 1fr 74px 66px;
+      gap: .4rem;
+      align-items: center;
+      padding: .25rem .4rem;
+      font-size: .75rem;
+      border-bottom: 1px solid rgba(148, 163, 184, .06);
+    }
+
+    .filerow:hover {
+      background: rgba(148, 163, 184, .05);
     }
   </style>
 </head>
@@ -214,16 +232,50 @@
     </div>
   </div>
 
+  <!-- ---------------------------------------------------------- add ----- -->
   <dialog id="addDlg">
     <form method="dialog" onsubmit="return false">
       <div class="px-4 py-3 border-b border-slate-700/60 flex justify-between items-center">
         <strong class="text-sm">Add a torrent</strong>
         <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Close</button>
       </div>
-      <div class="p-4 space-y-3">
+
+      <div class="p-4 space-y-3 max-h-[72vh] overflow-y-auto">
         <div>
           <label>Magnet or infohash</label>
-          <textarea id="a_magnet" rows="2" placeholder="magnet:?xt=urn:btih:… or a 40-char infohash"></textarea>
+          <div class="flex gap-2">
+            <textarea id="a_magnet" rows="2" placeholder="magnet:?xt=urn:btih:… or a 40-char infohash"></textarea>
+            <button class="btn btn-primary whitespace-nowrap" id="inspectBtn" onclick="inspect()">Inspect</button>
+          </div>
+          <div class="text-[11px] text-slate-500 mt-1">
+            Inspect reads the torrent's file list and works out whether it is a film, one
+            episode, or a season pack — so the fields below are filled from what is
+            actually inside rather than from the name.
+          </div>
+        </div>
+
+        <div id="inspectMsg" class="text-xs"></div>
+
+        <div id="inspectPanel" class="hidden space-y-2">
+          <div class="glass rounded-lg p-3 space-y-1">
+            <div class="text-sm font-semibold" id="i_title">—</div>
+            <div class="text-xs text-slate-400 flex flex-wrap gap-2 items-center">
+              <span id="i_size"></span>
+              <span id="i_res" class="pill bg-blue-500/15 text-blue-300 hidden"></span>
+              <span id="i_kind" class="pill bg-purple-500/15 text-purple-300"></span>
+            </div>
+            <div class="text-xs text-amber-300/90" id="i_note"></div>
+          </div>
+
+          <div>
+            <label>Files <span class="normal-case text-slate-500" id="i_filecount"></span></label>
+            <div class="glass rounded-lg max-h-52 overflow-y-auto" id="i_files"></div>
+            <div class="text-[11px] text-slate-500 mt-1">
+              Pick which file the stub points at. <em>Auto</em> uses the largest video file,
+              which is what you want unless the torrent bundles more than one feature.
+              File choice is ignored when filing a pack — every episode gets its own stub.
+            </div>
+          </div>
         </div>
 
         <div class="flex gap-3">
@@ -236,9 +288,8 @@
             </select>
           </div>
           <div style="flex:1">
-            <label>Title (drives the filename &mdash; must match the real title)</label>
-            <input id="a_title" placeholder="Start typing to search TMDB…" oninput="debouncedTmdb()"
-              autocomplete="off">
+            <label>Title (becomes the filename)</label>
+            <input id="a_title" placeholder="Start typing to search TMDB…" oninput="debouncedTmdb()" autocomplete="off">
             <div id="tmdbBox" class="glass rounded-lg mt-1 hidden max-h-48 overflow-y-auto"></div>
           </div>
           <div style="width:90px">
@@ -247,7 +298,7 @@
           </div>
         </div>
 
-        <div class="flex gap-3">
+        <div class="flex gap-3 items-end">
           <div style="flex:1">
             <label>IMDB id (optional)</label>
             <input id="a_imdb" placeholder="tt1234567">
@@ -256,23 +307,23 @@
             <label>Season</label>
             <input id="a_season" type="number" placeholder="1">
           </div>
-          <div style="width:110px" class="tv-only hidden">
+          <div style="width:120px" class="tv-only hidden">
             <label>Episode</label>
             <input id="a_episode" type="number" placeholder="blank = pack">
           </div>
-          <div style="width:110px">
+          <div style="width:120px">
             <label>File index</label>
-            <input id="a_fileindex" type="number" placeholder="0 = largest">
+            <input id="a_fileindex" type="number" placeholder="0 = auto">
           </div>
         </div>
 
         <div class="text-[11px] text-slate-400 leading-relaxed">
-          The stub is written immediately, but Jellyfin only shows it after its next library scan.
-          Leaving <em>Episode</em> blank with a season set files the torrent as a season pack.
+          The stub is written immediately; Jellyfin shows it after its next library scan.
         </div>
 
         <div id="addMsg" class="text-xs"></div>
       </div>
+
       <div class="px-4 py-3 border-t border-slate-700/60 flex justify-end gap-2">
         <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Cancel</button>
         <button class="btn btn-primary" id="addBtn" onclick="submitAdd()">Add to library</button>
@@ -280,8 +331,35 @@
     </form>
   </dialog>
 
+  <!-- ------------------------------------------------------- remove ----- -->
+  <dialog id="rmDlg">
+    <form method="dialog" onsubmit="return false">
+      <div class="px-4 py-3 border-b border-slate-700/60"><strong class="text-sm">Remove from library</strong></div>
+      <div class="p-4 space-y-3">
+        <div class="text-sm text-slate-300 mono break-all" id="rm_path"></div>
+        <label class="flex items-start gap-2 normal-case tracking-normal text-sm text-slate-300"
+          style="text-transform:none;letter-spacing:normal">
+          <input type="checkbox" id="rm_blacklist" class="mt-1">
+          <span>
+            Don't re-add
+            <span class="block text-[11px] text-slate-500">
+              Without this the sync engines are free to add the title back on their next
+              run. Tick it to remove for good; leave it clear if you are removing to
+              replace the release with a better one.
+            </span>
+          </span>
+        </label>
+        <div id="rmMsg" class="text-xs"></div>
+      </div>
+      <div class="px-4 py-3 border-t border-slate-700/60 flex justify-end gap-2">
+        <button class="btn btn-ghost" onclick="document.getElementById('rmDlg').close()">Cancel</button>
+        <button class="btn btn-danger" id="rmBtn" onclick="confirmRemove()">Remove</button>
+      </div>
+    </form>
+  </dialog>
+
   <script>
-    let offset = 0, total = 0, activeHashes = new Set();
+    let offset = 0, total = 0, activeHashes = new Set(), inspected = null, rmTarget = null;
 
     const el = id => document.getElementById(id);
     const fmtSize = b => {
@@ -290,20 +368,17 @@
       while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
       return v.toFixed(1) + ' ' + u[i];
     };
-    const esc = s => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const esc = s => (s || '').replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-    function debounce(fn, ms) {
-      let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) };
-    }
+    function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
     const debouncedReload = debounce(() => reload(0), 300);
 
-    // Name shown to a person: the stub filename minus the directory and the
-    // hash suffix the filer appends.
+    // Name shown to a person: the stub filename minus directory and hash suffix.
     function pretty(fusePath) {
       const base = (fusePath || '').split('/').pop().replace(/\.mkv$/i, '');
       return base.replace(/_[0-9a-f]{8}$/, '').replace(/_/g, ' ');
     }
-
     function kindOf(fusePath) {
       const top = (fusePath || '').split('/')[0];
       return top === 'tv' || top === 'anime' ? top : 'movie';
@@ -311,8 +386,7 @@
 
     async function loadActive() {
       try {
-        const r = await fetch('/api/torrents');
-        const d = await r.json();
+        const d = await (await fetch('/api/torrents')).json();
         activeHashes = new Set((d || []).map(t => (t.hash || '').toLowerCase()));
       } catch (e) { activeHashes = new Set(); }
     }
@@ -321,73 +395,82 @@
       if (newOffset !== undefined) offset = newOffset;
       const limit = +el('limit').value;
       const p = new URLSearchParams({
-        type: el('kind').value, search: el('q').value.trim(),
-        limit: limit, offset: offset
+        type: el('kind').value, search: el('q').value.trim(), limit, offset
       });
       el('rows').innerHTML = '<tr><td colspan="7" class="text-slate-500 p-4">Loading…</td></tr>';
       await loadActive();
       let d;
-      try {
-        const r = await fetch('/api/library/list?' + p);
-        d = await r.json();
-      } catch (e) {
+      try { d = await (await fetch('/api/library/list?' + p)).json(); }
+      catch (e) {
         el('rows').innerHTML = '<tr><td colspan="7" class="text-red-400 p-4">' + esc(String(e)) + '</td></tr>';
         return;
       }
       const items = d.items || [];
       total = d.total || 0;
-      if (!items.length) {
-        el('rows').innerHTML = '<tr><td colspan="7" class="text-slate-500 p-4">Nothing matches.</td></tr>';
-      } else {
-        el('rows').innerHTML = items.map(it => {
-          const h = (it.hash || '').toLowerCase();
-          const live = activeHashes.has(h);
-          const se = it.season ? 'S' + String(it.season).padStart(2, '0') +
-            (it.episode ? 'E' + String(it.episode).padStart(2, '0') : ' pack') : '—';
-          return '<tr>' +
-            '<td title="' + esc(it.fuse_path) + '">' + esc(pretty(it.fuse_path)) + '</td>' +
-            '<td class="text-slate-400">' + kindOf(it.fuse_path) + '</td>' +
-            '<td class="text-slate-400 mono">' + se + '</td>' +
-            '<td class="mono text-slate-300">' + fmtSize(it.size) + '</td>' +
-            '<td class="mono text-[11px] text-slate-500" title="' + esc(it.hash) + '">' +
-            esc((it.hash || '').slice(0, 12)) + '</td>' +
-            '<td>' + (live
-              ? '<span class="pill bg-green-500/15 text-green-400">active</span>'
-              : '<span class="pill bg-slate-500/10 text-slate-500">idle</span>') + '</td>' +
-            '<td class="text-right"><button class="btn btn-danger" onclick="removeItem(\'' +
-            esc(it.fuse_path) + '\')">Remove</button></td>' +
-            '</tr>';
-        }).join('');
-      }
-      const shown = items.length ? (offset + 1) + '–' + (offset + items.length) : '0';
-      el('count').textContent = shown + ' of ' + total;
+      el('rows').innerHTML = items.length ? items.map(it => {
+        const live = activeHashes.has((it.hash || '').toLowerCase());
+        const se = it.season ? 'S' + String(it.season).padStart(2, '0') +
+          (it.episode ? 'E' + String(it.episode).padStart(2, '0') : ' pack') : '—';
+        return '<tr>' +
+          '<td title="' + esc(it.fuse_path) + '">' + esc(pretty(it.fuse_path)) + '</td>' +
+          '<td class="text-slate-400">' + kindOf(it.fuse_path) + '</td>' +
+          '<td class="text-slate-400 mono">' + se + '</td>' +
+          '<td class="mono text-slate-300">' + fmtSize(it.size) + '</td>' +
+          '<td class="mono text-[11px] text-slate-500" title="' + esc(it.hash) + '">' +
+          esc((it.hash || '').slice(0, 12)) + '</td>' +
+          '<td>' + (live ? '<span class="pill bg-green-500/15 text-green-400">active</span>'
+            : '<span class="pill bg-slate-500/10 text-slate-500">idle</span>') + '</td>' +
+          '<td class="text-right"><button class="btn btn-danger" onclick="openRemove(\'' +
+          esc(it.fuse_path) + '\')">Remove</button></td></tr>';
+      }).join('') : '<tr><td colspan="7" class="text-slate-500 p-4">Nothing matches.</td></tr>';
+
+      el('count').textContent = (items.length ? (offset + 1) + '–' + (offset + items.length) : '0') + ' of ' + total;
       el('prev').disabled = offset <= 0;
       el('next').disabled = offset + items.length >= total;
     }
 
     function page(dir) {
-      const limit = +el('limit').value;
-      const next = offset + dir * limit;
+      const next = offset + dir * (+el('limit').value);
       if (next < 0 || next >= total) return;
       reload(next);
     }
 
-    async function removeItem(fusePath) {
-      if (!confirm('Remove this stub from the library?\n\n' + fusePath)) return;
+    /* ---------------------------- remove ---------------------------- */
+
+    function openRemove(fusePath) {
+      rmTarget = fusePath;
+      el('rm_path').textContent = fusePath;
+      el('rm_blacklist').checked = false;
+      el('rmMsg').textContent = '';
+      el('rmDlg').showModal();
+    }
+
+    async function confirmRemove() {
+      el('rmBtn').disabled = true;
       try {
         const r = await fetch('/api/library/remove', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: fusePath })
+          body: JSON.stringify({ path: rmTarget, blacklist: el('rm_blacklist').checked })
         });
-        if (!r.ok) alert('Remove failed: ' + r.status + ' ' + (await r.text()).slice(0, 200));
-      } catch (e) { alert(String(e)); }
-      reload();
+        if (!r.ok) {
+          el('rmMsg').innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' +
+            esc((await r.text()).slice(0, 240)) + '</span>';
+          return;
+        }
+        el('rmDlg').close();
+        reload();
+      } catch (e) {
+        el('rmMsg').innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
+      } finally { el('rmBtn').disabled = false; }
     }
 
-    /* ---------- add dialog ---------- */
+    /* ------------------------------ add ----------------------------- */
 
     function openAdd() {
       el('addMsg').textContent = '';
+      el('inspectMsg').textContent = '';
+      el('inspectPanel').classList.add('hidden');
+      inspected = null;
       el('addDlg').showModal();
       onTypeChange();
     }
@@ -397,8 +480,84 @@
       document.querySelectorAll('.tv-only').forEach(n => n.classList.toggle('hidden', !isTV));
     }
 
-    // TMDB lookup goes through the server, which already holds the key - the
-    // browser never sees it, and the page keeps working if no key is set.
+    async function inspect() {
+      const magnet = el('a_magnet').value.trim();
+      const msg = el('inspectMsg');
+      if (!magnet) { msg.innerHTML = '<span class="text-red-400">Paste a magnet or infohash first.</span>'; return; }
+      const body = /^[0-9a-fA-F]{40}$/.test(magnet)
+        ? { hash: magnet.toLowerCase() } : { magnet };
+      body.metadata_wait = 60;
+
+      el('inspectBtn').disabled = true;
+      msg.innerHTML = '<span class="text-slate-400">Fetching metadata from the swarm — up to 60s…</span>';
+      try {
+        const r = await fetch('/api/library/inspect', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const txt = await r.text();
+        if (!r.ok) {
+          msg.innerHTML = '<span class="text-red-400">' + esc(txt.slice(0, 300)) + '</span>';
+          return;
+        }
+        inspected = JSON.parse(txt);
+        msg.textContent = '';
+        renderInspect(inspected);
+      } catch (e) {
+        msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
+      } finally { el('inspectBtn').disabled = false; }
+    }
+
+    function renderInspect(d) {
+      el('i_title').textContent = d.title || '(unnamed torrent)';
+      el('i_size').textContent = fmtSize(d.size) + ' · ' + (d.files || []).length + ' files';
+      const res = el('i_res');
+      res.classList.toggle('hidden', !d.resolution);
+      res.textContent = d.resolution || '';
+      el('i_kind').textContent = d.pack ? (d.kind + ' pack') : d.kind;
+      el('i_note').textContent = d.note || '';
+      el('i_filecount').textContent = '(' + d.video_count + ' video)';
+
+      // Auto row first, then every file; non-video rows stay visible because a
+      // mislabelled extension is exactly when picking by hand matters.
+      const rows = ['<label class="filerow"><input type="radio" name="fidx" value="0" ' +
+        (d.file_index === 0 ? 'checked' : '') + '><span class="text-slate-300">Auto — largest video file</span>' +
+        '<span></span><span></span></label>'];
+      for (const f of d.files || []) {
+        const se = f.episode ? 'S' + String(f.season).padStart(2, '0') + 'E' + String(f.episode).padStart(2, '0') : '';
+        rows.push('<label class="filerow" title="' + esc(f.path) + '">' +
+          '<input type="radio" name="fidx" value="' + f.id + '" ' + (d.file_index === f.id ? 'checked' : '') + '>' +
+          '<span class="' + (f.video ? 'text-slate-200' : 'text-slate-500') + ' truncate">' + esc(f.name) + '</span>' +
+          '<span class="mono text-slate-400 text-right">' + fmtSize(f.size) + '</span>' +
+          '<span class="mono text-[11px] ' + (se ? 'text-amber-300' : 'text-slate-600') + '">' + (se || (f.video ? 'video' : '—')) + '</span>' +
+          '</label>');
+      }
+      el('i_files').innerHTML = rows.join('');
+      el('i_files').onchange = () => {
+        const v = document.querySelector('input[name=fidx]:checked');
+        if (v) el('a_fileindex').value = v.value;
+      };
+      el('inspectPanel').classList.remove('hidden');
+
+      // Prefill from the contents. Anime stays anime if the user already chose
+      // it: the engine cannot tell anime from ordinary TV, only the user can.
+      if (d.kind === 'tv' && el('a_type').value === 'movie') el('a_type').value = 'tv';
+      if (d.kind === 'movie' && el('a_type').value !== 'movie') el('a_type').value = 'movie';
+      onTypeChange();
+      el('a_season').value = d.season || '';
+      el('a_episode').value = d.pack ? '' : (d.episode || '');
+      el('a_fileindex').value = d.file_index || 0;
+      if (!el('a_title').value.trim() && d.title) {
+        // A release name is not a title, but it is a far better starting point
+        // for the TMDB search than an empty box.
+        el('a_title').value = d.title.replace(/[._]/g, ' ')
+          .replace(/\b(1080p|2160p|720p|4k|uhd|web-?dl|webrip|bluray|x26[45]|hevc|h26[45]|ddp?5\.?1|aac|hdr|dv|remux|repack|proper|complete)\b.*/i, '')
+          .replace(/\b(s\d{1,2}(e\d{1,2})?)\b.*/i, '').trim();
+        debouncedTmdb();
+      }
+    }
+
+    // TMDB lookup goes through the server, which holds the key.
     const debouncedTmdb = debounce(async () => {
       const q = el('a_title').value.trim();
       const box = el('tmdbBox');
@@ -408,23 +567,21 @@
       try {
         const r = await fetch('/api/tmdb/search?type=' + kind + '&query=' + encodeURIComponent(q));
         if (r.ok) hits = (await r.json()) || [];
-      } catch (e) { /* leave the field as free text */ }
+      } catch (e) { /* leave as free text */ }
       if (!hits.length) { box.classList.add('hidden'); return; }
-      box.innerHTML = hits.slice(0, 8).map(h =>
-        '<div class="tmdb-hit" onclick=\'pickTmdb(' + JSON.stringify(JSON.stringify(h)) + ')\'>' +
-        '<span>' + esc(h.title) + '</span> ' +
-        '<span class="text-slate-500 text-xs">' + (h.year || '') + '</span></div>'
-      ).join('');
+      box.innerHTML = hits.slice(0, 8).map((h, i) =>
+        '<div class="tmdb-hit" data-i="' + i + '"><span>' + esc(h.title) + '</span> ' +
+        '<span class="text-slate-500 text-xs">' + esc(h.year || '') + '</span></div>').join('');
+      box.onclick = ev => {
+        const row = ev.target.closest('.tmdb-hit');
+        if (!row) return;
+        const h = hits[+row.dataset.i];
+        el('a_title').value = h.title || '';
+        if (h.year) el('a_year').value = h.year;
+        box.classList.add('hidden');
+      };
       box.classList.remove('hidden');
     }, 350);
-
-    function pickTmdb(raw) {
-      const h = JSON.parse(raw);
-      el('a_title').value = h.title || '';
-      if (h.year) el('a_year').value = h.year;
-      if (h.imdb) el('a_imdb').value = h.imdb;
-      el('tmdbBox').classList.add('hidden');
-    }
 
     async function submitAdd() {
       const msg = el('addMsg');
@@ -434,13 +591,11 @@
       if (!title) { msg.innerHTML = '<span class="text-red-400">Title is required — it becomes the filename.</span>'; return; }
 
       const body = {
-        type: el('a_type').value,
-        title: title,
+        type: el('a_type').value, title,
         year: +el('a_year').value || 0,
         imdb: el('a_imdb').value.trim(),
         file_index: +el('a_fileindex').value || 0
       };
-      // A bare infohash is accepted in the same box as a full magnet link.
       if (/^[0-9a-fA-F]{40}$/.test(magnet)) body.hash = magnet.toLowerCase();
       else body.magnet = magnet;
       if (el('a_type').value !== 'movie') {
@@ -449,25 +604,26 @@
       }
 
       el('addBtn').disabled = true;
-      msg.innerHTML = '<span class="text-slate-400">Adding… fetching torrent metadata can take a moment.</span>';
+      msg.innerHTML = '<span class="text-slate-400">Adding…</span>';
       try {
         const r = await fetch('/api/library/add', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
         const txt = await r.text();
-        if (r.ok) {
-          msg.innerHTML = '<span class="text-green-400">Added. Jellyfin will show it after its next library scan.</span>';
-          el('a_magnet').value = '';
-          reload(0);
-        } else {
+        if (!r.ok) {
           msg.innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' + esc(txt.slice(0, 300)) + '</span>';
+          return;
         }
+        let n = 0;
+        try { n = (JSON.parse(txt).files || []).length; } catch (e) { }
+        msg.innerHTML = '<span class="text-green-400">Added' + (n ? ' — ' + n + ' stub' + (n > 1 ? 's' : '') : '') +
+          '. Jellyfin will show it after its next library scan.</span>';
+        el('a_magnet').value = '';
+        reload(0);
       } catch (e) {
         msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
-      } finally {
-        el('addBtn').disabled = false;
-      }
+      } finally { el('addBtn').disabled = false; }
     }
 
     reload(0);
