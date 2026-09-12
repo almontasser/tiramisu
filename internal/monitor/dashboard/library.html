@@ -289,7 +289,12 @@
           </div>
           <div style="flex:1">
             <label>Title (becomes the filename)</label>
-            <input id="a_title" placeholder="Start typing to search TMDB…" oninput="debouncedTmdb()" autocomplete="off">
+            <input id="a_title" placeholder="Start typing to search TMDB…"
+              oninput="debouncedTmdb(); checkTitle()" autocomplete="off">
+            <div id="titleWarn" class="hidden text-[11px] text-amber-300 mt-1">
+              This still looks like a release name. It becomes the folder name, so leave only
+              the title — a season or quality tag here creates a second, separate show.
+            </div>
             <div id="tmdbBox" class="glass rounded-lg mt-1 hidden max-h-48 overflow-y-auto"></div>
           </div>
           <div style="width:90px">
@@ -550,11 +555,51 @@
       if (!el('a_title').value.trim() && d.title) {
         // A release name is not a title, but it is a far better starting point
         // for the TMDB search than an empty box.
-        el('a_title').value = d.title.replace(/[._]/g, ' ')
-          .replace(/\b(1080p|2160p|720p|4k|uhd|web-?dl|webrip|bluray|x26[45]|hevc|h26[45]|ddp?5\.?1|aac|hdr|dv|remux|repack|proper|complete)\b.*/i, '')
-          .replace(/\b(s\d{1,2}(e\d{1,2})?)\b.*/i, '').trim();
+        el('a_title').value = cleanTitle(d.title);
+        if (!el('a_year').value) el('a_year').value = yearOf(d.title);
         debouncedTmdb();
       }
+      checkTitle();
+    }
+
+    /* Turning a release name into a title.
+     *
+     * This matters more than it looks: the title becomes the show folder, so
+     * "Ted Lasso (2020) Season 2" files seasons 2 and 3 into a folder of that
+     * name and the media server then treats it as a separate series from
+     * "Ted Lasso". Strip everything that is release metadata rather than name.
+     */
+    function stripJunk(name) {
+      let s = (name || '').replace(/[._]/g, ' ');
+      s = s.replace(/\b(1080p|2160p|720p|480p|4k|uhd|web[- ]?dl|webrip|bluray|bdrip|hdtv|x26[45]|h\.?26[45]|hevc|avc|ddp?\s?5\.?1|aac|ac3|atmos|hdr10?\+?|dv|remux|repack|proper|internal|complete|multi|dual)\b.*/i, '');
+      s = s.replace(/\b(s\d{1,2}(\s?e\d{1,3})?|seasons?\s*\d{1,2}|series\s*\d{1,2})\b.*/i, '');
+      return s;
+    }
+
+    function cleanTitle(name) {
+      let s = stripJunk(name);
+      s = s.replace(/[\(\[]\s*(19|20)\d{2}\s*[\)\]]/g, ' ');
+      s = s.replace(/[\[\(][^\])]*$/, '');
+      s = s.replace(/[\s\-_.\[\(\)\]]+$/, '').replace(/\s{2,}/g, ' ').trim();
+      // A trailing year is the release year, not part of the name — release
+      // names put it straight after the title. Keep it when it IS the title,
+      // so "1917" survives and "Blade Runner 2049 2017" loses only the 2017.
+      const trimmed = s.replace(/\s+\b(19|20)\d{2}\b$/, '').trim();
+      return trimmed || s;
+    }
+
+    function yearOf(name) {
+      const m = stripJunk(name).match(/\b(19|20)\d{2}\b/g);
+      return m ? m[m.length - 1] : '';
+    }
+
+    // Last line of defence: say so plainly when the title still looks like a
+    // release name, because the damage (a duplicate show folder) only shows up
+    // later in the media server.
+    function checkTitle() {
+      const t = el('a_title').value;
+      const bad = /\b(seasons?\s*\d|series\s*\d|s\d{2}(e\d{2})?|\d{3,4}p|web[- ]?dl|bluray|x26[45]|hevc)\b/i.test(t);
+      el('titleWarn').classList.toggle('hidden', !bad);
     }
 
     // TMDB lookup goes through the server, which holds the key.
@@ -579,6 +624,7 @@
         el('a_title').value = h.title || '';
         if (h.year) el('a_year').value = h.year;
         box.classList.add('hidden');
+        checkTitle();
       };
       box.classList.remove('hidden');
     }, 350);
