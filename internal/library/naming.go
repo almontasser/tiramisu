@@ -151,6 +151,16 @@ func IsVideoFile(path string) bool {
 	return false
 }
 
+// reExtrasDir matches a directory of bonus material. Packs keep podcasts and
+// featurettes there under names such as "S00E40 - Inside the Episode", which
+// parse as episodes.
+var reExtrasDir = regexp.MustCompile(`(?i)(^|/)(specials?|extras?|featurettes?|bonus|behind[ ._-]the[ ._-]scenes|deleted[ ._-]scenes|interviews?|trailers?|samples?)(/|$)`)
+
+// IsExtrasPath reports whether a torrent file sits in a bonus-material directory.
+func IsExtrasPath(path string) bool {
+	return reExtrasDir.MatchString(filepath.ToSlash(filepath.Dir(path)))
+}
+
 // WriteStub writes the virtual .mkv: a small JSON file the FUSE layer exposes at the
 // declared size.
 func WriteStub(path, streamURL string, size int64, magnet, imdbID string) error {

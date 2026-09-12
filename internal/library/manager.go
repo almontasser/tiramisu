@@ -448,12 +448,34 @@ func (m *Manager) pickFile(index int, files []FileStat) (*FileStat, error) {
 // kind is passed rather than re-derived from req.Type: validate normalises the
 // caller's spelling ("show", "series", "episode") into a local kind and never
 // writes it back, so req.Type here may still hold any of the aliases.
-func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, hash, magnet string, info *TorrentStats, dropped map[string]bool) ([]AddedFile, error) {
-	type episodeFile struct {
-		file    FileStat
-		season  int
-		episode int
+// episodeFile is one torrent file and the episode it is filed as.
+type episodeFile struct {
+	file    FileStat
+	season  int
+	episode int
+}
+
+// packEpisodes names the episodes in a pack by their files' own SxxExx. Files
+// in a bonus-material directory are left out, and so is anything numbered
+// season 0. The add used to file those under the season it was asked for: a
+// pack's "Specials/S00E40 - Inside the Episode" became episode 40 of season 2,
+// and 18 podcasts and featurettes became The Last of Us S02E40-E57.
+func packEpisodes(files []FileStat) []episodeFile {
+	var out []episodeFile
+	for _, f := range files {
+		if !IsVideoFile(f.Path) || IsExtrasPath(f.Path) {
+			continue
+		}
+		season, episode := ParseSeasonEpisode(filepath.Base(f.Path))
+		if season == 0 || episode == 0 {
+			continue
+		}
+		out = append(out, episodeFile{f, season, episode})
 	}
+	return out
+}
+
+func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, hash, magnet string, info *TorrentStats, dropped map[string]bool) ([]AddedFile, error) {
 	var wanted []episodeFile
 
 	if req.Episode > 0 {
@@ -463,19 +485,7 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 		}
 		wanted = append(wanted, episodeFile{*file, req.Season, req.Episode})
 	} else {
-		for _, f := range info.FileStats {
-			if !IsVideoFile(f.Path) {
-				continue
-			}
-			season, episode := ParseSeasonEpisode(filepath.Base(f.Path))
-			if episode == 0 {
-				continue
-			}
-			if season == 0 {
-				season = req.Season
-			}
-			wanted = append(wanted, episodeFile{f, season, episode})
-		}
+		wanted = packEpisodes(info.FileStats)
 		if len(wanted) == 0 {
 			return nil, errf(http.StatusUnprocessableEntity, "no episode file could be named in this torrent")
 		}
@@ -644,14 +654,16 @@ func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileSta
 	if req.FileIndex > 0 {
 		return m.pickFile(req.FileIndex, files)
 	}
+	var only *FileStat
 	videos := 0
 	for i := range files {
-		if !IsVideoFile(files[i].Path) {
+		if !IsVideoFile(files[i].Path) || IsExtrasPath(files[i].Path) {
 			continue
 		}
 		videos++
-		if season, episode := ParseSeasonEpisode(filepath.Base(files[i].Path)); episode == req.Episode &&
-			(season == req.Season || season == 0) {
+		only = &files[i]
+		// Season 0 is a special, not the same-numbered episode of this season.
+		if season, episode := ParseSeasonEpisode(filepath.Base(files[i].Path)); episode == req.Episode && season == req.Season {
 			return &files[i], nil
 		}
 	}
@@ -665,7 +677,15 @@ func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileSta
 		return nil, errf(http.StatusUnprocessableEntity,
 			"no file in this torrent is named S%02dE%02d; pass file_index to choose one", req.Season, req.Episode)
 	}
-	return m.pickFile(0, files)
+	if videos == 0 {
+		return nil, errf(http.StatusUnprocessableEntity, "the torrent holds no episode file")
+	}
+	// A lone file named for another episode is that episode, not this one.
+	if _, episode := ParseSeasonEpisode(filepath.Base(only.Path)); episode > 0 {
+		return nil, errf(http.StatusUnprocessableEntity,
+			"the torrent's only episode file is %s, not S%02dE%02d", filepath.Base(only.Path), req.Season, req.Episode)
+	}
+	return only, nil
 }
 
 func (m *Manager) section(kind string) int {

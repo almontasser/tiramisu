@@ -133,7 +133,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 		if item.Size > biggest.Size {
 			biggest = item
 		}
-		if episode > 0 {
+		if episode > 0 && season > 0 && !IsExtrasPath(f.Path) {
 			episodes++
 			seasonSet[season] = true
 		}
