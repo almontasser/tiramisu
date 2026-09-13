@@ -212,7 +212,7 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 
 	e.logger.Printf("[WatchlistSync] Done: %d added, %d skipped", added, skipped)
 	if added > 0 {
-		e.mediasrv.RefreshLibrary(context.Background(), e.sectionID)
+		mediaserver.Refresh(context.Background(), e.mediasrv, "movies", e.sectionID)
 	}
 
 	return nil

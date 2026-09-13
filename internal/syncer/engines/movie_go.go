@@ -242,8 +242,8 @@ func (e *MovieGoEngine) Run(ctx context.Context) error {
 	e.rehydrateMissingTorrents(ctx)
 	e.cleanupOrphanedFiles(ctx)
 
-	// Plex skips this without a section ID; Jellyfin refreshes every library and ignores it.
-	if err := e.mediasrv.RefreshLibrary(context.Background(), e.plexLib); err != nil {
+	// Plex skips this without a section ID; Jellyfin refreshes the movies library.
+	if err := mediaserver.Refresh(context.Background(), e.mediasrv, "movies", e.plexLib); err != nil {
 		e.logger.Printf("[MovieSync] Warning: media server library refresh failed: %v", err)
 	}
 
