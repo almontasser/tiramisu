@@ -498,7 +498,7 @@ func (e *TVGoEngine) loadRegistry() map[string]TVEpisodeEntry {
 			reg := make(map[string]TVEpisodeEntry)
 			for _, entry := range entries {
 				reg[entry.EpisodeKey] = TVEpisodeEntry{
-					QualityScore: entry.QualityScore,
+					QualityScore: protectedScore(entry.QualityScore, entry.Source),
 					Hash:         entry.Hash,
 					FilePath:     entry.FilePath,
 					Source:       entry.Source,
@@ -1089,6 +1089,12 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 
 	// Title blacklist check
 	if e.isBlacklisted(title) {
+		return nil
+	}
+
+	// A fan re-edit numbers its files its own way: One Pace's batch was a
+	// candidate for ONE PIECE's first season.
+	if reTVFanEdit.MatchString(title) {
 		return nil
 	}
 
