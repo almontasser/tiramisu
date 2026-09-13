@@ -6,18 +6,39 @@ import (
 	"os"
 	"path/filepath"
 
+	"tiramisu/internal/catalog/tmdb"
 	"tiramisu/internal/config"
 	"tiramisu/internal/metadb"
 	"tiramisu/internal/prowlarr"
 )
 
+// TVSyncMode chooses which series a TV engine run covers.
+type TVSyncMode string
+
+const (
+	// TVModeAll covers every series, anime included, as upstream does.
+	TVModeAll TVSyncMode = ""
+	// TVModeTV covers the series outside the anime tree.
+	TVModeTV TVSyncMode = "tv"
+	// TVModeAnime covers anime alone.
+	TVModeAnime TVSyncMode = "anime"
+)
+
 // TVSyncer runs the TV sync in pure Go (Fase 3).
 type TVSyncer struct {
 	engine *TVGoEngine
+	name   string
 }
 
 // TVSyncerConfig holds config for the Go TV engine.
 type TVSyncerConfig struct {
+	// Name is the scheduler job name, and names the log file: "tv" by default,
+	// "anime" for the anime job.
+	Name string
+	// Mode is read at the start of every run, so enabling the anime job in the
+	// control panel takes anime out of the TV job without a restart. Nil means
+	// TVModeAll.
+	Mode            func() TVSyncMode
 	GoStormURL      string
 	TMDBAPIKey      string
 	TorrentioURL    string
@@ -59,8 +80,14 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 	if logsDir == "" {
 		logsDir = filepath.Join(binDir, "logs")
 	}
+	name := cfg.Name
+	if name == "" {
+		name = "tv"
+	}
 
 	engineCfg := TVEngineConfig{
+		Name:            name,
+		Mode:            cfg.Mode,
 		GoStormURL:      cfg.GoStormURL,
 		TMDBAPIKey:      cfg.TMDBAPIKey,
 		TorrentioURL:    cfg.TorrentioURL,
@@ -82,16 +109,36 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		InvalidatePath:  cfg.InvalidatePath,
 	}
 
-	return &TVSyncer{
-		engine: NewTVGoEngine(engineCfg, cfg.DB),
-	}
+	engine := NewTVGoEngine(engineCfg, cfg.DB)
+	engine.name = name
+	engine.mode = cfg.Mode
+	return &TVSyncer{engine: engine, name: name}
 }
 
-func (s *TVSyncer) Name() string { return "tv" }
+func (s *TVSyncer) Name() string { return s.name }
 
 func (s *TVSyncer) Run(ctx context.Context) error {
 	if err := s.engine.Run(ctx); err != nil {
-		return fmt.Errorf("tv sync: %w", err)
+		return fmt.Errorf("%s sync: %w", s.name, err)
 	}
 	return nil
+}
+
+// currentMode is the series this engine's runs cover now.
+func (e *TVGoEngine) currentMode() TVSyncMode {
+	if e.mode == nil {
+		return TVModeAll
+	}
+	return e.mode()
+}
+
+// wants reports whether a discovered show belongs to the current mode.
+func (e *TVGoEngine) wants(show tmdb.TVShow) bool {
+	switch e.currentMode() {
+	case TVModeTV:
+		return !e.isAnimeShow(show)
+	case TVModeAnime:
+		return e.isAnimeShow(show)
+	}
+	return true
 }

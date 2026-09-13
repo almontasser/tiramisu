@@ -8,12 +8,17 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
 
 // ErrAlreadyRunning is returned when TriggerRun is called on a job that is already running.
 var ErrAlreadyRunning = errors.New("job already running")
+
+// ErrBusy is returned when TriggerRun is called on a job that must not run
+// alongside one that is running.
+var ErrBusy = errors.New("cannot run while another job of its group is running")
 
 // JobState tracks the runtime state of a scheduled job.
 type JobState struct {
@@ -33,9 +38,15 @@ type Syncer interface {
 // ErrNotRunning is returned when StopJob is called on a job that is not running.
 var ErrNotRunning = errors.New("job not running")
 
+// exclusionGroups names the jobs that must never run at the same time. The TV
+// and anime jobs are one engine over two trees, and each run's cleanup deletes
+// the stubs and torrents that the registry it loaded does not list, which would
+// include the other run's newest.
+var exclusionGroups = map[string]string{"tv": "series", "anime": "series"}
+
 // Scheduler manages scheduled and manual sync jobs.
 type Scheduler struct {
-	cfg     SchedulerConfig
+	cfg     func() SchedulerConfig
 	jobs    map[string]Syncer
 	state   *StateStore
 	mu      sync.Mutex
@@ -47,6 +58,7 @@ type SchedulerConfig struct {
 	Enabled       bool
 	MoviesSync    DailyJobConfig
 	TVSync        DailyJobConfig
+	AnimeSync     DailyJobConfig
 	WatchlistSync WatchlistSyncConfig
 }
 
@@ -56,6 +68,9 @@ type DailyJobConfig struct {
 	DaysOfWeek []int
 	Hour       int
 	Minute     int
+	// IntervalHours, above zero, runs the job every that many hours instead of
+	// on DaysOfWeek at Hour:Minute.
+	IntervalHours int
 }
 
 // WatchlistSyncConfig mirrors config.go.
@@ -64,8 +79,9 @@ type WatchlistSyncConfig struct {
 	IntervalHours int
 }
 
-// New creates a Scheduler.
-func New(cfg SchedulerConfig, jobs map[string]Syncer, statePath string) *Scheduler {
+// New creates a Scheduler. cfg is read on every tick, so a schedule saved from
+// the control panel applies within a minute, without a restart.
+func New(cfg func() SchedulerConfig, jobs map[string]Syncer, statePath string) *Scheduler {
 	ss, _ := NewStateStore(statePath)
 
 	s := &Scheduler{
@@ -82,12 +98,13 @@ func New(cfg SchedulerConfig, jobs map[string]Syncer, statePath string) *Schedul
 	}
 
 	// Calculate initial NextRun times
-	s.updateNextRuns()
+	s.updateNextRuns(cfg())
 
 	return s
 }
 
-// Run starts the scheduler loop. Blocks until stop is closed.
+// Run starts the scheduler loop. Blocks until stop is closed. Jobs start on
+// their own only while the configuration has the scheduler enabled.
 func (s *Scheduler) Run(stop <-chan struct{}) {
 	logger := log.New(os.Stdout, "[Scheduler] ", log.LstdFlags)
 	logger.Printf("started (tick=60s)")
@@ -107,7 +124,8 @@ func (s *Scheduler) Run(stop <-chan struct{}) {
 	}
 }
 
-// TriggerRun starts a job immediately. Returns ErrAlreadyRunning if the job is already running.
+// TriggerRun starts a job immediately. It returns ErrAlreadyRunning if the job
+// is already running, and ErrBusy if a job it must not overlap is.
 func (s *Scheduler) TriggerRun(name string) error {
 	syncer, ok := s.jobs[name]
 	if !ok {
@@ -115,12 +133,19 @@ func (s *Scheduler) TriggerRun(name string) error {
 	}
 
 	jt := s.state.Tracker(name)
+	s.mu.Lock()
 	if jt.Snapshot().Running {
+		s.mu.Unlock()
 		return ErrAlreadyRunning
 	}
-
+	if other := s.conflicting(name); other != "" {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrBusy, other)
+	}
 	// V2.0: Set running before spawn to prevent concurrent launches from tick().
 	jt.SetRunning(true)
+	s.mu.Unlock()
+
 	s.state.Save()
 	go s.runJob(syncer, jt)
 	return nil
@@ -146,42 +171,84 @@ func (s *Scheduler) Status() map[string]JobState {
 	return s.state.Status()
 }
 
-func (s *Scheduler) tick() {
-	for name, syncer := range s.jobs {
-		jt := s.state.Tracker(name)
-		state := jt.Snapshot()
-
-		if !s.shouldRun(name, state) {
-			continue
+// conflicting returns a running job that name must not overlap, or "". The
+// caller holds s.mu.
+func (s *Scheduler) conflicting(name string) string {
+	group := exclusionGroups[name]
+	if group == "" {
+		return ""
+	}
+	for other := range s.jobs {
+		if other != name && exclusionGroups[other] == group && s.state.Tracker(other).Snapshot().Running {
+			return other
 		}
+	}
+	return ""
+}
 
-		// V2.0: Set running before spawn to prevent concurrent TriggerRun/tick races.
-		jt.SetRunning(true)
-		go s.runJob(syncer, jt)
+func (s *Scheduler) tick() {
+	cfg := s.cfg()
+	if cfg.Enabled {
+		names := make([]string, 0, len(s.jobs))
+		for name := range s.jobs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			jt := s.state.Tracker(name)
+			if !shouldRun(cfg, name, jt.Snapshot()) {
+				continue
+			}
+
+			s.mu.Lock()
+			if s.conflicting(name) != "" {
+				// Still due on the next tick, so it starts once the other finishes.
+				s.mu.Unlock()
+				continue
+			}
+			// V2.0: Set running before spawn to prevent concurrent TriggerRun/tick races.
+			jt.SetRunning(true)
+			s.mu.Unlock()
+			go s.runJob(s.jobs[name], jt)
+		}
 	}
 
-	s.updateNextRuns()
+	s.updateNextRuns(cfg)
 	s.state.Save()
 }
 
-func (s *Scheduler) shouldRun(name string, state JobState) bool {
+// jobConfig is the schedule of one job. The watchlist job only ever runs on an
+// interval, so its config is expressed as an interval schedule.
+func jobConfig(cfg SchedulerConfig, name string) (DailyJobConfig, bool) {
+	switch name {
+	case "movies":
+		return cfg.MoviesSync, true
+	case "tv":
+		return cfg.TVSync, true
+	case "anime":
+		return cfg.AnimeSync, true
+	case "watchlist":
+		return DailyJobConfig{Enabled: cfg.WatchlistSync.Enabled, IntervalHours: cfg.WatchlistSync.IntervalHours}, true
+	}
+	return DailyJobConfig{}, false
+}
+
+func shouldRun(cfg SchedulerConfig, name string, state JobState) bool {
 	if state.Running {
 		return false
 	}
-
-	switch name {
-	case "movies":
-		return s.shouldRunDaily(state, s.cfg.MoviesSync.Enabled, s.cfg.MoviesSync.DaysOfWeek, s.cfg.MoviesSync.Hour, s.cfg.MoviesSync.Minute)
-	case "tv":
-		return s.shouldRunDaily(state, s.cfg.TVSync.Enabled, s.cfg.TVSync.DaysOfWeek, s.cfg.TVSync.Hour, s.cfg.TVSync.Minute)
-	case "watchlist":
-		return s.shouldRunInterval(state, s.cfg.WatchlistSync.Enabled, s.cfg.WatchlistSync.IntervalHours)
+	job, ok := jobConfig(cfg, name)
+	if !ok {
+		return false
 	}
-
-	return false
+	if job.IntervalHours > 0 {
+		return shouldRunInterval(state, job.Enabled, job.IntervalHours)
+	}
+	return shouldRunDaily(state, job.Enabled, job.DaysOfWeek, job.Hour, job.Minute)
 }
 
-func (s *Scheduler) shouldRunDaily(state JobState, enabled bool, daysOfWeek []int, hour, minute int) bool {
+func shouldRunDaily(state JobState, enabled bool, daysOfWeek []int, hour, minute int) bool {
 	if !enabled {
 		return false
 	}
@@ -216,7 +283,10 @@ func (s *Scheduler) shouldRunDaily(state JobState, enabled bool, daysOfWeek []in
 	return true
 }
 
-func (s *Scheduler) shouldRunInterval(state JobState, enabled bool, intervalHours int) bool {
+// shouldRunInterval measures the interval from the end of the last run, so a
+// run that takes longer than its interval is followed by the next one at once,
+// never overlapped by it.
+func shouldRunInterval(state JobState, enabled bool, intervalHours int) bool {
 	if !enabled || intervalHours <= 0 {
 		return false
 	}
@@ -269,20 +339,17 @@ func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
 	s.state.Save()
 }
 
-func (s *Scheduler) updateNextRuns() {
+func (s *Scheduler) updateNextRuns(cfg SchedulerConfig) {
 	for name := range s.jobs {
 		jt := s.state.Tracker(name)
 		state := jt.Snapshot()
 
 		var next time.Time
-		switch name {
-		case "movies":
-			next = nextRunTime(s.cfg.MoviesSync.Enabled, s.cfg.MoviesSync.DaysOfWeek, s.cfg.MoviesSync.Hour, s.cfg.MoviesSync.Minute)
-		case "tv":
-			next = nextRunTime(s.cfg.TVSync.Enabled, s.cfg.TVSync.DaysOfWeek, s.cfg.TVSync.Hour, s.cfg.TVSync.Minute)
-		case "watchlist":
-			if s.cfg.WatchlistSync.Enabled && s.cfg.WatchlistSync.IntervalHours > 0 {
-				next = state.LastRun.Add(time.Duration(s.cfg.WatchlistSync.IntervalHours) * time.Hour)
+		if job, ok := jobConfig(cfg, name); ok && job.Enabled {
+			if job.IntervalHours > 0 {
+				next = state.LastRun.Add(time.Duration(job.IntervalHours) * time.Hour)
+			} else {
+				next = nextRunTime(job.Enabled, job.DaysOfWeek, job.Hour, job.Minute)
 			}
 		}
 

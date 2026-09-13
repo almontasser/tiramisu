@@ -1593,11 +1593,15 @@
                         <div class="form-section">
                             <div class="form-section-title">Movies Library Sync</div>
                             <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;">
-                                <div class="form-group" style="flex:1;min-width:0;">
+                                <div class="form-group" style="flex-shrink:0;">
+                                    <label>Repeat</label>
+                                    <select id="sched-movies-repeat" onchange="_toggleRepeat('movies')"></select>
+                                </div>
+                                <div class="form-group" id="sched-movies-weekly-days" style="flex:1;min-width:0;">
                                     <label>Weekdays</label>
                                     <div class="day-picker" id="sched-movies-days"></div>
                                 </div>
-                                <div class="form-group" style="flex-shrink:0;">
+                                <div class="form-group" id="sched-movies-weekly-time" style="flex-shrink:0;">
                                     <label>Start time</label>
                                     <input type="time" id="sched-movies-time">
                                 </div>
@@ -1609,18 +1613,45 @@
                         <!-- TV Series Library Sync -->
                         <div class="form-section">
                             <div class="form-section-title">TV Series Library Sync</div>
+                            <div class="hint">While the anime job is on, this job leaves anime to it.</div>
                             <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;">
-                                <div class="form-group" style="flex:1;min-width:0;">
+                                <div class="form-group" style="flex-shrink:0;">
+                                    <label>Repeat</label>
+                                    <select id="sched-tv-repeat" onchange="_toggleRepeat('tv')"></select>
+                                </div>
+                                <div class="form-group" id="sched-tv-weekly-days" style="flex:1;min-width:0;">
                                     <label>Weekdays</label>
                                     <div class="day-picker" id="sched-tv-days"></div>
                                 </div>
-                                <div class="form-group" style="flex-shrink:0;">
+                                <div class="form-group" id="sched-tv-weekly-time" style="flex-shrink:0;">
                                     <label>Start time</label>
                                     <input type="time" id="sched-tv-time">
                                 </div>
                             </div>
                             <div class="sched-meta" id="sched-tv-meta"></div>
                             <button type="button" id="sched-tv-btn" class="btn btn-secondary btn-sm" onclick="runSyncNow('tv')">▶ Run now</button>
+                        </div>
+
+                        <!-- Anime Library Sync -->
+                        <div class="form-section">
+                            <div class="form-section-title">Anime Library Sync</div>
+                            <div class="hint">Syncs anime on its own schedule. It never runs at the same time as the TV job; whichever is due second starts when the first finishes.</div>
+                            <div style="display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+                                <div class="form-group" style="flex-shrink:0;">
+                                    <label>Repeat</label>
+                                    <select id="sched-anime-repeat" onchange="_toggleRepeat('anime')"></select>
+                                </div>
+                                <div class="form-group" id="sched-anime-weekly-days" style="flex:1;min-width:0;">
+                                    <label>Weekdays</label>
+                                    <div class="day-picker" id="sched-anime-days"></div>
+                                </div>
+                                <div class="form-group" id="sched-anime-weekly-time" style="flex-shrink:0;">
+                                    <label>Start time</label>
+                                    <input type="time" id="sched-anime-time">
+                                </div>
+                            </div>
+                            <div class="sched-meta" id="sched-anime-meta"></div>
+                            <button type="button" id="sched-anime-btn" class="btn btn-secondary btn-sm" onclick="runSyncNow('anime')">▶ Run now</button>
                         </div>
 
                         <!-- Plex Watchlist Sync -->
@@ -2516,6 +2547,18 @@
             document.getElementById('sched-body').classList.toggle('disabled', !enabled);
         }
 
+        // Movies, TV and anime share one schedule shape: weekdays at a start
+        // time, or every N hours. A repeat of 0 means weekdays.
+        const SCHED_JOBS = [
+            { key: 'movies', cfg: 'movies_sync', hour: 3 },
+            { key: 'tv', cfg: 'tv_sync', hour: 4 },
+            { key: 'anime', cfg: 'anime_sync', hour: 5 },
+        ];
+        const REPEAT_HOURS = [1, 2, 3, 4, 6, 8, 12, 24];
+        // The status refresh every 30 seconds fills the form only once, so it
+        // never undoes a choice that has not been saved yet.
+        let _schedLoaded = false;
+
         function buildDayPicker(containerId) {
             const container = document.getElementById(containerId);
             if (!container) return;
@@ -2526,34 +2569,22 @@
                 btn.className = 'day-pill';
                 btn.textContent = label;
                 btn.dataset.day = idx;
-                btn.addEventListener('click', () => {
-                    btn.classList.toggle('selected');
-                    _updateDayConflicts();
-                });
+                btn.addEventListener('click', () => btn.classList.toggle('selected'));
                 container.appendChild(btn);
             });
         }
 
-        function _updateDayConflicts() {
-            const moviesDays = new Set(
-                [...document.querySelectorAll('#sched-movies-days .day-pill.selected')].map(b => +b.dataset.day)
-            );
-            const tvDays = new Set(
-                [...document.querySelectorAll('#sched-tv-days .day-pill.selected')].map(b => +b.dataset.day)
-            );
+        function buildRepeat(key) {
+            const select = document.getElementById(`sched-${key}-repeat`);
+            if (!select) return;
+            select.innerHTML = '<option value="0">On weekdays</option>' +
+                REPEAT_HOURS.map(h => `<option value="${h}">Every ${h === 1 ? 'hour' : h + ' hours'}</option>`).join('');
+        }
 
-            document.querySelectorAll('#sched-movies-days .day-pill').forEach(btn => {
-                const day = +btn.dataset.day;
-                const conflict = tvDays.has(day) && !moviesDays.has(day);
-                btn.classList.toggle('conflict', conflict);
-                if (conflict) btn.classList.remove('selected');
-            });
-            document.querySelectorAll('#sched-tv-days .day-pill').forEach(btn => {
-                const day = +btn.dataset.day;
-                const conflict = moviesDays.has(day) && !tvDays.has(day);
-                btn.classList.toggle('conflict', conflict);
-                if (conflict) btn.classList.remove('selected');
-            });
+        function _toggleRepeat(key) {
+            const weekly = document.getElementById(`sched-${key}-repeat`).value === '0';
+            document.getElementById(`sched-${key}-weekly-days`).style.display = weekly ? '' : 'none';
+            document.getElementById(`sched-${key}-weekly-time`).style.display = weekly ? '' : 'none';
         }
 
         function setDayPicker(containerId, selectedDays) {
@@ -2591,7 +2622,7 @@
             if (rt.running) parts.push('<span style="color:#22c55e">● Running</span>');
             el.innerHTML = parts.join(' &nbsp;|&nbsp; ');
             // Sync button state with API
-            const jobMap = {'sched-movies-meta':'movies','sched-tv-meta':'tv','sched-wl-meta':'watchlist'};
+            const jobMap = {'sched-movies-meta':'movies','sched-tv-meta':'tv','sched-anime-meta':'anime','sched-wl-meta':'watchlist'};
             const job = jobMap[id];
             const btnEl = document.getElementById(id.replace('-meta', '-btn'));
             if (btnEl && job) {
@@ -2614,65 +2645,54 @@
             const sched = cfg.scheduler || {};
             const rt = rtRes && rtRes.ok ? await rtRes.json() : {};
 
-            document.getElementById('sched-enabled').checked = sched.enabled || false;
-            _toggleSchedBody(sched.enabled || false);
+            if (!_schedLoaded) {
+                document.getElementById('sched-enabled').checked = sched.enabled || false;
+                _toggleSchedBody(sched.enabled || false);
 
-            setDayPicker('sched-movies-days', sched.movies_sync?.days_of_week || []);
-            document.getElementById('sched-movies-time').value =
-                _toTimeInput(sched.movies_sync?.hour ?? 3, sched.movies_sync?.minute ?? 0);
+                SCHED_JOBS.forEach(job => {
+                    const c = sched[job.cfg] || {};
+                    const hours = c.enabled && c.interval_hours > 0 ? c.interval_hours : 0;
+                    document.getElementById(`sched-${job.key}-repeat`).value = String(hours);
+                    setDayPicker(`sched-${job.key}-days`, c.days_of_week || []);
+                    document.getElementById(`sched-${job.key}-time`).value =
+                        _toTimeInput(c.hour ?? job.hour, c.minute ?? 0);
+                    _toggleRepeat(job.key);
+                });
 
-            setDayPicker('sched-tv-days', sched.tv_sync?.days_of_week || []);
-            document.getElementById('sched-tv-time').value =
-                _toTimeInput(sched.tv_sync?.hour ?? 4, sched.tv_sync?.minute ?? 0);
+                document.getElementById('sched-wl-interval').value =
+                    sched.watchlist_sync?.interval_hours || 1;
+                _schedLoaded = true;
+            }
 
-            document.getElementById('sched-wl-interval').value =
-                sched.watchlist_sync?.interval_hours || 1;
-
-            _updateDayConflicts();
-
-            _renderMeta('sched-movies-meta', rt.movies);
-            _renderMeta('sched-tv-meta', rt.tv);
+            SCHED_JOBS.forEach(job => _renderMeta(`sched-${job.key}-meta`, rt[job.key]));
             _renderMeta('sched-wl-meta', rt.watchlist);
         }
 
         async function saveScheduler() {
             const status = document.getElementById('sched-save-status');
-            const moviesDays = getDayPicker('sched-movies-days');
-            const tvDays = getDayPicker('sched-tv-days');
-
-            const overlap = moviesDays.filter(d => tvDays.includes(d));
-            if (overlap.length > 0) {
-                status.textContent = `✗ Days overlap between Movies and TV: ${overlap.map(d => DAY_LABELS[d]).join(', ')}`;
-                status.className = 'status-msg status-error';
-                setTimeout(() => { status.className = 'status-msg'; }, 5000);
-                return;
-            }
-
-            const moviesTime = document.getElementById('sched-movies-time').value.split(':');
-            const tvTime = document.getElementById('sched-tv-time').value.split(':');
-
             const cfgRes = await fetch('/api/config');
             const data = await cfgRes.json();
 
             data.scheduler = {
                 enabled: document.getElementById('sched-enabled').checked,
-                movies_sync: {
-                    enabled: moviesDays.length > 0,
-                    days_of_week: moviesDays,
-                    hour: parseInt(moviesTime[0]) || 3,
-                    minute: parseInt(moviesTime[1]) || 0
-                },
-                tv_sync: {
-                    enabled: tvDays.length > 0,
-                    days_of_week: tvDays,
-                    hour: parseInt(tvTime[0]) || 4,
-                    minute: parseInt(tvTime[1]) || 0
-                },
                 watchlist_sync: {
                     enabled: true,
                     interval_hours: parseInt(document.getElementById('sched-wl-interval').value) || 1
                 }
             };
+            // Weekdays with none selected turns a job off, as before.
+            SCHED_JOBS.forEach(job => {
+                const days = getDayPicker(`sched-${job.key}-days`);
+                const hours = parseInt(document.getElementById(`sched-${job.key}-repeat`).value) || 0;
+                const [h, m] = document.getElementById(`sched-${job.key}-time`).value.split(':').map(v => parseInt(v));
+                data.scheduler[job.cfg] = {
+                    enabled: hours > 0 || days.length > 0,
+                    days_of_week: days,
+                    hour: Number.isNaN(h) ? job.hour : h,
+                    minute: Number.isNaN(m) ? 0 : m,
+                    interval_hours: hours
+                };
+            });
 
             const res = await fetch('/api/config', {
                 method: 'POST',
@@ -2699,8 +2719,10 @@
         }
 
         // Build pickers then load data
-        buildDayPicker('sched-movies-days');
-        buildDayPicker('sched-tv-days');
+        SCHED_JOBS.forEach(job => {
+            buildDayPicker(`sched-${job.key}-days`);
+            buildRepeat(job.key);
+        });
         loadScheduler();
         setInterval(loadScheduler, 30000);
 

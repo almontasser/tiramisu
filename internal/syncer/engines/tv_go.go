@@ -50,6 +50,11 @@ type TVGoEngine struct {
 	processedThisRun map[string]bool
 	stats            TVSyncStats
 
+	// name is the scheduler job this engine runs as, and mode the series its
+	// runs cover (see TVSyncMode). Nil mode covers every series.
+	name string
+	mode func() TVSyncMode
+
 	blacklist     BlacklistData
 	blacklistFile string
 
@@ -98,6 +103,10 @@ type TVSyncStats struct {
 
 // TVEngineConfig holds config for the TV engine.
 type TVEngineConfig struct {
+	// Name is the scheduler job, and names the log file.
+	Name string
+	// Mode chooses the series a run covers; nil covers every series.
+	Mode            func() TVSyncMode
 	GoStormURL      string
 	TMDBAPIKey      string
 	TorrentioURL    string
@@ -249,9 +258,18 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		prowlarrClient = prowlarr.NewClient(cfg.ProwlarrCfg)
 	}
 
-	logPath := filepath.Join(cfg.LogsDir, "tv-sync.log")
+	// Each job logs to its own file: tv-sync.log, anime-sync.log.
+	name := cfg.Name
+	if name == "" {
+		name = "tv"
+	}
+	prefix := "[TVSync] "
+	if name != "tv" {
+		prefix = "[" + strings.ToUpper(name[:1]) + name[1:] + "Sync] "
+	}
+	logPath := filepath.Join(cfg.LogsDir, name+"-sync.log")
 	logFile, _ := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	logger := log.New(io.MultiWriter(os.Stdout, logFile), "[TVSync] ", log.LstdFlags)
+	logger := log.New(io.MultiWriter(os.Stdout, logFile), prefix, log.LstdFlags)
 
 	regFile := filepath.Join(cfg.StateDir, "tv_episode_registry.json")
 	blFile := filepath.Join(cfg.StateDir, "blacklist.json")
@@ -407,21 +425,68 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	// torrent is missing from GoStorm, restore it first. cleanupOrphanedFiles
 	// runs after so it cannot delete a file that rehydrate still needs.
 	e.rehydrateMissingTorrents(ctx)
-	e.cleanupOrphanedFiles(ctx)
-	e.cleanupOrphanedTorrents(ctx)
+	if e.mergeRegistryFromDB() {
+		e.cleanupOrphanedFiles(ctx)
+		e.cleanupOrphanedTorrents(ctx)
+	}
 
 	e.logger.Printf("TV sync complete: %d shows, %d episodes created, %d skipped, %d upgrades",
 		e.stats.Shows, e.stats.EpisodesCreated, e.stats.EpisodesSkipped, e.stats.Upgrades)
 
-	// Notify the media server. Plex skips this without a section ID; Jellyfin refreshes
-	// every library and ignores it.
+	// Notify the media server: Plex needs a section ID; Jellyfin refreshes the
+	// libraries this run covers.
 	if e.stats.EpisodesCreated > 0 {
-		if err := e.mediasrv.RefreshLibrary(context.Background(), e.plexTVLib); err != nil {
-			e.logger.Printf("Warning: media server library refresh failed: %v", err)
+		for _, kind := range e.libraryKinds() {
+			if err := mediaserver.Refresh(context.Background(), e.mediasrv, kind, e.plexTVLib); err != nil {
+				e.logger.Printf("Warning: media server library refresh failed: %v", err)
+			}
 		}
 	}
 
 	return nil
+}
+
+// mergeRegistryFromDB reads into the registry the episodes filed since the run
+// loaded it, and reports whether cleanup is safe. Cleanup deletes every stub the
+// registry does not list, and the Seerr bridge and the hourly episode job file
+// episodes through the Library API while a run of several hours is working: from
+// the copy loaded at the start, cleanup would delete all of them. Database rows
+// win over this run's copy; entries only the copy holds, such as the stubs
+// adopted at the start of the run, stay. Without a readable database, cleanup is
+// skipped rather than run blind.
+func (e *TVGoEngine) mergeRegistryFromDB() bool {
+	if e.db == nil {
+		return true
+	}
+	entries, err := e.db.AllEpisodes()
+	if err != nil {
+		e.logger.Printf("Warning: cannot reread the registry, skipping cleanup: %v", err)
+		return false
+	}
+	for _, entry := range entries {
+		e.registry[entry.EpisodeKey] = TVEpisodeEntry{
+			QualityScore: entry.QualityScore,
+			Hash:         entry.Hash,
+			FilePath:     entry.FilePath,
+			Source:       entry.Source,
+			Created:      entry.Created,
+		}
+	}
+	return true
+}
+
+// libraryKinds is the libraries a run of this engine files into.
+func (e *TVGoEngine) libraryKinds() []string {
+	switch e.currentMode() {
+	case TVModeTV:
+		return []string{"tv"}
+	case TVModeAnime:
+		return []string{"anime"}
+	}
+	if len(e.roots()) > 1 {
+		return []string{"tv", "anime"}
+	}
+	return []string{"tv"}
 }
 
 func (e *TVGoEngine) loadRegistry() map[string]TVEpisodeEntry {
@@ -605,7 +670,7 @@ func (e *TVGoEngine) discoverShows(ctx context.Context) ([]tmdb.TVShow, error) {
 			continue
 		}
 		for _, s := range shows {
-			if !seen[s.ID] && e.passesShowFilters(s) {
+			if !seen[s.ID] && e.wants(s) && e.passesShowFilters(s) {
 				seen[s.ID] = true
 				all = append(all, s)
 			}
@@ -616,7 +681,7 @@ func (e *TVGoEngine) discoverShows(ctx context.Context) ([]tmdb.TVShow, error) {
 	discShows, err := e.tmdb.DiscoverTV(ctx, "en", cutoff, "", 5)
 	if err == nil {
 		for _, s := range discShows {
-			if !seen[s.ID] && e.passesShowFilters(s) {
+			if !seen[s.ID] && e.wants(s) && e.passesShowFilters(s) {
 				seen[s.ID] = true
 				all = append(all, s)
 			}

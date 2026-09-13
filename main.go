@@ -4548,11 +4548,16 @@ func main() {
 	// automatic cron loop (sched.Run) is gated by Scheduler.Enabled, since that's
 	// what could collide with a user's own external cron setup.
 	{
-		schedCfg := scheduler.SchedulerConfig{
-			Enabled:       gc().Scheduler.Enabled,
-			MoviesSync:    scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
-			TVSync:        scheduler.DailyJobConfig(gc().Scheduler.TVSync),
-			WatchlistSync: scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
+		// Read on every scheduler tick, so a schedule saved from the control panel
+		// applies within a minute.
+		schedCfg := func() scheduler.SchedulerConfig {
+			return scheduler.SchedulerConfig{
+				Enabled:       gc().Scheduler.Enabled,
+				MoviesSync:    scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
+				TVSync:        scheduler.DailyJobConfig(gc().Scheduler.TVSync),
+				AnimeSync:     scheduler.DailyJobConfig(gc().Scheduler.AnimeSync),
+				WatchlistSync: scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
+			}
 		}
 
 		statePath := filepath.Join(GetStateDir(), "scheduler_state.json")
@@ -4562,24 +4567,11 @@ func main() {
 		// Start midnight log truncation
 		engines.StartLogTruncator(logsDir, backgroundStopChan)
 
-		syncers := map[string]scheduler.Syncer{
-			"movies": engines.NewMoviesSyncer(engines.MoviesSyncerConfig{
-				GoStormURL:      gc().GoStormBaseURL,
-				TMDBAPIKey:      gc().TMDBAPIKey,
-				TorrentioURL:    gc().TorrentioURL,
-				PlexURL:         gc().Plex.URL,
-				PlexToken:       gc().Plex.Token,
-				PlexLib:         gc().Plex.LibraryID,
-				MediaServerType: gc().MediaServerType,
-				MoviesDir:       filepath.Join(gc().PhysicalSourcePath, "movies"),
-				StateDir:        GetStateDir(),
-				LogsDir:         logsDir,
-				ProwlarrCfg:     gc().Prowlarr,
-				Language:        gc().Language,
-				QualityScoring:  gc().QualityScoringConfig,
-				InvalidatePath:  invalidateSyncRemovedPath,
-			}),
-			"tv": engines.NewTVSyncer(engines.TVSyncerConfig{
+		// The TV and anime jobs run the same engine, each over its own series.
+		newSeriesSyncer := func(name, logsDir string, mode func() engines.TVSyncMode) scheduler.Syncer {
+			return engines.NewTVSyncer(engines.TVSyncerConfig{
+				Name:            name,
+				Mode:            mode,
 				GoStormURL:      gc().GoStormBaseURL,
 				TMDBAPIKey:      gc().TMDBAPIKey,
 				TorrentioURL:    gc().TorrentioURL,
@@ -4600,7 +4592,36 @@ func main() {
 				MaxSeasons:      gc().TVMaxSeasons,
 				DB:              stateDB,
 				InvalidatePath:  invalidateSyncRemovedPath,
+			})
+		}
+
+		syncers := map[string]scheduler.Syncer{
+			"movies": engines.NewMoviesSyncer(engines.MoviesSyncerConfig{
+				GoStormURL:      gc().GoStormBaseURL,
+				TMDBAPIKey:      gc().TMDBAPIKey,
+				TorrentioURL:    gc().TorrentioURL,
+				PlexURL:         gc().Plex.URL,
+				PlexToken:       gc().Plex.Token,
+				PlexLib:         gc().Plex.LibraryID,
+				MediaServerType: gc().MediaServerType,
+				MoviesDir:       filepath.Join(gc().PhysicalSourcePath, "movies"),
+				StateDir:        GetStateDir(),
+				LogsDir:         logsDir,
+				ProwlarrCfg:     gc().Prowlarr,
+				Language:        gc().Language,
+				QualityScoring:  gc().QualityScoringConfig,
+				InvalidatePath:  invalidateSyncRemovedPath,
 			}),
+			// While the anime job is enabled, the TV job leaves anime to it; while it
+			// is not, the TV job covers both, as upstream does. The scheduler never
+			// runs the two at once.
+			"tv": newSeriesSyncer("tv", logsDir, func() engines.TVSyncMode {
+				if gc().Scheduler.AnimeSync.Enabled {
+					return engines.TVModeTV
+				}
+				return engines.TVModeAll
+			}),
+			"anime": newSeriesSyncer("anime", logsDir, func() engines.TVSyncMode { return engines.TVModeAnime }),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
 				TMDBAPIKey:      gc().TMDBAPIKey,
@@ -4646,14 +4667,12 @@ func main() {
 			w.WriteHeader(http.StatusAccepted)
 		})
 
-		if gc().Scheduler.Enabled {
-			safeGo(func() {
-				sched.Run(backgroundStopChan)
-			})
-			logger.Printf("[Scheduler] enabled (Go native)")
-		} else {
-			logger.Printf("[Scheduler] auto-run disabled, manual API available")
-		}
+		// The loop always runs and reads Scheduler.Enabled on every tick, so
+		// turning the scheduler on or off in the control panel needs no restart.
+		safeGo(func() {
+			sched.Run(backgroundStopChan)
+		})
+		logger.Printf("[Scheduler] started (Go native), auto-run enabled: %v", gc().Scheduler.Enabled)
 	}
 
 	// Library API (external clients)

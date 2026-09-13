@@ -30,6 +30,9 @@ type DailyJobConfig struct {
 	DaysOfWeek []int `json:"days_of_week"` // 0=Sun, 1=Mon, …, 6=Sat
 	Hour       int   `json:"hour"`
 	Minute     int   `json:"minute"`
+	// IntervalHours, above zero, runs the job every that many hours, measured
+	// from the end of its last run, instead of on DaysOfWeek at Hour:Minute.
+	IntervalHours int `json:"interval_hours,omitempty"`
 }
 
 type WatchlistSyncConfig struct {
@@ -38,9 +41,13 @@ type WatchlistSyncConfig struct {
 }
 
 type SchedulerConfig struct {
-	Enabled       bool                `json:"enabled"`
-	MoviesSync    DailyJobConfig      `json:"movies_sync"`
-	TVSync        DailyJobConfig      `json:"tv_sync"`
+	Enabled    bool           `json:"enabled"`
+	MoviesSync DailyJobConfig `json:"movies_sync"`
+	TVSync     DailyJobConfig `json:"tv_sync"`
+	// AnimeSync runs the TV engine over anime alone. While it is enabled, the
+	// TV job leaves anime out; while it is not, the TV job covers both, as
+	// upstream does.
+	AnimeSync     DailyJobConfig      `json:"anime_sync"`
 	WatchlistSync WatchlistSyncConfig `json:"watchlist_sync"`
 }
 
@@ -391,6 +398,7 @@ func LoadConfig() Config {
 			Enabled:       false, // off by default — won't break installs using cron
 			MoviesSync:    DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
 			TVSync:        DailyJobConfig{Enabled: true, DaysOfWeek: []int{3, 5}, Hour: 4, Minute: 0},
+			AnimeSync:     DailyJobConfig{Enabled: false, DaysOfWeek: []int{3, 5}, Hour: 5, Minute: 0},
 			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
 		},
 
