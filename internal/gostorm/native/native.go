@@ -366,7 +366,7 @@ func (r *NativeReader) Interrupt() {
 }
 
 // startStreamFn opens the stream; a var so the reconnect path can be exercised without a
-// live torrent, the same injection seam used for warmup.TailFetch.
+// live torrent, the same injection seam used for warmup.Fetch.
 var startStreamFn = (*NativeReader).startStream
 
 func (r *NativeReader) startStream(off int64) error {

@@ -317,6 +317,13 @@ func (d *DiskWarmupCache) writeWorker() {
 }
 
 func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off int64) {
+	d.enqueue(hash, fileID, data, off, false)
+}
+
+// enqueue copies data onto the write worker's queue. The read path drops a chunk when the
+// queue is full rather than wait; a background fill blocks instead, because a dropped chunk
+// leaves a hole, and processWrite refuses every write past a hole.
+func (d *DiskWarmupCache) enqueue(hash string, fileID int, data []byte, off int64, block bool) {
 	if off > FileSize || d.writeCh == nil {
 		return
 	}
@@ -331,8 +338,13 @@ func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off i
 		copy(*bufPtr, data)
 	}
 
+	w := warmupWrite{hash, fileID, bufPtr, len(data), off}
+	if block {
+		d.writeCh <- w
+		return
+	}
 	select {
-	case d.writeCh <- warmupWrite{hash, fileID, bufPtr, len(data), off}:
+	case d.writeCh <- w:
 	default:
 		warmupWritePool.Put(bufPtr)
 	}
@@ -705,9 +717,10 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 	atomic.StoreInt64(&d.totalSize, diskTotal)
 }
 
-// TailFetch fetches bytes from the torrent. Wired at startup to the native bridge: the
-// warmup package cannot import it, so the dependency is injected like OnWarmupStateChange.
-var TailFetch func(hash string, fileID int, off int64, buf []byte) (int, error)
+// Fetch fetches bytes from the torrent for the tail fill and HeadGate. Wired at startup to
+// the native bridge: the warmup package cannot import it, so the dependency is injected like
+// OnWarmupStateChange.
+var Fetch func(hash string, fileID int, off int64, buf []byte) (int, error)
 
 const tailFillChunk = 1024 * 1024 // per-request size of the sequential fill
 
@@ -723,7 +736,7 @@ var tailFillPacing = 250 * time.Millisecond
 // partially downloaded file compete with the sequential download front and stall the
 // playhead (observed 2026-08-12).
 func (d *DiskWarmupCache) EnsureTail(hash string, fileID int, fileSize int64) {
-	if d == nil || TailFetch == nil || hash == "" || fileSize <= 0 {
+	if d == nil || Fetch == nil || hash == "" || fileSize <= 0 {
 		return
 	}
 	if d.TailReady(hash, fileID) {
@@ -756,7 +769,7 @@ func (d *DiskWarmupCache) EnsureTail(hash string, fileID int, fileSize int64) {
 				rel = end
 				continue
 			}
-			n, err := TailFetch(hash, fileID, tailStart+rel, buf[:end-rel])
+			n, err := Fetch(hash, fileID, tailStart+rel, buf[:end-rel])
 			if err != nil || n <= 0 {
 				logf.Printf("[DiskWarmup] Tail fill stopped at %.1f/%.1fMB for %s: %v",
 					float64(rel)/(1<<20), float64(tailLen)/(1<<20), filepath.Base(path), err)

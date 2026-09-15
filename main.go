@@ -4055,8 +4055,26 @@ func main() {
 	library.SetOwner(gc().FileUID, gc().FileGID, source)
 
 	// Likewise before anything writes or removes one: Jellyfin learns about each
-	// changed stub from this, and refreshes only the folder holding it.
-	library.StubChanged = mediaserver.NewReporter(gc().MediaServerType, gc().Plex.URL, gc().Plex.Token, source, logger).Changed
+	// changed stub from this, and refreshes only the folder holding it. A new stub is
+	// reported once the head of its file is on SSD, so Jellyfin's probe of it never
+	// waits on the swarm (see warmup.HeadGate).
+	if reporter := mediaserver.NewReporter(gc().MediaServerType, gc().Plex.URL, gc().Plex.Token, source, logger); reporter != nil {
+		library.StubChanged = warmup.NewHeadGate(reporter.Changed,
+			func(path string) (string, int, bool) {
+				m, err := vfs.ReadMetadataFromFile(path)
+				if err != nil {
+					return "", 0, false
+				}
+				hash, fileID := vfs.ExtractHashAndIndex(m.URL)
+				return hash, fileID, hash != ""
+			},
+			func(hash string, fileID int) {
+				if t := torr.PeekTorrent(hash); nativeBridge == nil || (t != nil && t.Torrent != nil) {
+					return
+				}
+				_ = nativeBridge.Wake("magnet:?xt=urn:btih:"+hash, fileID)
+			}).Changed
+	}
 
 	// Same bound the FUSE read uses, applied where the wait actually happens: a
 	// block fetch that never receives its first bytes. Wrapping the read in a
@@ -4104,9 +4122,9 @@ func main() {
 			tr.Torrent.SetWarmupActive(active, fileID)
 		}
 	}
-	// Lets the warmup package pull the tail window itself (EnsureTail); it cannot import
-	// the bridge, so the dependency is injected the same way as the callback above.
-	warmup.TailFetch = func(hash string, fileID int, off int64, buf []byte) (int, error) {
+	// Lets the warmup package pull the tail and head windows itself (EnsureTail, HeadGate);
+	// it cannot import the bridge, so the dependency is injected the same way as the callback above.
+	warmup.Fetch = func(hash string, fileID int, off int64, buf []byte) (int, error) {
 		if nativeBridge == nil {
 			return 0, fmt.Errorf("native bridge unavailable")
 		}
