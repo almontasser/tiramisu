@@ -313,13 +313,14 @@ async function load(){
       const poster=t.poster?`<img src="${t.poster}" class="w-12 h-16 object-cover rounded flex-shrink-0" onerror="this.style.display='none'">`:'';
       const title=t.clean_title||(t.title||'--');
       const year=t.year?` (${t.year})`:'';
+      const ep=t.episode?` · ${t.episode}`:'';
       const isStreaming=t.speed_mbs>0.01||t.is_priority;
       const dimStyle=isStreaming?'':'opacity:0.5;filter:grayscale(70%)';
       return`<div class="relative flex items-center gap-3 py-2 px-3 bg-slate-800/50 rounded-lg" style="${dimStyle}">
       <button onclick="killStream('${t.hash}')" class="absolute top-2 right-2 text-slate-500 hover:text-red-400 hover:bg-red-900/30 rounded p-0.5 transition-colors leading-none text-xs" title="Kill stream">&#x2715;</button>
       ${poster}
       <div class="flex-1 min-w-0">
-        <div class="text-sm font-semibold truncate">${trunc(title,60)}${year}</div>
+        <div class="text-sm font-semibold truncate">${trunc(title,60)}${year}${ep}</div>
         <div class="text-xs text-slate-500">${t.hash.slice(0,8)}... &middot; ${fmtSize(t.size)}</div>
         ${badgeHtml}
       </div>

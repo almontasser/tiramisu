@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 	"tiramisu/internal/catalog"
 	"tiramisu/internal/catalog/mediaserver"
+	"tiramisu/internal/library"
 	"tiramisu/internal/monitor/logtail"
 )
 
@@ -102,6 +104,7 @@ type TorrentInfo struct {
 	Hash       string  `json:"hash"`
 	Title      string  `json:"title"`
 	CleanTitle string  `json:"clean_title"`
+	Episode    string  `json:"episode,omitempty"`
 	Year       string  `json:"year,omitempty"`
 	Poster     string  `json:"poster,omitempty"`
 	SpeedMBs   float64 `json:"speed_mbs"`
@@ -164,6 +167,10 @@ type Collector struct {
 	msMu      sync.Mutex
 	msFound   []mediaserver.Discovered
 	msFoundAt time.Time
+
+	// openFiles returns the stub paths open for each torrent, keyed by lowercase info
+	// hash. Set before Run.
+	openFiles func() map[string][]string
 }
 
 // New creates a Collector.
@@ -186,6 +193,32 @@ func New(gostormURL, fusePath, sourcePath, vpnIface, plexURL, plexToken string, 
 }
 
 // Run starts the collection loop. Blocks until stop is closed.
+// SetOpenFiles gives the collector the stub paths open for each torrent, so a stream
+// of a season pack shows the episode being read and not only the show. Call it
+// before Run.
+func (c *Collector) SetOpenFiles(f func() map[string][]string) {
+	c.openFiles = f
+}
+
+// episodesOf names the episodes among open stub paths, such as "S01E05" or
+// "S01E05, S01E06", and returns "" when none is an episode.
+func episodesOf(paths []string) string {
+	seen := map[string]bool{}
+	var eps []string
+	for _, p := range paths {
+		season, episode := library.ParseSeasonEpisode(filepath.Base(p))
+		if episode == 0 {
+			continue
+		}
+		if ep := fmt.Sprintf("S%02dE%02d", season, episode); !seen[ep] {
+			seen[ep] = true
+			eps = append(eps, ep)
+		}
+	}
+	sort.Strings(eps)
+	return strings.Join(eps, ", ")
+}
+
 func (c *Collector) Run(stop <-chan struct{}) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -743,6 +776,10 @@ var (
 
 func (c *Collector) enrichTorrents(torrents []TorrentInfo) {
 	sessions := c.fetchPlexSessions()
+	var open map[string][]string
+	if c.openFiles != nil {
+		open = c.openFiles()
+	}
 
 	for i := range torrents {
 		t := &torrents[i]
@@ -827,6 +864,7 @@ func (c *Collector) enrichTorrents(torrents []TorrentInfo) {
 		if t.CleanTitle == "" {
 			t.CleanTitle = cleanTorrentTitle(t.Title)
 		}
+		t.Episode = episodesOf(open[strings.ToLower(t.Hash)])
 	}
 }
 

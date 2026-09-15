@@ -910,15 +910,12 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		magnetCandidate = "magnet:?xt=urn:btih:" + hashStr
 	}
 
-	// Async Wake when head warmup is ready (Open returns instantly); sync Wake otherwise.
-	if nativeBridge != nil && magnetCandidate != "" {
-		if headReady {
-			safeGo(func() {
-				_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
-			})
-		} else {
-			_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
-		}
+	// With the head warmup ready, waking the torrent waits for a read past the header (see
+	// startDeferred): the SSD serves the first bytes, and a Jellyfin home screen opens every
+	// movie it shows and reads 4KB, which woke 20 torrents and started 20 pumps per refresh.
+	// Without warmup the torrent is needed now.
+	if nativeBridge != nil && magnetCandidate != "" && !headReady {
+		_ = nativeBridge.Wake(magnetCandidate, urlFileIdx)
 	}
 
 	if val, exists := playbackRegistry.Load(n.vMeta.Path); !exists {
@@ -991,9 +988,15 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		tailFillTargets.Store(n.vMeta.Path, tailFillTarget{hash: finalHash, fileID: fileIdx, size: n.vMeta.Size})
 		// Gillian: proactive pump start at Open() — pump ready before first Read().
 		// pumpOnce ensures single start; late rescue path in Read() handles hash=='' case.
-		h.pumpOnce.Do(func() {
-			h.startNativePump(finalHash, fileIdx)
-		})
+		// With the head warmup ready the SSD serves the first reads, so the pump waits,
+		// with the wake, for a read that goes further (startDeferred).
+		if headReady {
+			h.deferredStart.Store(true)
+		} else {
+			h.pumpOnce.Do(func() {
+				h.startNativePump(finalHash, fileIdx)
+			})
+		}
 		if !headReady {
 			// Real cold start: no warmup data present yet. Signal warmupActive here, at Open(),
 			// rather than waiting for the first WriteChunk - that first-connection burst is
@@ -1063,6 +1066,13 @@ type MkvHandle struct {
 	pumpOnce        sync.Once
 	isPrimaryHandle atomic.Bool  // pump creator, primary reconnects (refCount 0→1), proven readers
 	seqAdvances     atomic.Int32 // consecutive sequential streaming reads, feeds the promotion below
+	// deferredStart is set when Open left waking the torrent and starting the pump to
+	// the first read that goes past the header, and reads counts reads until then.
+	deferredStart atomic.Bool
+	reads         atomic.Int32
+	// scanWait is how long this handle's reads have waited while nothing marked the
+	// file as playing (see Read).
+	scanWait atomic.Int64
 }
 
 // startNativePump acquires a slot and starts the background pump.
@@ -1079,6 +1089,46 @@ func scanSlotLimit(capacity int, anyHealthyPlayback bool) int {
 		return n
 	}
 	return 1
+}
+
+// A read past deferredStartOffset, or the deferredStartReads-th read of a handle, is more
+// than a look at the header.
+const (
+	deferredStartOffset = 1 << 20
+	deferredStartReads  = 3
+)
+
+// startDeferred wakes the torrent and starts the pump that Open held back because the head
+// warmup could serve the first reads. A player or a probe reads past the first MiB within a
+// few reads; a client that only looks at the header never does, and costs no torrent.
+func (h *MkvHandle) startDeferred(off int64) {
+	if !h.deferredStart.Load() || (off < deferredStartOffset && h.reads.Add(1) < deferredStartReads) {
+		return
+	}
+	if !h.deferredStart.CompareAndSwap(true, false) {
+		return
+	}
+	hash, fileID, magnet := h.hash, h.fileID, h.magnet
+	if nativeBridge != nil && magnet != "" {
+		safeGo(func() {
+			_ = nativeBridge.Wake(magnet, fileID)
+		})
+	}
+	safeGo(func() {
+		h.pumpOnce.Do(func() {
+			h.startNativePump(hash, fileID)
+		})
+	})
+}
+
+// isPlaying reports whether the media server confirmed playback of path, or its reads show it.
+func isPlaying(path string) bool {
+	val, ok := playbackRegistry.Load(path)
+	if !ok {
+		return false
+	}
+	ps, ok := val.(*PlaybackState)
+	return ok && (ps.GetStatus() || ps.IsInferredPlayback())
 }
 
 func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
@@ -1972,10 +2022,29 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 	// retries, and the blocked probes pile up until nothing else gets a slot.
 	// One dead torrent then stalls a whole library scan. Bound the wait instead.
 	ctx := fuseCtx
-	if d := time.Duration(gc().FuseReadTimeoutSeconds) * time.Second; d > 0 {
+	d := time.Duration(gc().FuseReadTimeoutSeconds) * time.Second
+	if d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(fuseCtx, d)
 		defer cancel()
+	}
+
+	// The deadline bounds one read, and a probe makes hundreds. Against a swarm that
+	// trickles, each read came back inside it, and one ffprobe held its slot for ten
+	// minutes until a watchdog killed it. So the reads of a file nothing marks as
+	// playing share one budget of the same length, and after it the file answers EIO.
+	if d > 0 && !isPlaying(h.path) {
+		if time.Duration(h.scanWait.Load()) >= d {
+			return nil, syscall.EIO
+		}
+		start := time.Now()
+		defer func() {
+			waited := time.Since(start)
+			if total := time.Duration(h.scanWait.Add(int64(waited))); total >= d && total-waited < d {
+				logger.Printf("[ScanBudget] Reads of %s waited %s without playback - EIO from now on",
+					filepath.Base(h.path), total.Round(time.Second))
+			}
+		}()
 	}
 
 	res, errno := h.readInner(ctx, dest, off)
@@ -2070,6 +2139,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	if off >= h.size {
 		return fuse.ReadResultData(nil), 0
 	}
+	h.startDeferred(off)
 
 	h.mu.Lock()
 	// Late hash recovery: if Open() failed to resolve (metadata lag), retry now.
@@ -4797,6 +4867,19 @@ func main() {
 		gc().MetricsPort,
 		logsDir,
 	)
+	// The active streams panel names the episode being read: GoStorm only knows the
+	// torrent, and a season pack is one torrent behind all of its episodes.
+	monCollector.SetOpenFiles(func() map[string][]string {
+		open := map[string][]string{}
+		activeHandles.Range(func(k, _ interface{}) bool {
+			if h, ok := k.(*MkvHandle); ok && h.hash != "" {
+				key := strings.ToLower(h.hash)
+				open[key] = append(open[key], h.path)
+			}
+			return true
+		})
+		return open
+	})
 	dashHandler := dashboard.New(monCollector, logsDir)
 	http.HandleFunc("/dashboard", dashHandler.Dashboard)
 	http.HandleFunc("/library", dashHandler.Library)
