@@ -495,11 +495,15 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			continue
 		}
 
-		// Take largest
-		sort.Slice(videoFiles, func(i, j int) bool {
-			return videoFiles[i].Length > videoFiles[j].Length
-		})
-		bestFile := videoFiles[0]
+		// The file named for this movie, never simply the largest: in a pack of films
+		// the largest is another film.
+		bestFile := library.MovieFile(videoFiles, title, year)
+		if bestFile == nil {
+			e.logger.Printf("[MovieSync] %s: cannot tell which file of %s is the movie, skipping it", title, c.Hash[:8])
+			e.setCache(e.noMKVCache, hash, CacheEntry{Reason: "ambiguous_files", TS: time.Now().Unix()})
+			e.gostorm.RemoveTorrent(ctx, hash)
+			continue
+		}
 
 		// Remove existing if upgrading
 		if existingPath != "" {

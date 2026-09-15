@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -159,6 +160,94 @@ var reExtrasDir = regexp.MustCompile(`(?i)(^|/)(specials?|extras?|featurettes?|b
 // IsExtrasPath reports whether a torrent file sits in a bonus-material directory.
 func IsExtrasPath(path string) bool {
 	return reExtrasDir.MatchString(filepath.ToSlash(filepath.Dir(path)))
+}
+
+var (
+	reApostrophe = regexp.MustCompile(`['’]`)
+	reNotAlnum   = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+	reYear       = regexp.MustCompile(`^(19|20)\d{2}$`)
+)
+
+// MovieFile picks the file that holds a movie in a torrent's file list, or returns
+// nil when the list does not show which one it is. A torrent can be a pack of
+// films, and filing a pack's largest file filed 13 movies as other films from their
+// packs: Interstellar played a film from "Imdb top 263 movies".
+//
+// Samples, trailers and bonus folders are never the feature. Of the rest, the file
+// named for the movie wins; with no such file, a torrent holding one feature is that
+// feature, and one large file beside small ones counts as one feature.
+func MovieFile(files []FileStat, title string, year int) *FileStat {
+	var features, named []*FileStat
+	for i := range files {
+		f := &files[i]
+		if !IsVideoFile(f.Path) || IsExtrasPath(f.Path) || reJunk.MatchString(filepath.Base(f.Path)) {
+			continue
+		}
+		features = append(features, f)
+		if namesMovie(filepath.Base(f.Path), title, year) {
+			named = append(named, f)
+		}
+	}
+	if len(named) > 0 {
+		return onlyFeature(named)
+	}
+	return onlyFeature(features)
+}
+
+// onlyFeature returns the one file, or the largest when every other file is under
+// 1 GiB and a fifth of its size. Anything else is several films.
+func onlyFeature(files []*FileStat) *FileStat {
+	if len(files) == 0 {
+		return nil
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Length > files[j].Length })
+	for _, f := range files[1:] {
+		if f.Length >= 1<<30 || f.Length*5 >= files[0].Length {
+			return nil
+		}
+	}
+	return files[0]
+}
+
+// namesMovie reports whether a file name carries the title, either as words or with
+// the separators squeezed out ("Spiderman 3" for "Spider-Man 3"), and no year but the
+// movie's: "The Dark Knight Rises (2012)" also carries the words of The Dark Knight.
+func namesMovie(name, title string, year int) bool {
+	nameWords := words(strings.TrimSuffix(name, filepath.Ext(name)))
+	titleWords := words(title)
+	if len(titleWords) == 0 {
+		return false
+	}
+	if year > 0 {
+		for _, w := range nameWords {
+			if reYear.MatchString(w) && w != strconv.Itoa(year) {
+				return false
+			}
+		}
+	}
+	have := map[string]bool{}
+	for _, w := range nameWords {
+		have[w] = true
+	}
+	all := true
+	for _, w := range titleWords {
+		all = all && have[w]
+	}
+	// Squeezing a short title matches inside unrelated words: "up" is in "1080p.bluray.x264-SUPERB".
+	squeezed := strings.Join(titleWords, "")
+	return all || (len(squeezed) >= 8 && strings.Contains(strings.Join(nameWords, ""), squeezed))
+}
+
+// words lowercases s and splits it on anything but letters and digits, dropping
+// apostrophes first so that "World's" and "Worlds" agree.
+func words(s string) []string {
+	var out []string
+	for _, w := range reNotAlnum.Split(reApostrophe.ReplaceAllString(strings.ToLower(s), ""), -1) {
+		if w != "" {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // StubChanged is called with the path of every stub or stub directory written or

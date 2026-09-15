@@ -239,7 +239,8 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	// The stub already on disk is the cheap answer: it saves the metadata wait, and
 	// re-adding would duplicate the title under a second name. For TV only an exact
 	// episode counts, because one multi-season pack is a single hash behind several
-	// seasons: matching by hash alone would report season 2 as already filed.
+	// seasons: matching by hash alone would report season 2 as already filed. For a
+	// movie only the same file counts, for the same reason with films.
 	if existing, err := m.alreadyPresent(kind, hash, req); err != nil {
 		return nil, err
 	} else if len(existing) > 0 {
@@ -288,7 +289,11 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	if isSeriesKind(kind) {
 		files, err = m.addEpisodes(ctx, kind, req, hash, magnet, info, dropped)
 	} else {
-		files, err = m.addMovie(req, hash, magnet, info)
+		var present bool
+		files, present, err = m.addMovie(ctx, req, hash, magnet, info)
+		if err == nil && present {
+			return &AddResponse{Hash: hash, Title: req.Title, Type: kind, Files: files, AlreadyPresent: true}, nil
+		}
 	}
 	if err != nil {
 		dropped[hash] = true
@@ -305,7 +310,14 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 // file list arrives.
 func (m *Manager) alreadyPresent(kind, hash string, req AddRequest) ([]AddedFile, error) {
 	if !isSeriesKind(kind) {
-		return m.findByHash(kind, hash)
+		// A pack is one hash behind several films, and matching the hash alone
+		// answered "already present" for The Godfather because Interstellar came
+		// from the same pack. Without a file_index the file is only known once the
+		// list arrives, and addMovie checks again then.
+		if req.FileIndex <= 0 {
+			return nil, nil
+		}
+		return m.movieStubs(hash, req.FileIndex)
 	}
 	if req.Episode <= 0 {
 		return nil, nil
@@ -393,10 +405,17 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 	return kind, hash, nil
 }
 
-func (m *Manager) addMovie(req AddRequest, hash, magnet string, info *TorrentStats) ([]AddedFile, error) {
-	file, err := m.pickFile(req.FileIndex, info.FileStats)
+// addMovie files one movie, and reports present when that file of the torrent is
+// already filed.
+func (m *Manager) addMovie(ctx context.Context, req AddRequest, hash, magnet string, info *TorrentStats) ([]AddedFile, bool, error) {
+	file, err := m.pickFile(req, info.FileStats)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if existing, err := m.movieStubs(hash, file.ID); err != nil {
+		return nil, false, err
+	} else if len(existing) > 0 {
+		return existing, true, nil
 	}
 
 	is4K := reIs4K.MatchString(req.ReleaseTitle)
@@ -409,19 +428,44 @@ func (m *Manager) addMovie(req AddRequest, hash, magnet string, info *TorrentSta
 		Is4K: is4K, Hash: hash,
 	})
 	path := filepath.Join(m.cfg.MoviesDir, name)
+	// The name carries the title and the hash, so a stub already here is another file
+	// of this torrent filed under this title: the wrong film. Remove it properly, or
+	// the FUSE layer keeps serving the old file's cached size.
+	if _, err := os.Stat(path); err == nil {
+		if err := m.deleteStub(ctx, path); err != nil {
+			return nil, false, errf(http.StatusInternalServerError, "cannot replace %s: %v", name, err)
+		}
+	}
 	if err := WriteStub(path, m.streamURL(hash, file.ID), file.Length, magnet, req.IMDB); err != nil {
-		return nil, errf(http.StatusInternalServerError, "cannot write %s: %v", name, err)
+		return nil, false, errf(http.StatusInternalServerError, "cannot write %s: %v", name, err)
 	}
 	return []AddedFile{{
 		Path: path, FusePath: m.fusePath(path), Size: file.Length, FileIndex: file.ID,
-	}}, nil
+	}}, false, nil
+}
+
+// movieStubs returns the movie stubs already filed for one file of a torrent.
+func (m *Manager) movieStubs(hash string, fileIndex int) ([]AddedFile, error) {
+	found, err := m.findByHash("movie", hash)
+	if err != nil {
+		return nil, err
+	}
+	var out []AddedFile
+	for _, f := range found {
+		if f.FileIndex == fileIndex {
+			out = append(out, f)
+		}
+	}
+	return out, nil
 }
 
 var reIs4K = regexp.MustCompile(`(?i)2160p|\buhd\b|\b4k\b`)
 
-// pickFile returns the requested file, or the largest video file when no index is given.
-func (m *Manager) pickFile(index int, files []FileStat) (*FileStat, error) {
-	if index > 0 {
+// pickFile returns the requested file, or the file MovieFile finds for the movie. A
+// torrent where it finds none is refused rather than guessed at: its largest file is
+// usually another film of a pack.
+func (m *Manager) pickFile(req AddRequest, files []FileStat) (*FileStat, error) {
+	if index := req.FileIndex; index > 0 {
 		for i := range files {
 			if files[i].ID == index {
 				if !IsVideoFile(files[i].Path) {
@@ -433,16 +477,24 @@ func (m *Manager) pickFile(index int, files []FileStat) (*FileStat, error) {
 		return nil, errf(http.StatusBadRequest, "the torrent has no file %d", index)
 	}
 
-	var best *FileStat
-	for i := range files {
-		if IsVideoFile(files[i].Path) && (best == nil || files[i].Length > best.Length) {
-			best = &files[i]
+	year := 0
+	if len(req.ReleaseDate) >= 4 {
+		year, _ = strconv.Atoi(req.ReleaseDate[:4])
+	}
+	if f := MovieFile(files, req.Title, year); f != nil {
+		return f, nil
+	}
+	videos := 0
+	for _, f := range files {
+		if IsVideoFile(f.Path) {
+			videos++
 		}
 	}
-	if best == nil {
+	if videos == 0 {
 		return nil, errf(http.StatusUnprocessableEntity, "the torrent holds no video file")
 	}
-	return best, nil
+	return nil, errf(http.StatusUnprocessableEntity,
+		"no file in this torrent is named for %q; pass file_index to choose one of its %d video files", req.Title, videos)
 }
 
 // kind is passed rather than re-derived from req.Type: validate normalises the
@@ -652,7 +704,7 @@ func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) {
 // a single-episode torrent that does not name it falls back to the largest video file.
 func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileStat, error) {
 	if req.FileIndex > 0 {
-		return m.pickFile(req.FileIndex, files)
+		return m.pickFile(req, files)
 	}
 	var only *FileStat
 	videos := 0
