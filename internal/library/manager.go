@@ -56,7 +56,11 @@ type Config struct {
 	// Blacklist, when set, records a removed release the way the FUSE unlink handler
 	// does, so the sync engines do not add it back. Called only when the caller asks.
 	Blacklist func(path, hash string)
-	Logger    *log.Logger
+	// Gaps, when set, reports the episodes the reaper removed and has not been able to
+	// replace. Read-only: what to do about a hole is a decision for the client, which
+	// can ask the user; the engine only says which ones are open.
+	Gaps   func() ([]Gap, error)
+	Logger *log.Logger
 	// MediaServer, when set, is asked to rescan the section a stub was added to or
 	// removed from. MovieSection and TVSection are its library ids.
 	MediaServer  MediaServer
@@ -151,6 +155,48 @@ type RemoveRequest struct {
 	Blacklist bool `json:"blacklist"`
 }
 
+// Gap is an episode removed because its release died and nothing live replaced it.
+type Gap struct {
+	EpisodeKey string `json:"episode_key"`
+	Show       string `json:"show"`
+	Season     int    `json:"season"`
+	ShowIMDB   string `json:"show_imdb,omitempty"`
+	Path       string `json:"path"`
+	DeadHash   string `json:"dead_hash"`
+	RemovedAt  int64  `json:"removed_at"`
+	// LastAttempt is when the engine last re-searched this hole, zero when it never
+	// has. No omitempty: the client needs to tell "never tried" from "tried at 0".
+	LastAttempt int64 `json:"last_attempt"`
+}
+
+// maxGaps caps one listing: the client pages through nothing, it acts on what it
+// sees, and an unbounded backlog should not become an unbounded response.
+const maxGaps = 500
+
+// ListGaps returns the open holes, oldest first, along with how many there are in
+// total: the response is capped, and a client cannot tell a full page from a
+// truncated one by its length alone.
+func (m *Manager) ListGaps() ([]Gap, int, error) {
+	if m.cfg.Gaps == nil {
+		return []Gap{}, 0, nil
+	}
+	gaps, err := m.cfg.Gaps()
+	if err != nil {
+		// The driver error names the database file: it is logged, not returned, since
+		// this endpoint carries no authentication.
+		m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot read the episode gaps: %v", err)
+		return nil, 0, errf(http.StatusInternalServerError, "cannot read the episode gaps")
+	}
+	if gaps == nil {
+		gaps = []Gap{}
+	}
+	total := len(gaps)
+	if len(gaps) > maxGaps {
+		gaps = gaps[:maxGaps]
+	}
+	return gaps, total, nil
+}
+
 type RemoveResponse struct {
 	Removed []string `json:"removed"`
 }
@@ -168,7 +214,7 @@ type Item struct {
 }
 
 var (
-	reStubHash  = regexp.MustCompile(`link=([a-f0-9]{40})`)
+	reStubHash  = regexp.MustCompile(`link=([a-fA-F0-9]{40})`)
 	reStubIndex = regexp.MustCompile(`index=(\d+)`)
 	reStubIMDB  = regexp.MustCompile(`tt\d{7,10}`)
 )
@@ -185,6 +231,13 @@ func (m *Manager) dropTorrent(ctx context.Context, hash string) {
 	defer cancel()
 	if err := m.cfg.GoStorm.RemoveTorrent(cctx, hash); err != nil {
 		m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot remove torrent %s: %v", hash, err)
+	}
+	// The failure counter outlives the torrent otherwise: the same release added again
+	// later would arrive already condemned, and the reaper would drop it on sight.
+	if cf, ok := m.cfg.Registry.(interface{ ClearMetadataFailure(string) error }); ok {
+		if err := cf.ClearMetadataFailure(hash); err != nil {
+			m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot clear the failure counter for %s: %v", hash, err)
+		}
 	}
 }
 
@@ -632,12 +685,25 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 		})
 		prior = append(prior, p)
 
+		// UpsertEpisode replaces the row, so the show id a previous sync stored would
+		// be wiped by an add through the API. It is carried over instead: the id is
+		// how a dead release is traced back to TMDB, and this path has none of its own.
+		// Reuse the row already read above: reading again would cost a query per
+		// episode and, on error, blank the id this very block exists to preserve.
+		showIMDB := p.entry.ShowIMDB
 		if err := m.cfg.Registry.UpsertEpisode(key, metadb.EpisodeEntry{
 			EpisodeKey: key, QualityScore: req.QualityScore, Hash: hash,
-			FilePath: path, Source: "api", Created: time.Now().Unix(),
+			FilePath: path, Source: "api", Created: time.Now().Unix(), ShowIMDB: showIMDB,
 		}); err != nil {
 			rollback()
 			return nil, errf(http.StatusInternalServerError, "cannot register S%02dE%02d: %v", w.season, w.episode, err)
+		}
+		// The episode is back on disk: an open gap for it is stale, and a client that
+		// read the gap list and added it here would otherwise keep seeing its own hole.
+		if gc, ok := m.cfg.Registry.(interface{ ClearEpisodeGap(string) error }); ok {
+			if err := gc.ClearEpisodeGap(key); err != nil {
+				m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot clear the gap for %s: %v", key, err)
+			}
 		}
 	}
 
@@ -821,8 +887,12 @@ func (m *Manager) findByHash(kind, hash string) ([]AddedFile, error) {
 	}
 	suffix := HashSuffix(hash)
 	if isSeriesKind(kind) {
-		suffix = hash[:8]
+		suffix = HashPrefix(hash)
 	}
+	// Legacy stubs carry the hash in the case the tracker used, so match case-insensitively:
+	// readStub lowercases the hash it returns, and a mismatch here would hide sibling stubs
+	// and drop a torrent still in use.
+	suffix = strings.ToLower(suffix)
 	var out []AddedFile
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -830,7 +900,7 @@ func (m *Manager) findByHash(kind, hash string) ([]AddedFile, error) {
 			// missing stub here means a duplicate add.
 			return err
 		}
-		if info.IsDir() || !strings.HasSuffix(path, "_"+suffix+".mkv") {
+		if info.IsDir() || !strings.HasSuffix(strings.ToLower(path), "_"+suffix+".mkv") {
 			return nil
 		}
 		st := readStub(path)
@@ -1066,8 +1136,11 @@ func readStub(path string) stub {
 		}
 	}
 
+	// Older builds wrote the URL verbatim, hash in caps included, so normalise it:
+	// everything downstream compares lowercase, and an empty hash would leave the
+	// torrent in the engine and blacklist the release without its id.
 	if m := reStubHash.FindStringSubmatch(url); len(m) > 1 {
-		out.Hash = m[1]
+		out.Hash = strings.ToLower(m[1])
 	}
 	if m := reStubIndex.FindStringSubmatch(url); len(m) > 1 {
 		out.FileIndex, _ = strconv.Atoi(m[1])

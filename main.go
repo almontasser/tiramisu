@@ -805,6 +805,11 @@ func invalidateSyncRemovedPath(path string) {
 		forceCloseVirtualFile(path)
 		registry.RemoveFromRegistry(path)
 	}
+	// The directory listing is not the only way back to a removed stub: a lookup by
+	// exact path is served from the metadata cache, which holds entries for 24h.
+	if metaCache != nil {
+		metaCache.Delete(path)
+	}
 	globalDirCache.Delete(filepath.Dir(path))
 	// Covers removed directories too (empty season/show dir cleanup).
 	globalDirCache.Delete(path)
@@ -845,6 +850,11 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 
 	registry.RemoveFromRegistry(fullPath)
 	globalDirCache.Delete(d.physicalPath)
+	// Same reason as the sync removal path: a lookup by exact path is answered from
+	// the metadata cache, which would keep serving this file for the whole TTL.
+	if metaCache != nil {
+		metaCache.Delete(fullPath)
+	}
 	library.StubChanged(fullPath)
 
 	logger.Printf("UNLINK COMPLETE: file deleted successfully")
@@ -4141,6 +4151,26 @@ func main() {
 					torrent.V304LoadBans(ips)
 					logger.Printf("[V304] Restored %d persisted peer bans", len(ips))
 				}
+				// Metadata resolution outcomes: the sync engines read the counter to
+				// tell a dead swarm from a slow one before dropping a title.
+				failDB := stateDB
+				native.MetadataOutcome = func(hash string, resolved bool) {
+					var err error
+					if resolved {
+						// Success is the common case: read first so the usual Open costs a
+						// lookup instead of a write transaction.
+						if n, qerr := failDB.MetadataFailureCount(hash); qerr != nil || n == 0 {
+							return
+						}
+						err = failDB.ClearMetadataFailure(hash)
+					} else {
+						err = failDB.RecordMetadataFailure(hash)
+					}
+					if err != nil {
+						logger.Printf("WARNING: metadata failure bookkeeping for %s: %v", hash, err)
+					}
+				}
+
 				banDB := stateDB
 				torrent.V304SetOnBan(func(ip string) {
 					if err := banDB.SaveV304Ban(ip); err != nil {
@@ -4617,6 +4647,7 @@ func main() {
 				Language:        gc().Language,
 				QualityScoring:  gc().QualityScoringConfig,
 				InvalidatePath:  invalidateSyncRemovedPath,
+				DB:              stateDB,
 			}),
 			// While the anime job is enabled, the TV job leaves anime to it; while it
 			// is not, the TV job covers both, as upstream does. The scheduler never
@@ -4705,6 +4736,30 @@ func main() {
 			GoStorm:        engines.NewGoStormClient(gc().GoStormBaseURL),
 			Registry:       registry,
 			InvalidatePath: invalidateSyncRemovedPath,
+			// Read-only view of the holes the reaper left, for a client that can decide
+			// what to do about them.
+			Gaps: func() ([]library.Gap, error) {
+				if stateDB == nil {
+					return nil, nil
+				}
+				rows, err := stateDB.EpisodeGaps()
+				if err != nil {
+					return nil, err
+				}
+				out := make([]library.Gap, 0, len(rows))
+				for _, g := range rows {
+					// Same spelling the sync logs use, so a client and the log agree on
+					// what the show is called.
+					show := engines.ShowNameFromEpisodePath(g.FilePath)
+					out = append(out, library.Gap{
+						EpisodeKey: g.EpisodeKey, Show: show, Season: g.Season,
+						ShowIMDB: g.ShowIMDB, Path: g.FilePath,
+						DeadHash: g.DeadHash, RemovedAt: g.RemovedAt,
+						LastAttempt: g.LastAttempt,
+					})
+				}
+				return out, nil
+			},
 			// Same record the FUSE unlink handler writes: without it the sync engines
 			// add the title back on their next run.
 			Blacklist: func(path, hash string) {

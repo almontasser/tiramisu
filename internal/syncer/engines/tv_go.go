@@ -54,6 +54,15 @@ type TVGoEngine struct {
 	// runs cover (see TVSyncMode). Nil mode covers every series.
 	name string
 	mode func() TVSyncMode
+	// deadEpisodeKeys holds the episodes whose torrent stopped resolving its metadata.
+	// They stay in the registry - deregistering would have cleanupOrphanedFiles delete
+	// their stubs at the end of the run - but every quality comparison must treat them
+	// as absent, or a replacement of equal quality is refused and the dead release
+	// keeps its place. Rebuilt every run.
+	deadEpisodeKeys map[string]bool
+	// deadPackHashes keeps the releases already known to be silent out of the
+	// candidate list: re-selecting one costs a full metadata wait for nothing.
+	deadPackHashes map[string]bool
 
 	blacklist     BlacklistData
 	blacklistFile string
@@ -169,11 +178,11 @@ var (
 	reTVSeasonW      = regexp.MustCompile(`\bseasons?\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\b`)
 	reTVCompleteS    = regexp.MustCompile(`(?i)\b(complete\s+series|all\s+seasons|full\s+series)\b`)
 	reTVEpNum        = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
-	reTVFileName     = regexp.MustCompile(`(.+)_S(\d+)E(\d+)_([a-f0-9]{8})\.mkv$`)
+	reTVFileName     = regexp.MustCompile(`(?i)(.+)_S(\d+)E(\d+)_([a-f0-9]{8})\.mkv$`)
 	reTVNonWord      = regexp.MustCompile(`[^a-z0-9]`)
 	reTVYear         = regexp.MustCompile(`\(?(\d{4})\)?`)
 	reTVQuality      = regexp.MustCompile(`\b(2160p|1080p|720p|4k|uhd|hdr|dv|dovi|web|bluray|remux)\b.*`)
-	reTVHashURL      = regexp.MustCompile(`link=([a-f0-9]{40})`)
+	reTVHashURL      = regexp.MustCompile(`(?i)link=([a-f0-9]{40})`)
 )
 
 var tvExcludedGenreIDs = map[int]bool{99: true, 10763: true, 10764: true, 10767: true, 16: true}
@@ -331,6 +340,12 @@ func (e *TVGoEngine) removeStub(ctx context.Context, path, hash string) {
 			e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
 		}
 	}
+	e.removeStubFile(path)
+}
+
+// removeStubFile drops the stub without touching the engine, for callers that share one
+// torrent across several stubs and drop it once.
+func (e *TVGoEngine) removeStubFile(path string) {
 	os.Remove(path)
 	if e.invalidatePath != nil {
 		e.invalidatePath(path)
@@ -368,6 +383,11 @@ func (e *TVGoEngine) isBlacklisted(title string) bool {
 	return false
 }
 
+// isDeadPackHash reports a release this run already found silent.
+func (e *TVGoEngine) isDeadPackHash(hash string) bool {
+	return e.deadPackHashes[strings.ToLower(hash)]
+}
+
 func (e *TVGoEngine) isHashBlacklisted(hash string) bool {
 	_, ok := e.blacklist.Hashes[strings.ToLower(hash)]
 	return ok
@@ -388,16 +408,24 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	// Start every run from the database, and from the current blacklist.
 	e.registry = e.loadRegistry()
 	e.blacklist = e.loadBlacklist()
+	e.deadEpisodeKeys = make(map[string]bool)
+	e.deadPackHashes = make(map[string]bool)
 	e.populateRegistryFromExisting()
 	e.reconcileRegistry()
+
+	// Flagged before discovery: the reaper does not depend on it, and a TMDB outage or
+	// a filter that empties the list must not leave dead packs untouched for days.
+	deadPacks := e.flagDeadPacks()
 
 	shows, err := e.discoverShows(ctx)
 	if err != nil {
 		e.logger.Printf("Discover error: %v", err)
+		e.reapDeadPacks(ctx, deadPacks)
 		return fmt.Errorf("discover shows: %w", err)
 	}
 	if len(shows) == 0 {
 		e.logger.Printf("No shows discovered")
+		e.reapDeadPacks(ctx, deadPacks)
 		return nil
 	}
 	e.logger.Printf("Discovered %d shows", len(shows))
@@ -413,6 +441,15 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 		e.logger.Printf("[%d/%d] %s", i+1, len(shows), show.Name)
 		e.processShow(ctx, show)
 	}
+
+	// After the loop: a pack that died on an old season is outside the discovery
+	// window, so this is the only pass that reaches it. Before the cleanup, which
+	// deletes anything the registry no longer lists.
+	e.reapDeadPacks(ctx, deadPacks)
+	// After the reaper. A hole opened in this run is skipped here: it was just created
+	// by a search that failed on the same season, so retrying it now would cost a full
+	// season search to learn nothing.
+	e.repairEpisodeGaps(ctx)
 
 	// Only write JSON registry when DB is unavailable. If DB is active,
 	// episodes were already persisted via registerEpisode() → UpsertEpisode().
@@ -536,7 +573,7 @@ func (e *TVGoEngine) populateRegistryFromExisting() {
 		showName := m[1]
 		season, _ := strconv.Atoi(m[2])
 		episode, _ := strconv.Atoi(m[3])
-		hash8 := m[4]
+		hash8 := strings.ToLower(m[4])
 		key := e.episodeKey(showName, season, episode)
 
 		if _, exists := e.registry[key]; exists {
@@ -552,8 +589,8 @@ func (e *TVGoEngine) populateRegistryFromExisting() {
 				tsLoaded = true
 			}
 			for _, t := range torrents {
-				if strings.HasPrefix(t.Hash, hash8) {
-					fullHash = t.Hash
+				if strings.HasPrefix(strings.ToLower(t.Hash), hash8) {
+					fullHash = strings.ToLower(t.Hash)
 					break
 				}
 			}
@@ -590,7 +627,7 @@ func (e *TVGoEngine) readHashFromMKV(path string) string {
 	url, _ := obj["url"].(string)
 	m := reTVHashURL.FindStringSubmatch(url)
 	if len(m) > 1 {
-		return m[1]
+		return strings.ToLower(m[1])
 	}
 	return ""
 }
@@ -604,12 +641,21 @@ func (e *TVGoEngine) registryByPath(path string) (string, bool) {
 	return "", false
 }
 
+// isDeadEpisode reports whether an episode's release stopped answering. A dead entry
+// must not win a quality comparison: it is still on disk, but it cannot be played.
+func (e *TVGoEngine) isDeadEpisode(key string) bool {
+	return e.deadEpisodeKeys[key]
+}
+
 func (e *TVGoEngine) episodeKey(show string, season, episode int) string {
 	return library.EpisodeKey(show, season, episode)
 }
 
-func (e *TVGoEngine) registerEpisode(key string, score int, hash, path, source string) {
+func (e *TVGoEngine) registerEpisode(key string, score int, hash, path, source, showIMDB string) {
 	created := time.Now().Unix()
+	// The episode has a live release again: it must stop being treated as absent in
+	// the comparisons for the rest of the run.
+	delete(e.deadEpisodeKeys, key)
 	e.registry[key] = TVEpisodeEntry{
 		QualityScore: score,
 		Hash:         hash,
@@ -625,8 +671,14 @@ func (e *TVGoEngine) registerEpisode(key string, score int, hash, path, source s
 			FilePath:     path,
 			Source:       source,
 			Created:      created,
+			ShowIMDB:     showIMDB,
 		}); err != nil {
 			e.logger.Printf("[TVSync] Warning: failed to save episode to DB: %v", err)
+		}
+		// The hole is filled: close it here rather than only in the repair pass, or a
+		// client that reads the gap list and adds the episode itself keeps seeing it.
+		if err := e.db.ClearEpisodeGap(key); err != nil {
+			e.logger.Printf("[TVSync] Warning: could not clear the gap for %s: %v", key, err)
 		}
 	} else {
 		e.saveRegistry()
@@ -733,30 +785,33 @@ func (e *TVGoEngine) passesShowFilters(show tmdb.TVShow) bool {
 	return tmdb.HasPremiumProvider(details.WatchProviders)
 }
 
-func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
+// processShow searches one show and acquires what it is missing. seasons, when given,
+// replaces the default window of the last two: the reaper needs the seasons a dead
+// release covers. The returned map says which of them were conclusively searched.
+func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow, seasons ...int) map[int]seasonSearch {
 	showName := show.Name
 	if showName == "" {
 		showName = show.OriginalName
 	}
 	if showName == "" {
-		return
+		return nil
 	}
 
 	// Blacklist check at show level
 	if e.isBlacklisted(showName) {
 		e.logger.Printf("🚫 Blacklist: skipping show '%s'", showName)
-		return
+		return nil
 	}
 
 	t0 := time.Now()
 	imdbID, err := e.tmdb.TVExternalIDs(ctx, show.ID)
 	if err != nil || imdbID == "" {
-		return
+		return nil
 	}
 
 	details, err := e.tmdb.TVDetails(ctx, show.ID)
 	if err != nil {
-		return
+		return nil
 	}
 	e.logger.Printf("  TMDB lookups: %v", time.Since(t0).Round(time.Millisecond))
 
@@ -766,9 +821,12 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	//   1. premiered recently (first_air_date)
 	//   2. aired recently — catches old shows with new seasons (last_air_date)
 	//   3. has upcoming episodes planned (next_episode_to_air)
-	if !isShowRecent(details) {
+	// The recency gate keeps the routine sync on shows still airing. The reaper asks
+	// for explicit seasons, and it asks because a release there is already dead: a
+	// show off the air is exactly the case it exists for.
+	if len(seasons) == 0 && !isShowRecent(details) {
 		e.logger.Printf("  Skipping '%s' — no recent activity (last: %s, next: %v)", showName, details.LastAirDate, details.NextEpisodeToAir != nil)
-		return
+		return nil
 	}
 
 	// Check complete seasons
@@ -786,6 +844,17 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		startSeason = 1
 	}
 	endSeason := numSeasons
+	if len(seasons) > 0 {
+		startSeason, endSeason = seasons[0], seasons[0]
+		for _, sn := range seasons {
+			if sn < startSeason {
+				startSeason = sn
+			}
+			if sn > endSeason {
+				endSeason = sn
+			}
+		}
+	}
 
 	allTargetComplete := true
 	for s := startSeason; s <= endSeason; s++ {
@@ -799,15 +868,15 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 	// If ALL target seasons are complete, skip entire show immediately
 	if allTargetComplete {
 		e.logger.Printf("Skipping '%s' — all %d target seasons complete", showName, endSeason-startSeason+1)
-		return
+		return nil
 	}
 
 	// Get streams
 	t1 := time.Now()
-	streams := e.getStreams(ctx, imdbID, show.ID, showName, details)
+	streams, searched := e.getStreams(ctx, imdbID, show.ID, showName, details, seasons...)
 	e.logger.Printf("  getStreams: %v (%d streams)", time.Since(t1).Round(time.Millisecond), len(streams))
 	if len(streams) == 0 {
-		return
+		return searched
 	}
 
 	sort.SliceStable(streams, func(i, j int) bool {
@@ -856,7 +925,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		}
 
 		t2 := time.Now()
-		count := e.processFullpack(ctx, showName, e.showDir(show), stream, show.FirstAirDate, knownTitles)
+		count := e.processFullpack(ctx, showName, imdbID, e.showDir(show), stream, show.FirstAirDate, knownTitles)
 		e.logger.Printf("    fullpack S%02d: %d created in %v (%s)", stream.Season, count, time.Since(t2).Round(time.Millisecond), stream.Title[:min(60, len(stream.Title))])
 		if count > 0 {
 			created += count
@@ -887,7 +956,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 			continue
 		}
 
-		count := e.processSingle(ctx, showName, e.showDir(show), stream, show.FirstAirDate, knownTitles)
+		count := e.processSingle(ctx, showName, imdbID, e.showDir(show), stream, show.FirstAirDate, knownTitles)
 		created += count
 		singlesProcessed++
 	}
@@ -896,6 +965,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow) {
 		e.stats.Shows++
 		e.stats.EpisodesCreated += created
 	}
+	return searched
 }
 
 type TVStream struct {
@@ -921,7 +991,29 @@ func (e *TVGoEngine) seasonWindow(numSeasons int) int {
 	return e.maxSeasons
 }
 
-func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, showName string, details *tmdb.TVDetail) []TVStream {
+// seasonSearch is what one season's search established. Complete means every source
+// that should have answered did; RawSeen means releases naming that season came back
+// at all, before any quality gate. They are kept apart because they answer different
+// questions: whether the search ran, and whether the season exists in the catalogues.
+//
+// RawSeen is deliberately pre-gate on both sources. A release rejected for seeders or
+// language still proves the season is out there, and measuring it after the gates
+// would make the same reality read differently depending on which indexer answered.
+type seasonSearch struct {
+	Complete bool
+	RawSeen  bool
+}
+
+// getStreams returns the classified streams and, per season, what its search
+// established. Completeness is per season because the two sources cover different
+// ones: Prowlarr answers for the window, Torrentio fills only the seasons it left
+// uncovered. A single show-level flag would call a season searched when nothing ever
+// asked for it.
+//
+// seasons, when non-empty, replaces the default window (seasonWindow): the reaper
+// needs the seasons a dead release actually covers, which for an old pack are
+// nowhere near the end of the show.
+func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, showName string, details *tmdb.TVDetail, seasons ...int) ([]TVStream, map[int]seasonSearch) {
 	numSeasons := details.NumberOfSeasons
 	if numSeasons == 0 {
 		numSeasons = 5
@@ -933,6 +1025,17 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		startSeason = 1
 	}
 	endSeason := numSeasons
+	if len(seasons) > 0 {
+		startSeason, endSeason = seasons[0], seasons[0]
+		for _, s := range seasons {
+			if s < startSeason {
+				startSeason = s
+			}
+			if s > endSeason {
+				endSeason = s
+			}
+		}
+	}
 
 	var allStreams []prowlarr.Stream
 	seenHashes := make(map[string]bool)
@@ -958,16 +1061,21 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 	}
 
 	// Prowlarr primary
+	prowlarrComplete := true
 	if e.prowlarr != nil {
 		tp := time.Now()
 		var targetSeasons []int
 		for s := startSeason; s <= endSeason; s++ {
 			targetSeasons = append(targetSeasons, s)
 		}
-		streams, err := e.prowlarr.FetchTorrents(imdbID, "series", showName, 0, targetSeasons...)
+		streams, complete, err := e.prowlarr.FetchTorrentsStatus(imdbID, "series", showName, 0, nil, targetSeasons...)
 		if err != nil {
 			e.logger.Printf("Prowlarr search failed for %s: %v", showName, err)
 			streams = nil
+			prowlarrComplete = false
+		} else if !complete {
+			e.logger.Printf("Prowlarr answered partially for %s: seasons are not conclusively searched", showName)
+			prowlarrComplete = false
 		}
 		for _, s := range streams {
 			h := strings.ToLower(s.InfoHash)
@@ -997,6 +1105,30 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 
 	// Torrentio fallback, restricted to the uncovered seasons and merged with Prowlarr's
 	// results rather than replacing them, so ITA releases already found are kept.
+	// A season Prowlarr covered is as complete as Prowlarr's own answer; one it left
+	// to the fallback is complete only if every aired episode was actually fetched.
+	// Raw coverage, before the quality gates: a release that names the season counts
+	// even if classifyStream would discard it.
+	rawSeen := make(map[int]bool)
+	for _, st := range allStreams {
+		if span := e.extractSeasonSpan(st.Title); span != nil {
+			for season := span[0]; season <= span[1]; season++ {
+				rawSeen[season] = true
+			}
+			continue
+		}
+		// extractSeason falls back to 1 when the title names no season, so a release
+		// that mentions none is attributed there rather than to a phantom season 0.
+		if season := e.extractSeason(st.Title); season > 0 {
+			rawSeen[season] = true
+		}
+	}
+
+	seasonComplete := make(map[int]seasonSearch, endSeason-startSeason+1)
+	for s := startSeason; s <= endSeason; s++ {
+		seasonComplete[s] = seasonSearch{Complete: prowlarrComplete && covered[s], RawSeen: rawSeen[s]}
+	}
+
 	if len(missing) > 0 {
 		tt := time.Now()
 		epsFetched := 0
@@ -1005,12 +1137,19 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 			if epCount == 0 {
 				continue // no aired episode for this season — nothing legitimate to fetch
 			}
+			seasonFetchFailed := false
 			for ep := 1; ep <= epCount; ep++ {
 				tioStreams, err := e.torrentio.FetchEpisodeStreams(ctx, imdbID, season, ep)
 				if err != nil {
+					seasonFetchFailed = true
 					continue
 				}
 				epsFetched++
+				if len(tioStreams) > 0 {
+					// Same meaning as the Prowlarr side: releases came back for this
+					// season, whatever the gates will make of them.
+					rawSeen[season] = true
+				}
 				for _, s := range tioStreams {
 					// Prowlarr's hashes are stored lowercase; normalize so the merge dedups.
 					h := strings.ToLower(s.InfoHash)
@@ -1025,11 +1164,19 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 				}
 				e.limiter.Wait(ctx)
 			}
+			// RawSeen stays apart from Complete: every episode answering 200 with an
+			// empty list is a healthy search of a season with nothing to offer, and is
+			// indistinguishable here from a degraded indexer. The caller decides what
+			// to do with that, this only reports it.
+			seasonComplete[season] = seasonSearch{
+				Complete: prowlarrComplete && !seasonFetchFailed,
+				RawSeen:  rawSeen[season],
+			}
 		}
 		e.logger.Printf("    Torrentio fallback for S%v: %d streams total from %d eps in %v", missing, len(allStreams), epsFetched, time.Since(tt).Round(time.Millisecond))
 	}
 
-	return e.classifyAndFilter(allStreams, startSeason, endSeason, airedSeasonEps)
+	return e.classifyAndFilter(allStreams, startSeason, endSeason, airedSeasonEps), seasonComplete
 }
 
 // classifyAndFilter runs classifyStream on each raw stream and keeps only those matching the
@@ -1068,6 +1215,12 @@ func (e *TVGoEngine) classifyStream(s prowlarr.Stream) *TVStream {
 
 	// Hash blacklist check
 	if e.isHashBlacklisted(s.InfoHash) {
+		return nil
+	}
+
+	// A release this run already found silent: re-selecting it would cost a full
+	// metadata wait to learn what we know.
+	if e.isDeadPackHash(s.InfoHash) {
 		return nil
 	}
 
@@ -1255,7 +1408,7 @@ func (e *TVGoEngine) extractSeeders(title string) int {
 // targetDir is the tree this show's stubs go in: tvDir, or animeDir when the
 // show is anime. It is passed rather than read from the engine because the
 // choice is per show, and processShow is the only place that knows which.
-func (e *TVGoEngine) processFullpack(ctx context.Context, showName, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
+func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
 	magnet := BuildMagnet(stream.Hash, stream.Title, DefaultTrackers())
 	hash, err := e.gostorm.AddTorrent(ctx, magnet, stream.Title)
 	if err != nil || hash == "" {
@@ -1305,7 +1458,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, targetDir st
 			continue
 		}
 
-		if existing, ok := e.registry[key]; ok {
+		if existing, ok := e.registry[key]; ok && !e.isDeadEpisode(key) {
 			if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 				e.stats.EpisodesSkipped++
 				skipped++
@@ -1324,7 +1477,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, targetDir st
 				e.removeStub(ctx, existing.FilePath, existing.Hash)
 				e.stats.Upgrades++
 			}
-			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack")
+			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack", showIMDB)
 			e.processedThisRun[key] = true
 			created++
 			e.logger.Printf("Created: %s", epFilename)
@@ -1341,7 +1494,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, targetDir st
 	return created
 }
 
-func (e *TVGoEngine) processSingle(ctx context.Context, showName, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
+func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targetDir string, stream TVStream, firstAirDate string, knownTitles []string) int {
 	title := stream.Title
 	m := reTVEpNum.FindStringSubmatch(title)
 	if len(m) < 3 {
@@ -1356,7 +1509,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, targetDir stri
 		return 0
 	}
 
-	if existing, ok := e.registry[key]; ok {
+	if existing, ok := e.registry[key]; ok && !e.isDeadEpisode(key) {
 		if float64(stream.QualityScore) <= float64(existing.QualityScore)*tvUpgradeThreshold {
 			e.stats.EpisodesSkipped++
 			e.processedThisRun[key] = true
@@ -1408,7 +1561,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, targetDir stri
 			e.removeStub(ctx, existing.FilePath, existing.Hash)
 			e.stats.Upgrades++
 		}
-		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single")
+		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single", showIMDB)
 		e.processedThisRun[key] = true
 		e.logger.Printf("Created: %s", epFilename)
 		return 1
@@ -1430,8 +1583,15 @@ func (e *TVGoEngine) getCompleteSeasons(showName string, details *tmdb.TVDetail)
 	complete := make(map[int]float64)
 	for sn, expected := range seasonEps {
 		var scores []int
+		// The key is "<normalized show>_sXXeYY", so the show segment has to be anchored:
+		// a bare prefix counts every show whose name starts the same way, and "ted"
+		// would be filled in by "tedlasso" (nine such pairs in production).
+		prefix := fmt.Sprintf("%s_s%02de", normalized, sn)
 		for key, entry := range e.registry {
-			if strings.HasPrefix(key, normalized) && strings.Contains(key, fmt.Sprintf("_s%02de", sn)) {
+			// A dead episode does not count towards its season: leaving it in would keep
+			// the season "complete", and the cascade below would skip the very search
+			// meant to replace it.
+			if strings.HasPrefix(key, prefix) && !e.isDeadEpisode(key) {
 				scores = append(scores, entry.QualityScore)
 			}
 		}
@@ -1551,7 +1711,7 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 		if len(m) < 2 {
 			return nil
 		}
-		hash := m[1]
+		hash := strings.ToLower(m[1])
 
 		if activeHashes[hash] {
 			return nil
@@ -1669,6 +1829,11 @@ func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 strin
 	return library.EpisodeFilename(show, season, episode, hash8)
 }
 
+// createMKV writes an episode stub. The imdb field stays empty on purpose: the
+// webhook matcher pairs a Plex episode event with an open file by looking at states
+// whose id is empty, and a series id here would make every open episode of the same
+// show match the same event. The show id lives in tv_episodes.show_imdb instead,
+// which is where anything that needs to trace a file back to TMDB should read it.
 func (e *TVGoEngine) createMKV(path, streamURL string, fileSize int64, magnet string) bool {
 	return library.WriteStub(path, streamURL, fileSize, magnet, "") == nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -58,6 +59,32 @@ func New(dbPath string, logger Logger) (*DB, error) {
 func (d *DB) Close() error {
 	_, _ = d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return d.db.Close()
+}
+
+// hasColumn reports whether a table already carries a column.
+func (d *DB) hasColumn(table, column string) bool {
+	var n int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// addColumn applies an additive migration guarded by hasColumn. A lookup that fails for
+// its own reasons answers "missing", so the ALTER is attempted on a table that already
+// has the column: that duplicate is tolerated here, because the alternative is New()
+// returning an error and tiramisu refusing to start.
+func (d *DB) addColumn(table, column, ddl string) error {
+	if d.hasColumn(table, column) {
+		return nil
+	}
+	if _, err := d.db.Exec(ddl); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // SetLogger sets a custom logger for the database.
@@ -148,6 +175,13 @@ CREATE TABLE IF NOT EXISTS v304_bans (
     ip        TEXT PRIMARY KEY,
     banned_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS metadata_failures (
+    hash       TEXT PRIMARY KEY,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    first_fail INTEGER NOT NULL,
+    last_fail  INTEGER NOT NULL
+);
 `
 	_, err := d.db.Exec(schema)
 	if err != nil {
@@ -158,5 +192,44 @@ CREATE TABLE IF NOT EXISTS v304_bans (
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (1, 'initial schema')`)
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (2, 'add playback_states table')`)
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (3, 'add v304_bans table')`)
+	// 4 is taken on installations that ran the V754 webhook-position build, so this
+	// lands on 5: INSERT OR IGNORE would otherwise drop it there and leave the
+	// registry claiming two different things for the same version.
+	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (5, 'add metadata_failures table')`)
+
+	// Additive column: SQLite has no ADD COLUMN IF NOT EXISTS, so it is guarded by a
+	// lookup instead. Without the show id an episode file cannot be traced back to
+	// TMDB, which is what a re-search needs.
+	if err := d.addColumn("tv_episodes", "show_imdb",
+		`ALTER TABLE tv_episodes ADD COLUMN show_imdb TEXT DEFAULT ''`); err != nil {
+		return err
+	}
+	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (6, 'add tv_episodes.show_imdb')`)
+
+	// Episodes the reaper removed. Discovery returns a fraction of the library, so a
+	// season it does not reach would keep the hole forever: this is what a later run
+	// consults to try again.
+	if _, err := d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS episode_gaps (
+		    episode_key TEXT PRIMARY KEY,
+		    show_imdb   TEXT DEFAULT '',
+		    season      INTEGER NOT NULL,
+		    file_path   TEXT NOT NULL,
+		    dead_hash   TEXT NOT NULL,
+		    removed_at  INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_gaps_season ON episode_gaps(show_imdb, season);`); err != nil {
+		return err
+	}
+	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (7, 'add episode_gaps table')`)
+
+	// last_attempt sends a gap to the back of the queue once it has been tried. Without
+	// it a show whose name cannot be resolved is retried first on every run, and the
+	// rest of the backlog is never reached.
+	if err := d.addColumn("episode_gaps", "last_attempt",
+		`ALTER TABLE episode_gaps ADD COLUMN last_attempt INTEGER DEFAULT 0`); err != nil {
+		return err
+	}
+	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (8, 'add episode_gaps.last_attempt')`)
 	return nil
 }

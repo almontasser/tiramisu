@@ -120,6 +120,21 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	// type=gaps reuses this endpoint rather than adding one: the response stays an
+	// array, so a client that asks for movies or tv sees no change.
+	if strings.EqualFold(r.URL.Query().Get("type"), "gaps") {
+		gaps, total, err := h.mgr.ListGaps()
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		// The body stays an array, so the count travels in a header: without it a
+		// client reading a capped page cannot tell there is more behind it.
+		w.Header().Set("X-Total-Count", strconv.Itoa(total))
+		writeJSON(w, http.StatusOK, gaps)
+		return
+	}
+
 	q := r.URL.Query()
 	kind := q.Get("type")
 	search := strings.ToLower(strings.TrimSpace(q.Get("search")))

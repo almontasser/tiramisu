@@ -22,6 +22,7 @@ import (
 	"tiramisu/internal/catalog/torrentio"
 	"tiramisu/internal/config"
 	"tiramisu/internal/library"
+	"tiramisu/internal/metadb"
 	"tiramisu/internal/prowlarr"
 )
 
@@ -55,6 +56,12 @@ type MovieGoEngine struct {
 
 	blacklist     BlacklistData
 	blacklistFile string
+
+	db *metadb.DB
+	// deadTitles holds the IMDB ids whose current release stopped resolving its
+	// metadata. They are re-searched this run, and dropped only if nothing live
+	// turns up.
+	deadTitles map[string]bool
 
 	invalidatePath func(string)
 
@@ -98,6 +105,7 @@ type MovieEngineConfig struct {
 	StateDir        string
 	LogsDir         string
 	ProwlarrCfg     prowlarr.ConfigProwlarr
+	DB              *metadb.DB
 	Language        config.LanguageConfig
 	Weights         config.MovieWeights
 	// InvalidatePath, when set, is called after removing a stub file so the FUSE
@@ -105,18 +113,28 @@ type MovieEngineConfig struct {
 	InvalidatePath func(string)
 }
 
-// Movie thresholds
-const (
-	mMovieUpgradePct     = 1.1
-	mMovieProcessSleep   = 1 * time.Second
+// mMovieMetadataWait/mMovie4KMetadataWait are how long a candidate is given to
+// produce its metadata. Vars, not consts, so a test can exercise the timeout path
+// without waiting on the wall clock.
+var (
 	mMovieMetadataWait   = 12
 	mMovie4KMetadataWait = 45
-	noMKVCacheTTL        = 12 * time.Hour
-	noStreamsCacheTTL    = 24 * time.Hour
-	recheckCacheTTL      = 48 * time.Hour
-	recheck1080pTTL      = 6 * time.Hour
-	recheckNoFileTTL     = 24 * time.Hour
-	addFailCacheTTL      = 168 * time.Hour
+)
+
+// Movie thresholds
+const (
+	mMovieUpgradePct   = 1.1
+	mMovieProcessSleep = 1 * time.Second
+	noMKVCacheTTL      = 12 * time.Hour
+	// deadReleaseFailures/deadReleaseSpan: what tells a dead swarm from a bad
+	// evening is failures spread over time, not how many arrived together.
+	deadReleaseFailures = 3
+	deadReleaseSpan     = 24 * time.Hour
+	noStreamsCacheTTL   = 24 * time.Hour
+	recheckCacheTTL     = 48 * time.Hour
+	recheck1080pTTL     = 6 * time.Hour
+	recheckNoFileTTL    = 24 * time.Hour
+	addFailCacheTTL     = 168 * time.Hour
 )
 
 var (
@@ -131,14 +149,18 @@ var (
 	reMStereo = regexp.MustCompile(`(?i)stereo|aac|mp3|2\.0`)
 	// Same rule as library.BuildMovieFilename: no separator required before the word,
 	// so "BDRemux" and "UHDRemux" count as the remux they are.
-	reMRemux    = regexp.MustCompile(`(?i)remux(?:$|[^A-Za-z0-9])`)
-	reMGarbage  = regexp.MustCompile(`(?i)camrip|hdcam|hdts|telesync|\bts\b|telecine|\btc\b|\bscr\b|screener|webscreener`)
-	reMSeeders  = regexp.MustCompile(`👤\s*(\d+)`)
-	reMHashURL  = regexp.MustCompile(`link=([a-f0-9]{40})`)
-	reMMKVHash8 = regexp.MustCompile(`_([a-f0-9]{8})\.mkv$`)
-	reMYear     = regexp.MustCompile(`[._]((?:19|20)\d{2})[._]`)
-	reMNonWord  = regexp.MustCompile(`[^a-z0-9]`)
-	reMQuality  = regexp.MustCompile(`(?i)(2160p|1080p|720p|4k|uhd)`)
+	reMRemux   = regexp.MustCompile(`(?i)remux(?:$|[^A-Za-z0-9])`)
+	reMGarbage = regexp.MustCompile(`(?i)camrip|hdcam|hdts|telesync|\bts\b|telecine|\btc\b|\bscr\b|screener|webscreener`)
+	reMSeeders = regexp.MustCompile(`👤\s*(\d+)`)
+	// reQualityMarker: where a stub filename stops being the title and starts being
+	// release metadata. No audio-channel alternative (5.1, 7.1): titleFromStubName
+	// splits on "." before matching, so such a token never reaches here whole.
+	reQualityMarker = regexp.MustCompile(`(?i)^(2160p|1080p|720p|480p|4k|uhd|hdr|dv|atmos|remux|bluray|web|webrip|web-dl|hevc|x264|x265|multi|ita|eng)$`)
+	reMHashURL      = regexp.MustCompile(`(?i)link=([a-f0-9]{40})`)
+	reMMKVHash8     = regexp.MustCompile(`(?i)_([a-f0-9]{8})\.mkv$`)
+	reMYear         = regexp.MustCompile(`[._]((?:19|20)\d{2})[._]`)
+	reMNonWord      = regexp.MustCompile(`[^a-z0-9]`)
+	reMQuality      = regexp.MustCompile(`(?i)(2160p|1080p|720p|4k|uhd)`)
 )
 
 // NewMovieGoEngine creates a new Go movie sync engine.
@@ -182,12 +204,14 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 		weights: cfg.Weights,
 	}
 
-	e.noMKVCache = e.loadCache(e.noMKVCFile)
+	e.db = cfg.DB
+	e.noMKVCache = e.loadNoMKVCache()
 	e.noStreamsCache = e.loadCache(e.noStreamsCFile)
 	e.recheckCache = e.loadCache(e.recheckCFile)
 	e.addFailCache = e.loadCache(e.addFailCFile)
 	e.imdbCache = e.loadIMDBCache(e.imdbCFile)
 	e.blacklist = e.loadBlacklist()
+	e.deadTitles = make(map[string]bool)
 
 	e.pruneExpiredCaches()
 
@@ -202,6 +226,14 @@ func (e *MovieGoEngine) removeStub(ctx context.Context, path, hash string) {
 		if err := e.gostorm.RemoveTorrent(ctx, hash); err != nil {
 			e.logger.Printf("[MovieSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
 		}
+		// The failure counter outlives the release otherwise: if this hash is ever
+		// selected again, a stale count already past the threshold would condemn it
+		// before it has had a chance to fail.
+		if e.db != nil {
+			if err := e.db.ClearMetadataFailure(hash); err != nil {
+				e.logger.Printf("[MovieSync] WARNING: failed to clear metadata failures for %s: %v", hash, err)
+			}
+		}
 	}
 	os.Remove(path)
 	if e.invalidatePath != nil {
@@ -209,9 +241,151 @@ func (e *MovieGoEngine) removeStub(ctx context.Context, path, hash string) {
 	}
 }
 
+// flagDeadTitles marks the titles whose release stopped answering with its
+// metadata, so this run re-searches them instead of skipping them as already
+// present. The engine counts the failures; the threshold lives here because
+// what to do with a dead release is a library decision, not an engine one.
+//
+// The failing hash goes into noMKVCache, which the candidate loop already
+// consults: that keeps the dead release out of this run's selection without a
+// second writer for blacklist.json, which the mount's unlink handler owns.
+func (e *MovieGoEngine) flagDeadTitles(existingIndex map[string]movieFile) {
+	// Rebuilt every run, before the DB guard: a flag is a decision about this pass,
+	// and carrying it over would let a later run act on a title whose release has
+	// since been replaced.
+	e.deadTitles = make(map[string]bool)
+
+	if e.db == nil {
+		return
+	}
+	dead, err := e.db.MetadataFailuresOver(deadReleaseFailures, deadReleaseSpan)
+	if err != nil {
+		e.logger.Printf("[MovieSync] WARNING: could not read metadata failures: %v", err)
+		return
+	}
+	if len(dead) == 0 {
+		return
+	}
+	deadSet := make(map[string]bool, len(dead))
+	for _, h := range dead {
+		deadSet[strings.ToLower(h)] = true
+	}
+	for imdbID, mf := range existingIndex {
+		if mf.hash == "" || !deadSet[strings.ToLower(mf.hash)] {
+			continue
+		}
+		e.deadTitles[imdbID] = true
+		e.setCache(e.noMKVCache, mf.hash, CacheEntry{Reason: "dead_swarm", TS: time.Now().Unix()})
+		// Every negative cache has to go, not just the recheck one: a title that hit
+		// no_streams (24h) or add_failed (168h) would log "re-searching" and then return
+		// from evaluateTitle without searching anything, for up to a week.
+		delete(e.recheckCache, imdbID)
+		delete(e.noStreamsCache, imdbID)
+		delete(e.addFailCache, imdbID)
+		e.logger.Printf("[MovieSync] Dead release for %s (%s): re-searching", filepath.Base(mf.path), mf.hash[:8])
+	}
+}
+
+// dropDeadStub removes the stub of a title flagged dead once this run has
+// established there is nothing live to replace it with. A search that failed to
+// complete never gets here: it says nothing about the title.
+func (e *MovieGoEngine) dropDeadStub(ctx context.Context, imdbID string, existing movieFile, conclusive, rawSeen bool) bool {
+	if !e.deadTitles[imdbID] || existing.path == "" {
+		return false
+	}
+	// Only a run that actually reached the swarm may condemn a title. An aborted
+	// run, or one where candidates failed to be added at all, says nothing: without
+	// this an indexer outage would empty the library in a single pass.
+	if !conclusive || ctx.Err() != nil {
+		e.logger.Printf("[MovieSync] Dead release for %s: search was inconclusive, keeping the stub", filepath.Base(existing.path))
+		return false
+	}
+	e.logger.Printf("[MovieSync] No live release for %s (raw releases seen: %t): removing dead stub", filepath.Base(existing.path), rawSeen)
+	e.removeStub(ctx, existing.path, existing.hash)
+	delete(e.deadTitles, imdbID)
+	return true
+}
+
+// reapFlaggedTitles gives the titles still flagged at the end of a run their own
+// pass. Discovery only returns the last six months plus what is trending, so an
+// aging library would otherwise collect flags that are never acted on: neither
+// re-searched nor removed.
+func (e *MovieGoEngine) reapFlaggedTitles(ctx context.Context, existingIndex map[string]movieFile, diskHashes map[string]bool) {
+	if len(e.deadTitles) == 0 {
+		return
+	}
+	pending := make([]string, 0, len(e.deadTitles))
+	for imdbID := range e.deadTitles {
+		pending = append(pending, imdbID)
+	}
+	sort.Strings(pending) // deterministic order, so a run is reproducible from the log
+	for _, imdbID := range pending {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		existing := existingIndex[imdbID]
+		if existing.path == "" {
+			continue
+		}
+		title, year := titleFromStubName(filepath.Base(existing.path))
+		if title == "" {
+			continue
+		}
+		// An unknown year must stay empty: "0" is not a date, and BuildMovieFilename would
+		// drop it and rename the stub, which Plex reads as a different file.
+		releaseDate := ""
+		if year > 0 {
+			releaseDate = strconv.Itoa(year)
+		}
+		e.logger.Printf("[MovieSync] Dead release outside discovery: evaluating %s (%s)", title, imdbID)
+		e.evaluateTitle(ctx, imdbID, title, releaseDate, year, existing, diskHashes)
+		time.Sleep(mMovieProcessSleep)
+	}
+}
+
+// titleFromStubName recovers a searchable title and year from a stub filename. The
+// name is built from the title plus quality markers and an 8-char hash, so cutting
+// at the first marker is enough; the IMDB id carries the search either way, and this
+// only feeds the secondary title query.
+func titleFromStubName(name string) (string, int) {
+	base := strings.TrimSuffix(name, filepath.Ext(name))
+	if i := strings.LastIndex(base, "_"); i > 0 && len(base)-i == 9 {
+		base = base[:i] // drop the trailing _hash8
+	}
+	sep := func(r rune) bool { return r == '_' || r == '.' || r == ' ' }
+	parts := strings.FieldsFunc(base, sep)
+	var words []string
+	for _, p := range parts {
+		if reQualityMarker.MatchString(p) {
+			break // everything past the first marker is release metadata
+		}
+		words = append(words, p)
+	}
+	// The release year is the LAST year-like token, not the first: a title can be a year
+	// ("1917", "2012") or end with one ("Blade Runner 2049"), and taking the first would
+	// steal it from the title and report the wrong year. Index 0 is never the year, or a
+	// title that is just a year would come back empty and never be reaped.
+	year := 0
+	for i := len(words) - 1; i > 0; i-- {
+		if n, err := strconv.Atoi(words[i]); err == nil && n >= 1900 && n <= 2100 {
+			year = n
+			words = words[:i]
+			break
+		}
+	}
+	return strings.Join(words, " "), year
+}
+
 func (e *MovieGoEngine) Name() string { return "movies" }
 
 func (e *MovieGoEngine) Run(ctx context.Context) error {
+	// Deferred so an early return still persists what the run learned about dead
+	// candidates. The nominal path saves before the closing phases too: this is the
+	// backstop, not the only write.
+	defer e.saveAllCaches()
+
 	e.logger.Printf("[MovieSync] Starting discovery...")
 	movies, err := e.discoverMovies(ctx)
 	if err != nil {
@@ -221,6 +395,8 @@ func (e *MovieGoEngine) Run(ctx context.Context) error {
 
 	existingIndex, diskHashes := e.buildExistingMovieIndex()
 	e.logger.Printf("[MovieSync] Existing index: %d movies, %d hashes on disk", len(existingIndex), len(diskHashes))
+
+	e.flagDeadTitles(existingIndex)
 
 	created := 0
 	for i, m := range movies {
@@ -237,7 +413,11 @@ func (e *MovieGoEngine) Run(ctx context.Context) error {
 		time.Sleep(mMovieProcessSleep)
 	}
 
+	e.reapFlaggedTitles(ctx, existingIndex, diskHashes)
+
 	e.logger.Printf("[MovieSync] Processing complete: %d created out of %d discovered", created, len(movies))
+	// Saved here, and again by the deferred call: what the run learned is on disk
+	// before the long rehydrate/cleanup phases, which a SIGKILL would cut through.
 	e.saveAllCaches()
 	e.rehydrateMissingTorrents(ctx)
 	e.cleanupOrphanedFiles(ctx)
@@ -370,7 +550,7 @@ func (e *MovieGoEngine) buildExistingMovieIndex() (map[string]movieFile, map[str
 		}
 		var hash string
 		if m := reMHashURL.FindStringSubmatch(url); len(m) >= 2 {
-			hash = m[1]
+			hash = strings.ToLower(m[1])
 		}
 		is4K := reM4K.MatchString(info.Name())
 		score := e.calculateMovieScore(info.Name(), 0, 0, is4K, e.weights)
@@ -403,9 +583,20 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 		return false
 	}
 
+	year := 0
+	if len(movie.ReleaseDate) >= 4 {
+		year, _ = strconv.Atoi(movie.ReleaseDate[:4])
+	}
+	return e.evaluateTitle(ctx, imdbID, title, movie.ReleaseDate, year, existingIndex[imdbID], diskHashes)
+}
+
+// evaluateTitle runs the candidate search for one title and acts on the result. It is
+// separate from processMovie so a title the discovery feed never returns - anything
+// older than the six-month window - can still be reached, which is the only way the
+// reaper sees an aging library.
+func (e *MovieGoEngine) evaluateTitle(ctx context.Context, imdbID, title, releaseDate string, year int, existing movieFile, diskHashes map[string]bool) bool {
 	// TTL recheck upgrade-aware: 1080p esistente → 6h (cerca upgrade 4K),
 	// 4K esistente → 48h, nessun file → 24h.
-	existing := existingIndex[imdbID]
 	recheckTTL := recheckNoFileTTL
 	if existing.path != "" {
 		if existing.is4K {
@@ -415,24 +606,24 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 		}
 	}
 
-	// Check negative caches
-	if e.isInCache(e.noStreamsCache, imdbID, noStreamsCacheTTL) {
-		return false
-	}
-	if e.isInCache(e.recheckCache, imdbID, recheckTTL) {
-		return false
-	}
-	if e.isInCache(e.addFailCache, imdbID, addFailCacheTTL) {
-		return false
+	// Check negative caches. A title flagged dead this run skips them: its stub is
+	// unplayable, so a cached "nothing better" from a healthy release no longer applies,
+	// and honouring it would make the reaper log a search it never ran.
+	if !e.deadTitles[imdbID] {
+		if e.isInCache(e.noStreamsCache, imdbID, noStreamsCacheTTL) {
+			return false
+		}
+		if e.isInCache(e.recheckCache, imdbID, recheckTTL) {
+			return false
+		}
+		if e.isInCache(e.addFailCache, imdbID, addFailCacheTTL) {
+			return false
+		}
 	}
 
 	// Get streams
 	e.logger.Printf("[MovieSync] Processing: %s (%s)", title, imdbID)
-	year := 0
-	if len(movie.ReleaseDate) >= 4 {
-		year, _ = strconv.Atoi(movie.ReleaseDate[:4])
-	}
-	candidates, hadRaw, err := e.getMovieStreams(ctx, imdbID, title, year)
+	candidates, search, err := e.getMovieStreams(ctx, imdbID, title, year)
 	if err != nil {
 		// A search that never completed says nothing about the title. Caching it would
 		// hide the film for a day over a transient indexer timeout.
@@ -440,7 +631,11 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 		return false
 	}
 	if len(candidates) == 0 {
-		if hadRaw {
+		// Completeness is what matters, not whether releases came back: every indexer
+		// answering with nothing usable is a statement about the title, while one
+		// indexer down is a statement about the search.
+		e.dropDeadStub(ctx, imdbID, existing, search.Complete, search.HadRaw)
+		if search.HadRaw {
 			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_valid_stream", TS: time.Now().Unix()})
 		} else {
 			e.setCache(e.noStreamsCache, imdbID, CacheEntry{Title: title, TS: time.Now().Unix()})
@@ -453,6 +648,10 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 	existingPath := existing.path
 	existingScore := existing.score
 
+	// addFailed marks candidates the engine could not even take: their silence is
+	// about us, not about the swarm, so the title must not be condemned for it.
+	addFailed := false
+
 	// Try candidates
 	for _, c := range candidates {
 		if existingPath != "" && float64(c.QualityScore) <= float64(existingScore)*mMovieUpgradePct {
@@ -464,13 +663,16 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			continue
 		}
 
-		if diskHashes[c.Hash[len(c.Hash)-8:]] {
+		if diskHashes[strings.ToLower(c.Hash[len(c.Hash)-8:])] {
 			continue
 		}
 
 		magnet := BuildMagnet(c.Hash, title, DefaultTrackers())
-		hash, err := e.gostorm.AddTorrent(ctx, magnet, title)
-		if err != nil || hash == "" {
+		hash, confirmed, err := e.gostorm.AddTorrentConfirmed(ctx, magnet, title)
+		if err != nil || hash == "" || !confirmed {
+			// The engine refused the release, or answered without acknowledging it:
+			// either way nothing was learned about the swarm.
+			addFailed = true
 			e.setCache(e.addFailCache, imdbID, CacheEntry{Title: title, Reason: "add_failed", TS: time.Now().Unix()})
 			continue
 		}
@@ -511,7 +713,7 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			e.removeStub(ctx, existingPath, existing.hash)
 		}
 
-		filename := e.buildMovieFilename(title, movie.ReleaseDate, c)
+		filename := e.buildMovieFilename(title, releaseDate, c)
 		mkvPath := filepath.Join(e.moviesDir, filename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
@@ -520,6 +722,15 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 			if !c.Is4K {
 				res = "1080p"
 			}
+			// The title has a live release again: the flag must not survive, or a later
+			// run with no candidates would drop the replacement we just created.
+			delete(e.deadTitles, imdbID)
+			// The index was built before the run: without this the reap pass, which
+			// runs at the end with the same map, cannot see what the loop just wrote
+			// and would add the very same release a second time.
+			if len(hash) >= 8 {
+				diskHashes[strings.ToLower(hash[len(hash)-8:])] = true
+			}
 			e.logger.Printf("[MovieSync] Created: %s (%s, %.1fGB, score:%d)", filename, res, float64(bestFile.Length)/1024/1024/1024, c.QualityScore)
 			e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "processed", TS: time.Now().Unix()})
 			return true
@@ -527,6 +738,11 @@ func (e *MovieGoEngine) processMovie(ctx context.Context, movie tmdb.Movie, exis
 
 		e.gostorm.RemoveTorrent(ctx, hash)
 	}
+
+	// Every candidate was exhausted without a live one: the stub points at a swarm
+	// that cannot serve it. A live candidate would have returned above through the
+	// ordinary upgrade path.
+	e.dropDeadStub(ctx, imdbID, existing, !addFailed && search.Complete, search.HadRaw)
 
 	e.setCache(e.recheckCache, imdbID, CacheEntry{Title: title, Reason: "no_better_stream", TS: time.Now().Unix()})
 	return false
@@ -547,7 +763,16 @@ type MovieStream struct {
 //
 // The error return means no search completed. It must stay distinct from "searched and found
 // nothing", because the caller caches the latter for a day.
-func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title string, year int) ([]MovieStream, bool, error) {
+// streamSearch says what a search run actually established. HadRaw means releases
+// came back at all; Complete means every configured indexer answered. Condemning a
+// title needs Complete: with one indexer down, "no valid release" is a statement
+// about the search, not about the title.
+type streamSearch struct {
+	HadRaw   bool
+	Complete bool
+}
+
+func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title string, year int) ([]MovieStream, streamSearch, error) {
 	var streams []prowlarr.Stream
 	prowlarrOK, torrentioOK := false, false
 
@@ -561,11 +786,16 @@ func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title strin
 			ms, _ := e.classifyMovieStream(s)
 			return ms != nil
 		}
-		ps, err := e.prowlarr.FetchTorrentsFiltered(imdbID, "movie", title, year, keep)
+		ps, complete, err := e.prowlarr.FetchTorrentsStatus(imdbID, "movie", title, year, keep)
 		if err != nil {
 			e.logger.Printf("[MovieSync] Prowlarr search failed: %v", err)
 		} else {
-			prowlarrOK = true
+			// Partial answers still feed the candidate list, but they cannot make the
+			// search complete: some of Prowlarr's own queries never ran.
+			if !complete {
+				e.logger.Printf("[MovieSync] Prowlarr answered partially for %s: search is not conclusive", imdbID)
+			}
+			prowlarrOK = complete
 			streams = append(streams, ps...)
 		}
 	} else {
@@ -588,11 +818,14 @@ func (e *MovieGoEngine) getMovieStreams(ctx context.Context, imdbID, title strin
 	}
 
 	if !prowlarrOK && !torrentioOK {
-		return nil, false, fmt.Errorf("every indexer search failed for %s", imdbID)
+		return nil, streamSearch{}, fmt.Errorf("every indexer search failed for %s", imdbID)
 	}
 
 	streams = dedupStreamsByHash(streams)
-	return e.filterMovieStreams(streams), len(streams) > 0, nil
+	return e.filterMovieStreams(streams), streamSearch{
+		HadRaw:   len(streams) > 0,
+		Complete: prowlarrOK && torrentioOK,
+	}, nil
 }
 
 // dedupStreamsByHash keeps the first occurrence of each infohash: the two indexers list the
@@ -880,7 +1113,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 		if len(m) < 2 {
 			return nil
 		}
-		hash := m[1]
+		hash := strings.ToLower(m[1])
 
 		if activeHashes[hash] {
 			return nil
@@ -941,8 +1174,9 @@ func (e *MovieGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 		if len(m) < 2 {
 			return nil
 		}
-		if !activeHashes[m[1]] {
-			e.removeStub(ctx, path, m[1])
+		hash := strings.ToLower(m[1])
+		if !activeHashes[hash] {
+			e.removeStub(ctx, path, hash)
 		}
 		return nil
 	})
@@ -1024,11 +1258,7 @@ func (e *MovieGoEngine) pruneExpiredCaches() {
 }
 
 func (e *MovieGoEngine) saveAllCaches() {
-	// no_mkv_hashes.json is managed by SQLite after migration — skip if .migrated exists
-	// to avoid triggering the DB crash-recovery wipe on next restart.
-	if !isMigratedFile(e.noMKVCFile) {
-		e.saveCache(e.noMKVCFile, e.noMKVCache)
-	}
+	e.saveNoMKVCache()
 	e.saveCache(e.noStreamsCFile, e.noStreamsCache)
 	e.saveCache(e.recheckCFile, e.recheckCache)
 	e.saveCache(e.addFailCFile, e.addFailCache)
@@ -1040,6 +1270,61 @@ func (e *MovieGoEngine) saveAllCaches() {
 func isMigratedFile(path string) bool {
 	_, err := os.Stat(path + ".migrated")
 	return err == nil
+}
+
+// loadNoMKVCache reads the hashes to skip from the state DB, falling back to the
+// legacy JSON when there is no DB. Without it the cache lives only inside one run,
+// which is what happened between the April migration and now: the DB write was
+// never implemented and the JSON one had already been turned off.
+func (e *MovieGoEngine) loadNoMKVCache() map[string]CacheEntry {
+	if e.db == nil {
+		return e.loadCache(e.noMKVCFile)
+	}
+	neg, _, err := e.db.LoadAllCaches()
+	if err != nil {
+		e.logger.Printf("WARNING: could not read the negative cache from the state DB: %v", err)
+		return e.loadCache(e.noMKVCFile)
+	}
+	out := make(map[string]CacheEntry, len(neg))
+	for hash, entry := range neg {
+		ts, err := time.Parse(time.RFC3339, entry.Timestamp)
+		if err != nil {
+			// An unparseable row is one skipped candidate, not a reason to drop the set.
+			continue
+		}
+		out[hash] = CacheEntry{Reason: entry.Reason, TS: ts.Unix()}
+	}
+	return out
+}
+
+// saveNoMKVCache persists the set the run ends with. The JSON file is written only
+// when there is no DB: recreating it would make the next startup re-run the JSON
+// migration, which clears the table this function just filled.
+func (e *MovieGoEngine) saveNoMKVCache() {
+	if e.db == nil {
+		if !isMigratedFile(e.noMKVCFile) {
+			e.saveCache(e.noMKVCFile, e.noMKVCache)
+		}
+		return
+	}
+	now := time.Now()
+	entries := make([]metadb.NegativeCacheEntry, 0, len(e.noMKVCache))
+	for hash, entry := range e.noMKVCache {
+		if now.Sub(time.Unix(entry.TS, 0)) > noMKVCacheTTL {
+			// Expired in memory but never read again this run: writing it back would
+			// resurrect the rows the hourly cleanup has just deleted.
+			delete(e.noMKVCache, hash)
+			continue
+		}
+		entries = append(entries, metadb.NegativeCacheEntry{
+			Hash:      hash,
+			Reason:    entry.Reason,
+			Timestamp: time.Unix(entry.TS, 0).UTC().Format(time.RFC3339),
+		})
+	}
+	if err := e.db.ReplaceNegatives(entries); err != nil {
+		e.logger.Printf("WARNING: could not save the negative cache to the state DB: %v", err)
+	}
 }
 
 func (e *MovieGoEngine) saveCache(file string, data interface{}) {
