@@ -808,6 +808,7 @@ func invalidateSyncRemovedPath(path string) {
 	globalDirCache.Delete(filepath.Dir(path))
 	// Covers removed directories too (empty season/show dir cleanup).
 	globalDirCache.Delete(path)
+	library.StubChanged(path)
 }
 
 // Unlink handles file deletion and triggers torrent auto-remove (FASE 4.2)
@@ -844,6 +845,7 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 
 	registry.RemoveFromRegistry(fullPath)
 	globalDirCache.Delete(d.physicalPath)
+	library.StubChanged(fullPath)
 
 	logger.Printf("UNLINK COMPLETE: file deleted successfully")
 	return 0
@@ -3971,6 +3973,10 @@ func main() {
 	// server and the host user, both ordinary users, cannot prune the library
 	// these files make up.
 	library.SetOwner(gc().FileUID, gc().FileGID, source)
+
+	// Likewise before anything writes or removes one: Jellyfin learns about each
+	// changed stub from this, and refreshes only the folder holding it.
+	library.StubChanged = mediaserver.NewReporter(gc().MediaServerType, gc().Plex.URL, gc().Plex.Token, source, logger).Changed
 
 	// Same bound the FUSE read uses, applied where the wait actually happens: a
 	// block fetch that never receives its first bytes. Wrapping the read in a

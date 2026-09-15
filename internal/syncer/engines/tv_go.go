@@ -433,13 +433,11 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	e.logger.Printf("TV sync complete: %d shows, %d episodes created, %d skipped, %d upgrades",
 		e.stats.Shows, e.stats.EpisodesCreated, e.stats.EpisodesSkipped, e.stats.Upgrades)
 
-	// Notify the media server: Plex needs a section ID; Jellyfin refreshes the
-	// libraries this run covers.
+	// Notify the media server. Plex skips this without a section ID; Jellyfin skips
+	// it too, because each stub written or removed was already reported to it.
 	if e.stats.EpisodesCreated > 0 {
-		for _, kind := range e.libraryKinds() {
-			if err := mediaserver.Refresh(context.Background(), e.mediasrv, kind, e.plexTVLib); err != nil {
-				e.logger.Printf("Warning: media server library refresh failed: %v", err)
-			}
+		if err := e.mediasrv.RefreshLibrary(context.Background(), e.plexTVLib); err != nil {
+			e.logger.Printf("Warning: media server library refresh failed: %v", err)
 		}
 	}
 
@@ -473,20 +471,6 @@ func (e *TVGoEngine) mergeRegistryFromDB() bool {
 		}
 	}
 	return true
-}
-
-// libraryKinds is the libraries a run of this engine files into.
-func (e *TVGoEngine) libraryKinds() []string {
-	switch e.currentMode() {
-	case TVModeTV:
-		return []string{"tv"}
-	case TVModeAnime:
-		return []string{"anime"}
-	}
-	if len(e.roots()) > 1 {
-		return []string{"tv", "anime"}
-	}
-	return []string{"tv"}
 }
 
 func (e *TVGoEngine) loadRegistry() map[string]TVEpisodeEntry {

@@ -161,6 +161,12 @@ func IsExtrasPath(path string) bool {
 	return reExtrasDir.MatchString(filepath.ToSlash(filepath.Dir(path)))
 }
 
+// StubChanged is called with the path of every stub or stub directory written or
+// removed, so the media server can refresh just that folder. WriteStub calls it; the
+// removals call it from main, where they go through the FUSE layer's invalidation.
+// main sets it before anything writes a stub.
+var StubChanged = func(path string) {}
+
 // WriteStub writes the virtual .mkv: a small JSON file the FUSE layer exposes at the
 // declared size.
 func WriteStub(path, streamURL string, size int64, magnet, imdbID string) error {
@@ -180,5 +186,6 @@ func WriteStub(path, streamURL string, size int64, magnet, imdbID string) error 
 		return err
 	}
 	chownPath(path)
+	StubChanged(path)
 	return nil
 }

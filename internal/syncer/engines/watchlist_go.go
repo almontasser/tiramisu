@@ -212,7 +212,7 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 
 	e.logger.Printf("[WatchlistSync] Done: %d added, %d skipped", added, skipped)
 	if added > 0 {
-		mediaserver.Refresh(context.Background(), e.mediasrv, "movies", e.sectionID)
+		e.mediasrv.RefreshLibrary(context.Background(), e.sectionID)
 	}
 
 	return nil
@@ -538,6 +538,7 @@ func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, f
 	// it has to apply the ownership itself; without this its stubs would be the
 	// one remaining thing left owned by root.
 	library.ApplyOwner(path)
+	library.StubChanged(path)
 
 	return path, nil
 }

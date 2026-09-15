@@ -75,8 +75,8 @@ type Manager struct {
 	hashLocks *keyLocks // one lock per info hash
 	showLocks *keyLocks // one per show: exclusive for packs, shared for single episodes
 
-	refreshPending map[string]bool
-	refreshDirty   map[string]bool
+	refreshPending map[int]bool
+	refreshDirty   map[int]bool
 }
 
 func New(cfg Config) *Manager {
@@ -295,7 +295,7 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 		return nil, err
 	}
 
-	m.scheduleRefresh(kind)
+	m.scheduleRefresh(m.section(kind))
 	m.cfg.Logger.Printf("[LibraryAPI] Added %s %q (%s): %d file(s)", kind, req.Title, hash[:8], len(files))
 	return &AddResponse{Hash: hash, Title: req.Title, Type: kind, Files: files}, nil
 }
@@ -854,7 +854,7 @@ func (m *Manager) Remove(ctx context.Context, req RemoveRequest) (*RemoveRespons
 	}
 
 	for _, path := range resp.Removed {
-		m.scheduleRefresh(m.kindOf(path))
+		m.scheduleRefresh(m.section(m.kindOf(path)))
 	}
 	m.cfg.Logger.Printf("[LibraryAPI] Removed %d stub(s)", len(resp.Removed))
 	if len(failed) > 0 {
