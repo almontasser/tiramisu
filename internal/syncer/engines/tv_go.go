@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -570,11 +571,12 @@ func (e *TVGoEngine) populateRegistryFromExisting() {
 			return nil
 		}
 
-		showName := m[1]
 		season, _ := strconv.Atoi(m[2])
 		episode, _ := strconv.Atoi(m[3])
 		hash8 := strings.ToLower(m[4])
-		key := e.episodeKey(showName, season, episode)
+		// The file name drops the year the key needs; the show folder above
+		// Season.NN keeps it.
+		key := e.episodeKey(filepath.Base(filepath.Dir(filepath.Dir(path))), "", season, episode)
 
 		if _, exists := e.registry[key]; exists {
 			return nil
@@ -647,8 +649,8 @@ func (e *TVGoEngine) isDeadEpisode(key string) bool {
 	return e.deadEpisodeKeys[key]
 }
 
-func (e *TVGoEngine) episodeKey(show string, season, episode int) string {
-	return library.EpisodeKey(show, season, episode)
+func (e *TVGoEngine) episodeKey(show, firstAirDate string, season, episode int) string {
+	return library.EpisodeKey(show, firstAirDate, season, episode)
 }
 
 func (e *TVGoEngine) registerEpisode(key string, score int, hash, path, source, showIMDB string) {
@@ -830,7 +832,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow, seasons 
 	}
 
 	// Check complete seasons
-	completeSeasons := e.getCompleteSeasons(showName, details)
+	completeSeasons := e.getCompleteSeasons(showName, show.FirstAirDate, details)
 	skippedSeasons := make(map[int]bool)
 
 	// Determine target seasons range
@@ -1442,7 +1444,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 
 	created := 0
 	skipped := 0
-	cleanShow := e.getShowFolderName(showName, firstAirDate)
+	showDir := library.ShowDir(targetDir, showName, firstAirDate)
 
 	for _, vf := range videoFiles {
 		filename := filepath.Base(vf.Path)
@@ -1452,7 +1454,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 		}
 
 		season, episode := epInfo[0], epInfo[1]
-		key := e.episodeKey(showName, season, episode)
+		key := e.episodeKey(showName, firstAirDate, season, episode)
 
 		if e.processedThisRun[key] {
 			continue
@@ -1467,7 +1469,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 			}
 		}
 
-		seasonDir := filepath.Join(targetDir, cleanShow, fmt.Sprintf("Season.%02d", season))
+		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season.%02d", season))
 		epFilename := e.buildFilename(showName, season, episode, hash[:8])
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
@@ -1503,7 +1505,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	episode, _ := strconv.Atoi(m[2])
 	season := stream.Season
 
-	key := e.episodeKey(showName, season, episode)
+	key := e.episodeKey(showName, firstAirDate, season, episode)
 
 	if e.processedThisRun[key] {
 		return 0
@@ -1550,8 +1552,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 		return 0
 	}
 
-	cleanShow := e.getShowFolderName(showName, firstAirDate)
-	seasonDir := filepath.Join(targetDir, cleanShow, fmt.Sprintf("Season.%02d", season))
+	seasonDir := filepath.Join(library.ShowDir(targetDir, showName, firstAirDate), fmt.Sprintf("Season.%02d", season))
 	epFilename := e.buildFilename(showName, season, episode, hash[:8])
 	epPath := filepath.Join(seasonDir, epFilename)
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
@@ -1570,8 +1571,8 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	return 0
 }
 
-func (e *TVGoEngine) getCompleteSeasons(showName string, details *tmdb.TVDetail) map[int]float64 {
-	normalized := reTVNonWord.ReplaceAllString(strings.ToLower(showName), "")
+func (e *TVGoEngine) getCompleteSeasons(showName, firstAirDate string, details *tmdb.TVDetail) map[int]float64 {
+	normalized := library.ShowKey(showName, firstAirDate)
 
 	seasonEps := make(map[int]int)
 	for _, sd := range details.Seasons {
@@ -1587,13 +1588,28 @@ func (e *TVGoEngine) getCompleteSeasons(showName string, details *tmdb.TVDetail)
 		// a bare prefix counts every show whose name starts the same way, and "ted"
 		// would be filled in by "tedlasso" (nine such pairs in production).
 		prefix := fmt.Sprintf("%s_s%02de", normalized, sn)
+		absolute := false
 		for key, entry := range e.registry {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			if ep, _ := strconv.Atoi(key[len(prefix):]); ep > expected {
+				absolute = true
+			}
 			// A dead episode does not count towards its season: leaving it in would keep
 			// the season "complete", and the cascade below would skip the very search
 			// meant to replace it.
-			if strings.HasPrefix(key, prefix) && !e.isDeadEpisode(key) {
+			if !e.isDeadEpisode(key) {
 				scores = append(scores, entry.QualityScore)
 			}
+		}
+		// An episode numbered past TMDB's count means the season is numbered absolutely,
+		// as ONE PIECE's S23E1156 is. Releases number it from 1, so the sync would file
+		// an episode it already has under a second number (S23E19 beside S23E1174). The
+		// season is left to the Library API, which files by TMDB's numbers.
+		if absolute {
+			complete[sn] = math.Inf(1)
+			continue
 		}
 		if len(scores) >= expected {
 			sum := 0
@@ -1819,10 +1835,6 @@ func (e *TVGoEngine) extractEpisodeFromFilename(filename string) [2]int {
 
 func (e *TVGoEngine) sanitizeName(name string) string {
 	return library.SanitizeShowName(name)
-}
-
-func (e *TVGoEngine) getShowFolderName(showName, firstAirDate string) string {
-	return library.ShowFolderName(showName, firstAirDate)
 }
 
 func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 string) string {

@@ -280,10 +280,10 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	// shares the show and locks its own key, so filing a season episode by episode
 	// still runs in parallel.
 	if isSeriesKind(kind) {
-		show := "show:" + EpisodeKey(req.Title, 0, 0)
+		show := "show:" + ShowKey(req.Title, req.FirstAirDate)
 		if req.Episode > 0 {
 			defer m.showLocks.RLock(show)()
-			defer m.hashLocks.Lock("ep:" + EpisodeKey(req.Title, req.Season, req.Episode))()
+			defer m.hashLocks.Lock("ep:" + EpisodeKey(req.Title, req.FirstAirDate, req.Season, req.Episode))()
 		} else {
 			defer m.showLocks.Lock(show)()
 		}
@@ -375,7 +375,7 @@ func (m *Manager) alreadyPresent(kind, hash string, req AddRequest) ([]AddedFile
 	if req.Episode <= 0 {
 		return nil, nil
 	}
-	path := filepath.Join(m.dirFor(kind), ShowFolderName(req.Title, req.FirstAirDate),
+	path := filepath.Join(ShowDir(m.dirFor(kind), req.Title, req.FirstAirDate),
 		fmt.Sprintf("Season.%02d", req.Season),
 		EpisodeFilename(req.Title, req.Season, req.Episode, hash[:8]))
 	if _, err := os.Stat(path); err != nil {
@@ -617,7 +617,7 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 		return wanted[i].episode < wanted[j].episode
 	})
 
-	showDir := filepath.Join(m.dirFor(kind), ShowFolderName(req.Title, req.FirstAirDate))
+	showDir := ShowDir(m.dirFor(kind), req.Title, req.FirstAirDate)
 	var out []AddedFile
 	// What this call found already in place. The stubs it overwrote must survive a
 	// rollback, and the episodes a previous release left elsewhere are only deleted
@@ -638,7 +638,7 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 					m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot undo %s: %v", f.Path, err)
 				}
 			}
-			key := EpisodeKey(req.Title, f.Season, f.Episode)
+			key := EpisodeKey(req.Title, req.FirstAirDate, f.Season, f.Episode)
 			var err error
 			if prior[i].hadEntry {
 				err = m.cfg.Registry.UpsertEpisode(key, prior[i].entry)
@@ -654,7 +654,7 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 	for _, w := range wanted {
 		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season.%02d", w.season))
 		path := filepath.Join(seasonDir, EpisodeFilename(req.Title, w.season, w.episode, hash[:8]))
-		key := EpisodeKey(req.Title, w.season, w.episode)
+		key := EpisodeKey(req.Title, req.FirstAirDate, w.season, w.episode)
 
 		// Read the previous state before touching anything: a registry we cannot read
 		// is a registry we cannot restore, so the add stops here rather than

@@ -3,7 +3,13 @@ package metadb
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
 )
+
+var reKeyNonWord = regexp.MustCompile(`[^a-z0-9]`)
 
 // EpisodeEntry represents a TV episode registry entry.
 type EpisodeEntry struct {
@@ -117,4 +123,81 @@ func (d *DB) EpisodesByHash(hash string) ([]EpisodeEntry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// folderEpisodeKey rebuilds a registry key the way library.EpisodeKey builds it now,
+// from the show folder, which carries the year: ".../ONE_PIECE (1999)/Season.01/x.mkv"
+// turns "onepiece_s01e01" into "onepiece1999_s01e01". A path that is not
+// <show>/Season.NN/<file> keeps its key.
+func folderEpisodeKey(key, path string) string {
+	i := strings.LastIndex(key, "_s")
+	season := filepath.Dir(path)
+	if i < 0 || !strings.HasPrefix(filepath.Base(season), "Season.") {
+		return key
+	}
+	return reKeyNonWord.ReplaceAllString(strings.ToLower(filepath.Base(filepath.Dir(season))), "") + key[i:]
+}
+
+// rekeyEpisodes moves tv_episodes and episode_gaps to folder keys, once, as schema
+// version 9. Keys used to drop the year, so ONE PIECE (2023) and ONE PIECE (1999)
+// shared "onepiece_s01e01", and filing an episode of either deleted the other's.
+func (d *DB) rekeyEpisodes() error {
+	var done int
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE version = 9`).Scan(&done); err != nil || done > 0 {
+		return err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	moved := 0
+	for _, table := range []string{"tv_episodes", "episode_gaps"} {
+		rows, err := tx.Query(`SELECT episode_key, file_path FROM ` + table)
+		if err != nil {
+			return err
+		}
+		renames, taken := map[string]string{}, map[string]string{}
+		for rows.Next() {
+			var key, path string
+			if err := rows.Scan(&key, &path); err != nil {
+				rows.Close()
+				return err
+			}
+			next := folderEpisodeKey(key, path)
+			if other, dup := taken[next]; dup {
+				rows.Close()
+				return fmt.Errorf("rekey %s: %s and %s would both become %s", table, other, key, next)
+			}
+			taken[next] = key
+			if next != key {
+				renames[key] = next
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Two passes, so a new key never collides with an old one that has not moved yet.
+		for old, next := range renames {
+			if _, err := tx.Exec(`UPDATE `+table+` SET episode_key = ? WHERE episode_key = ?`, "\x01"+next, old); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`UPDATE ` + table + ` SET episode_key = substr(episode_key, 2) WHERE substr(episode_key, 1, 1) = char(1)`); err != nil {
+			return err
+		}
+		moved += len(renames)
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (9, 'key tv episodes by show folder')`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if d.logger != nil {
+		d.logger.Printf("[StateDB] Rekeyed %d TV episode entries by show folder", moved)
+	}
+	return nil
 }

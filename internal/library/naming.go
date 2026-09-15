@@ -133,10 +133,37 @@ func EpisodeFilename(show string, season, episode int, hash8 string) string {
 	return fmt.Sprintf("%s_S%02dE%02d_%s.mkv", SanitizeShowName(show), season, episode, hash8)
 }
 
+// ShowDir is the show's folder under root. A folder that differs only in case is
+// reused: TMDB names the show "One Piece" where the migration filed "ONE PIECE", and on
+// a case-sensitive disk a second folder is a second series in Jellyfin.
+func ShowDir(root, showName, firstAirDate string) string {
+	name := ShowFolderName(showName, firstAirDate)
+	found := name
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if e.Name() == name {
+			return filepath.Join(root, name)
+		}
+		if e.IsDir() && strings.EqualFold(e.Name(), name) {
+			found = e.Name()
+		}
+	}
+	return filepath.Join(root, found)
+}
+
+// ShowKey is the show half of an episode's registry key: the show folder's name,
+// lowercased, with everything but letters and digits removed. The folder carries the
+// year, so a remake is not the original: keyed on the title alone, ONE PIECE (2023) and
+// ONE PIECE (1999) shared "onepiece_s01e01", and filing either deleted the other's.
+func ShowKey(show, firstAirDate string) string {
+	return reNonWord.ReplaceAllString(strings.ToLower(ShowFolderName(show, firstAirDate)), "")
+}
+
 // EpisodeKey is the TV registry key. The sync deletes every stub under the TV dir whose
-// path is not registered, so an API-created episode must use this exact form.
-func EpisodeKey(show string, season, episode int) string {
-	return fmt.Sprintf("%s_s%02de%02d", reNonWord.ReplaceAllString(strings.ToLower(show), ""), season, episode)
+// path is not registered, so an API-created episode must use this exact form. metadb
+// rebuilds the same form from a stub's folder when it migrates older keys.
+func EpisodeKey(show, firstAirDate string, season, episode int) string {
+	return fmt.Sprintf("%s_s%02de%02d", ShowKey(show, firstAirDate), season, episode)
 }
 
 // ParseSeasonEpisode reads S01E05 or 1x05 out of a filename, returning 0,0 when the

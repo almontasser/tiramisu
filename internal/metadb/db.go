@@ -231,5 +231,6 @@ CREATE TABLE IF NOT EXISTS metadata_failures (
 		return err
 	}
 	_, _ = d.db.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (8, 'add episode_gaps.last_attempt')`)
-	return nil
+
+	return d.rekeyEpisodes()
 }
