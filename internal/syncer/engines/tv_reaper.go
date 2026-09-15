@@ -193,6 +193,7 @@ func (e *TVGoEngine) dropReplacedPack(ctx context.Context, pack deadPack, search
 
 	removed := 0
 	kept := 0
+	apiKept := 0
 	for _, ep := range pack.Episodes {
 		if !verified[seasonFromEpisodeKey(ep.EpisodeKey)] {
 			kept++
@@ -202,6 +203,14 @@ func (e *TVGoEngine) dropReplacedPack(ctx context.Context, pack deadPack, search
 		// registry now points at another release and there is nothing to remove.
 		current, ok := e.registry[ep.EpisodeKey]
 		if !ok || !strings.EqualFold(current.Hash, pack.Hash) {
+			continue
+		}
+		// Filed through the Library API, by file name rather than TMDB's numbering: the
+		// sync never replaces these (protectedScore), and removing one would hand the
+		// hole to a gap re-search that numbers episodes the TMDB way, which for ONE PIECE
+		// files another episode. The API's own tools refill them.
+		if current.Source == "api" {
+			apiKept++
 			continue
 		}
 		// The torrent is shared by every episode of the pack, so it is dropped once,
@@ -229,7 +238,7 @@ func (e *TVGoEngine) dropReplacedPack(ctx context.Context, pack deadPack, search
 	if removed > 0 {
 		// One call for the whole pack: every episode points at the same torrent. A stub
 		// kept above still needs it, so the torrent only goes when none is left.
-		if kept == 0 {
+		if kept == 0 && apiKept == 0 {
 			if err := e.gostorm.RemoveTorrent(ctx, pack.Hash); err != nil {
 				e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s: %v", pack.Hash[:8], err)
 			}
@@ -240,6 +249,10 @@ func (e *TVGoEngine) dropReplacedPack(ctx context.Context, pack deadPack, search
 	if kept > 0 {
 		e.logger.Printf("[TVSync] Dead release %s: kept %d stub(s) whose season could not be read from the key, torrent left in place",
 			pack.Hash[:8], kept)
+	}
+	if apiKept > 0 {
+		e.logger.Printf("[TVSync] Dead release %s: kept %d stub(s) filed through the Library API, torrent left in place",
+			pack.Hash[:8], apiKept)
 	}
 	// The counter outlives the release otherwise: the row stays and is re-read every
 	// run, and a hash picked again later would arrive already condemned.
