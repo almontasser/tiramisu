@@ -66,6 +66,17 @@ func (s *pendingStore) take(id string) (pending, bool) {
 	return p, ok
 }
 
+// all returns a copy of the held entries, for a caller that walks them.
+func (s *pendingStore) all() map[string]pending {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]pending, len(s.byID))
+	for id, p := range s.byID {
+		out[id] = p
+	}
+	return out
+}
+
 func (s *pendingStore) drop(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

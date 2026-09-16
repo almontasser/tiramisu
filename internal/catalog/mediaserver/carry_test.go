@@ -190,3 +190,44 @@ func TestIdentityIgnoresTheRelease(t *testing.T) {
 		t.Error("classFor picked the wrong Jellyfin type")
 	}
 }
+
+func TestCarryRetriesHeldStateWhenTiramisuStarts(t *testing.T) {
+	root := t.TempDir()
+	season := filepath.Join(root, "tv", "Show (2020)", "Season.01")
+	if err := os.MkdirAll(season, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(season, "Show_S01E01_aaaaaaaa.mkv")
+	newPath := filepath.Join(season, "Show_S01E01_bbbbbbbb.mkv")
+	oldID := itemID(episodeClass, serverPathOf("Show_S01E01_aaaaaaaa.mkv"))
+	newID := itemID(episodeClass, serverPathOf("Show_S01E01_bbbbbbbb.mkv"))
+
+	var appeared atomic.Bool
+	appeared.Store(true)
+	srv, written := fakeJellyfin(t, oldID, &appeared, newID)
+	store := filepath.Join(t.TempDir(), "carry-pending.json")
+
+	before := NewReporter("jellyfin", srv.URL, "tok", root, log.New(io.Discard, "", 0))
+	before.UsePendingStore(store)
+	before.Track(oldPath)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if data, err := os.ReadFile(store); err == nil && strings.Contains(string(data), "S01E01") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the watch state was never written to the pending list")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The replacement is filed while Tiramisu is down, so no write ever reaches Track.
+	if err := os.WriteFile(newPath, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after := NewReporter("jellyfin", srv.URL, "tok", root, log.New(io.Discard, "", 0))
+	after.UsePendingStore(store)
+
+	if d := waitForCarry(t, written, newID); !d.Played || d.PlayCount != 2 {
+		t.Fatalf("carried %+v, want the watched state", d)
+	}
+}

@@ -111,11 +111,21 @@ func classFor(id string) string {
 
 // UsePendingStore keeps the watch state of removed stubs in a file, so a restart between
 // a removal and the release that replaces it does not lose them.
+//
+// Held state is re-examined here rather than only when the next stub is written: the
+// replacement may have been filed while Tiramisu was down, and a wait that ran past
+// carryLimit - Jellyfin's refresh queue can sit on a folder for hours - leaves an entry
+// nothing else would ever look at again.
 func (r *Reporter) UsePendingStore(path string) {
 	if r == nil {
 		return
 	}
 	r.store = newPendingStore(path)
+	for id, held := range r.store.all() {
+		if replacement := r.sibling(held.Path, id); replacement != "" {
+			go r.apply(id, held.Users, replacement)
+		}
+	}
 }
 
 // Track follows one stub through a change of release.
