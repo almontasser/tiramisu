@@ -1477,8 +1477,6 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
 			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 				e.removeStub(ctx, existing.FilePath, existing.Hash)
-				// Same episode, better release: carry its watch state onto the new path.
-				library.StubReplaced(existing.FilePath, epPath)
 				e.stats.Upgrades++
 			}
 			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack", showIMDB)
@@ -1562,8 +1560,6 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
 		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 			e.removeStub(ctx, existing.FilePath, existing.Hash)
-			// Same episode, better release: carry its watch state onto the new path.
-			library.StubReplaced(existing.FilePath, epPath)
 			e.stats.Upgrades++
 		}
 		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single", showIMDB)

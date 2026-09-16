@@ -4059,7 +4059,12 @@ func main() {
 	// reported once the head of its file is on SSD, so Jellyfin's probe of it never
 	// waits on the swarm (see warmup.HeadGate).
 	if reporter := mediaserver.NewReporter(gc().MediaServerType, gc().Plex.URL, gc().Plex.Token, source, logger); reporter != nil {
-		library.StubChanged = warmup.NewHeadGate(reporter.Changed,
+		// A release change is a new path, and Jellyfin keys watch state by path, so the
+		// reporter follows every stub through one (see mediaserver.Track). The state of
+		// a removed stub is held here until the release replacing it arrives, which for
+		// the reaper's dead releases can be runs later, or after a restart.
+		reporter.UsePendingStore(filepath.Join(GetStateDir(), "carry-pending.json"))
+		gate := warmup.NewHeadGate(reporter.Changed,
 			func(path string) (string, int, bool) {
 				m, err := vfs.ReadMetadataFromFile(path)
 				if err != nil {
@@ -4073,11 +4078,11 @@ func main() {
 					return
 				}
 				_ = nativeBridge.Wake("magnet:?xt=urn:btih:"+hash, fileID)
-			}).Changed
-		// A replacement release is a new path, and Jellyfin keys watch state by path:
-		// without this, an upgrade or a re-file leaves played, the resume position and
-		// the favourite flag on the item that just disappeared.
-		library.StubReplaced = reporter.Carry
+			})
+		library.StubChanged = func(path string) {
+			reporter.Track(path)
+			gate.Changed(path)
+		}
 	}
 
 	// Same bound the FUSE read uses, applied where the wait actually happens: a

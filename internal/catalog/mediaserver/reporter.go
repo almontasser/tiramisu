@@ -36,6 +36,12 @@ type Reporter struct {
 
 	mu      sync.Mutex
 	pending map[string]bool
+
+	// Watch state of stubs a release change removed, and the queue that examines
+	// them; see Track. A nil store means nothing is held between restarts.
+	store     *pendingStore
+	track     chan string
+	trackOnce sync.Once
 }
 
 // NewReporter returns a Reporter for a Jellyfin server, or nil for any other
@@ -50,6 +56,7 @@ func NewReporter(serverType, url, token, root string, logger *log.Logger) *Repor
 		root:   filepath.Clean(root),
 		delay:  5 * time.Second,
 		logger: logger,
+		store:  newPendingStore(""),
 	}
 }
 

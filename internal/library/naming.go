@@ -291,12 +291,6 @@ func words(s string) []string {
 // main sets it before anything writes a stub.
 var StubChanged = func(path string) {}
 
-// StubReplaced is called when one stub takes another's place: the same episode or
-// movie, a different release, so a different file name. The media server keys watch
-// state by item and an item is its path, so the state has to be carried across or it
-// is lost. main sets it; the default does nothing.
-var StubReplaced = func(oldPath, newPath string) {}
-
 // WriteStub writes the virtual .mkv: a small JSON file the FUSE layer exposes at the
 // declared size.
 func WriteStub(path, streamURL string, size int64, magnet, imdbID string) error {
