@@ -101,16 +101,8 @@ func (c *JellyfinClient) reportChanged(ctx context.Context, root string, paths [
 	}
 	var updates []update
 	for _, p := range paths {
-		rel, err := filepath.Rel(root, p)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
-		top, rest, _ := strings.Cut(filepath.ToSlash(rel), "/")
-		for _, loc := range locations {
-			loc = strings.TrimRight(loc, "/")
-			if path.Base(loc) == top {
-				updates = append(updates, update{path.Join(loc, rest)})
-			}
+		for _, moved := range serverPaths(locations, root, p) {
+			updates = append(updates, update{moved})
 		}
 	}
 	if len(updates) == 0 {
@@ -126,6 +118,26 @@ func (c *JellyfinClient) reportChanged(ctx context.Context, root string, paths [
 	}
 	resp.Body.Close()
 	return nil
+}
+
+// serverPaths moves a path in Tiramisu's tree onto the folders the media server's
+// libraries point at: a path under root/tv goes under every location whose last element
+// is tv. Empty when the path sits outside root, or under a directory no location is
+// named for.
+func serverPaths(locations []string, root, p string) []string {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil
+	}
+	top, rest, _ := strings.Cut(filepath.ToSlash(rel), "/")
+	var out []string
+	for _, loc := range locations {
+		loc = strings.TrimRight(loc, "/")
+		if path.Base(loc) == top {
+			out = append(out, path.Join(loc, rest))
+		}
+	}
+	return out
 }
 
 // locations lists the folders of every Jellyfin library.

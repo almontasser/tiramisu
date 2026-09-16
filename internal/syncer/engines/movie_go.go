@@ -718,6 +718,10 @@ func (e *MovieGoEngine) evaluateTitle(ctx context.Context, imdbID, title, releas
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
 		if e.createMKV(mkvPath, streamURL, bestFile.Length, magnet, imdbID) {
+			if existingPath != "" {
+				// Same film, better release: carry its watch state onto the new path.
+				library.StubReplaced(existingPath, mkvPath)
+			}
 			res := "4K"
 			if !c.Is4K {
 				res = "1080p"

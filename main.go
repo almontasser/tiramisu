@@ -4074,6 +4074,10 @@ func main() {
 				}
 				_ = nativeBridge.Wake("magnet:?xt=urn:btih:"+hash, fileID)
 			}).Changed
+		// A replacement release is a new path, and Jellyfin keys watch state by path:
+		// without this, an upgrade or a re-file leaves played, the resume position and
+		// the favourite flag on the item that just disappeared.
+		library.StubReplaced = reporter.Carry
 	}
 
 	// Same bound the FUSE read uses, applied where the wait actually happens: a

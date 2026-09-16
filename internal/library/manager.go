@@ -718,6 +718,9 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot remove the replaced stub %s: %v", p.entry.FilePath, err)
 			continue
 		}
+		// The episode is the same one; only its release changed. The media server keys
+		// watch state by path, so it has to be moved across (see mediaserver.Carry).
+		StubReplaced(p.entry.FilePath, p.path)
 		if p.entry.Hash != "" && p.entry.Hash != hash {
 			dropped[p.entry.Hash] = true
 		}
