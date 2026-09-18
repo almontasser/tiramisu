@@ -317,12 +317,17 @@ one webhook with the events `PlaybackStart`, `PlaybackStop` and
 
 Template:
 ```
-{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
+{"event":"{{NotificationType}}","itemId":"{{ItemId}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
 ```
 
 Jellyfin's own event names and item types are mapped onto Tiramisu's internally
 (`PlaybackStart`→`media.play`, `PlaybackStop`→`media.stop`, `Movie`→`movie`,
 `Episode`→`show`), so neither side needs a code change or a plugin hack.
+
+When `media_server_type` is `jellyfin` and a token is set, Tiramisu asks Jellyfin
+for the file behind `itemId` and confirms only the stub with that name. The title
+fields are then unused: a series title matches any of its episodes, and the
+episodes of one pack share a hash suffix.
 
 ### 4. Adaptive Shield
 
@@ -560,7 +565,7 @@ http://192.168.1.2:9080/plex/webhook
 - Header: Key `Content-Type` / Value `application/json`
 - Template:
 ```
-{"event":"{{NotificationType}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
+{"event":"{{NotificationType}}","itemId":"{{ItemId}}","Metadata":{"title":"{{{Name}}}","grandparentTitle":"{{{SeriesName}}}","librarySectionType":"{{ItemType}}","guid":"imdb://{{Provider_imdb}}","Guid":[{"id":"imdb://{{Provider_imdb}}"}]}}
 ```
 
 Test connectivity:
