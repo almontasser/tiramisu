@@ -28,14 +28,16 @@ type FileMetadata struct {
 }
 
 // Validation constants
+// A stub under the minimum is hidden from the mount. 100 MB hid 253 episodes of
+// eleven-minute cartoons; 1 MB still turns away an empty or broken stub.
 const (
-	MinFileSize = 100 * 1024 * 1024        // 100 MB minimum
+	MinFileSize = 1024 * 1024              // 1 MB minimum
 	MaxFileSize = 100 * 1024 * 1024 * 1024 // 100 GB maximum
 )
 
 // Error definitions
 var (
-	ErrInvalidSize   = errors.New("file size outside valid range (100MB-100GB)")
+	ErrInvalidSize   = errors.New("file size outside valid range (1MB-100GB)")
 	ErrInvalidFormat = errors.New("invalid .mkv file format")
 	ErrMissingURL    = errors.New("missing stream URL on line 1")
 	ErrMissingSize   = errors.New("missing file size on line 2")
