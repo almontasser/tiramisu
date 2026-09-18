@@ -2052,6 +2052,9 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		fuseReadTimeouts.Add(1)
 		logger.Printf("[ReadTimeout] No data in %ds at offset %d for %s - EIO (swarm cannot serve it)",
 			gc().FuseReadTimeoutSeconds, off, filepath.Base(h.path))
+		// The deadline usually lands in readInner's retry backoff, which answers EINTR, so the
+		// EAGAIN exit that marks the session never runs.
+		ttffReadFailed(h.path)
 		return nil, syscall.EIO
 	}
 	if errno != 0 || res == nil {

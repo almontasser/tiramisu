@@ -2,6 +2,7 @@ package warmup
 
 import (
 	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,5 +69,69 @@ func TestHeadGateReportsAStubOnceItsHeadIsCached(t *testing.T) {
 	swarmDown.Store(false)
 	if p := next(); p != "/lib/stalled.mkv" {
 		t.Fatalf("third report %q, want the stalled stub once its swarm answers", p)
+	}
+}
+
+func TestHeadGateRefillsAHeadTheReaperDroppedMidStall(t *testing.T) {
+	d := &DiskWarmupCache{dir: t.TempDir(), writeCh: make(chan warmupWrite, 32)}
+	go d.writeWorker()
+	oldCache, oldFetch := DiskWarmup, Fetch
+	oldStall, oldPause := headStall, headPause
+	DiskWarmup = d
+	headStall, headPause = 5*time.Second, time.Millisecond
+	defer func() {
+		DiskWarmup, Fetch = oldCache, oldFetch
+		headStall, headPause = oldStall, oldPause
+	}()
+
+	// The swarm hands over half a chunk, below the ready floor, then stalls.
+	var calls, failed atomic.Int64
+	var down atomic.Bool
+	down.Store(true)
+	Fetch = func(hash string, fileID int, off int64, buf []byte) (int, error) {
+		if calls.Add(1) > 1 && down.Load() {
+			failed.Add(1)
+			return 0, errors.New("no peers")
+		}
+		n := len(buf)
+		if off == 0 && calls.Load() == 1 {
+			n = headReadyFloor / 2
+		}
+		for i := range buf[:n] {
+			buf[i] = byte((off + int64(i)) % 251)
+		}
+		return n, nil
+	}
+	reported := make(chan string, 1)
+	g := NewHeadGate(func(p string) { reported <- p },
+		func(string) (string, int, bool) { return "slow", 1, true },
+		func(string, int) {})
+	g.Changed("/lib/slow.mkv")
+
+	waitFor := func(what string, cond func() bool) {
+		for deadline := time.Now().Add(2 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+	waitFor("the short chunk to land", func() bool { return d.GetAvailableRange("slow", 1) == headReadyFloor/2 })
+	d.reapIdle(0)
+	if _, err := os.Stat(d.filePath("slow", 1)); !os.IsNotExist(err) {
+		t.Fatalf("the reaper kept a head below the ready floor: %v", err)
+	}
+	// Let the fill go round its error path at least once after the drop.
+	since := failed.Load()
+	waitFor("the fill to retry", func() bool { return failed.Load() >= since+2 })
+	down.Store(false)
+
+	select {
+	case <-reported:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stub was never reported: the fill kept writing past the dropped head")
+	}
+	head := make([]byte, 4096)
+	if n, _ := d.ReadAt("slow", 1, head, 0); n != len(head) || head[len(head)-1] != byte((len(head)-1)%251) {
+		t.Fatalf("head cache returned %d bytes at 0 that don't match the file", n)
 	}
 }

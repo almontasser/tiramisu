@@ -149,6 +149,9 @@ func (g *HeadGate) fill(hash string, fileID int) (int64, error) {
 			}
 			time.Sleep(headPause)
 			g.wake(hash, fileID) // reloads a torrent that closed; a no-op while it runs
+			// A stall long enough for the reaper drops a head still under the ready floor
+			// (dropResidue), and processWrite refuses every write past the hole it leaves.
+			off = min(off, d.GetAvailableRange(hash, fileID))
 			continue
 		}
 		d.enqueue(hash, fileID, buf[:n], off, true)
