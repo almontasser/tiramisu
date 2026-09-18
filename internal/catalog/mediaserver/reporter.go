@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"path"
 	"path/filepath"
 	"sort"
@@ -145,6 +146,26 @@ func serverPaths(locations []string, root, p string) []string {
 		}
 	}
 	return out
+}
+
+// ItemPath returns the file behind a Jellyfin item, or "" when Jellyfin holds no
+// such item. The Webhook plugin names an item by id and title only, and a title
+// can't tell apart the episodes of one show.
+func (r *Reporter) ItemPath(ctx context.Context, id string) (string, error) {
+	resp, err := r.client.send(ctx, http.MethodGet, "/Items?fields=Path&ids="+url.QueryEscape(id), nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Items []struct {
+			Path string `json:"Path"`
+		} `json:"Items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Items) == 0 {
+		return "", err
+	}
+	return out.Items[0].Path, nil
 }
 
 // locations lists the folders of every Jellyfin library.

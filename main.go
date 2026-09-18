@@ -181,6 +181,10 @@ func (ps *PlaybackState) GetStatus() bool {
 
 var playbackRegistry sync.Map // path -> *PlaybackState
 
+// jellyfinReporter is set at startup when the media server is Jellyfin; the webhook
+// uses it to find the file behind an item.
+var jellyfinReporter *mediaserver.Reporter
+
 // Global sync cache manager (FASE 4.13 - Sync Script Caches)
 var globalSyncCacheManager *syncercache.SyncCacheManager
 
@@ -3520,8 +3524,6 @@ func extractHashSuffix(filename string) string {
 
 // handlePlexWebhook gestisce i messaggi in arrivo dal server Plex
 func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
-	logger.Printf("[PLEX] Webhook connection from %s", r.RemoteAddr)
-
 	var payloadStr string
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
@@ -3541,15 +3543,9 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Logga il payload per debug (limitato ai primi 500 caratteri per non intasare)
-	displayPayload := payloadStr
-	if len(displayPayload) > 500 {
-		displayPayload = displayPayload[:500] + "..."
-	}
-	logger.Printf("[DEBUG] Webhook received: %s", displayPayload)
-
 	var payload struct {
 		Event    string `json:"event"`
+		ItemID   string `json:"itemId"` // Jellyfin only
 		Metadata struct {
 			Title              string `json:"title"`
 			GrandparentTitle   string `json:"grandparentTitle"` // for TV series
@@ -3591,16 +3587,36 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Jellyfin sends no file, and the matching below can't pick the right one: every
+	// episode of a pack shares the hash suffix, and the title matches any episode of
+	// the show. So ask Jellyfin for the item's file and match that alone; when no
+	// open stub is that file, nothing matches.
+	var fileMatch string
+	var fileState *PlaybackState
+	resolved := false
+	if payload.ItemID != "" && jellyfinReporter != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		p, err := jellyfinReporter.ItemPath(ctx, payload.ItemID)
+		cancel()
+		if err != nil {
+			logger.Printf("[PLEX] Cannot resolve Jellyfin item %s: %v", payload.ItemID, err)
+		}
+		if p != "" {
+			resolved = true
+			playbackRegistry.Range(func(key, value interface{}) bool {
+				if filepath.Base(key.(string)) == filepath.Base(p) {
+					fileMatch, fileState = key.(string), value.(*PlaybackState)
+					return false
+				}
+				return true
+			})
+		}
+	}
+
 	if payload.Event == "media.play" || payload.Event == "media.resume" {
 		targetTitle := strings.ToLower(payload.Metadata.Title)
 		seriesTitle := strings.ToLower(payload.Metadata.GrandparentTitle)
 		targetYear := payload.Metadata.Year
-
-		logger.Printf("[DEBUG] Webhook for '%s' / '%s' (%d). Current registry:", targetTitle, seriesTitle, targetYear)
-		playbackRegistry.Range(func(key, value interface{}) bool {
-			logger.Printf("  - Registered: %s", key.(string))
-			return true
-		})
 
 		// Two-pass matching: exact first (IMDB, hash, filename), fuzzy only as fallback.
 
@@ -3626,42 +3642,43 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Pass 1: Exact matches only (IMDB ID, hash suffix, filename)
-		var exactMatch string
-		var exactState *PlaybackState
-		playbackRegistry.Range(func(key, value interface{}) bool {
-			path := key.(string)
-			state := value.(*PlaybackState)
+		exactMatch, exactState := fileMatch, fileState
+		if !resolved {
+			playbackRegistry.Range(func(key, value interface{}) bool {
+				path := key.(string)
+				state := value.(*PlaybackState)
 
-			// Tentativo 0a: Match per IMDB ID (V281 — immune a titoli localizzati)
-			if imdb := state.GetImdbID(); webhookImdbID != "" && imdb != "" && imdb == webhookImdbID {
-				exactMatch = path
-				exactState = state
-				return false
-			}
+				// Tentativo 0a: Match per IMDB ID (V281 — immune a titoli localizzati)
+				if imdb := state.GetImdbID(); webhookImdbID != "" && imdb != "" && imdb == webhookImdbID {
+					exactMatch = path
+					exactState = state
+					return false
+				}
 
-			if targetSuffix != "" && extractHashSuffix(path) == targetSuffix {
-				exactMatch = path
-				exactState = state
-				return false
-			}
+				if targetSuffix != "" && extractHashSuffix(path) == targetSuffix {
+					exactMatch = path
+					exactState = state
+					return false
+				}
 
-			// Tentativo 1: Match per Filename (se presente nel payload)
-			for _, m := range payload.Metadata.Media {
-				for _, p := range m.Part {
-					if filepath.Base(p.File) == filepath.Base(path) {
-						exactMatch = path
-						exactState = state
-						return false
+				// Tentativo 1: Match per Filename (se presente nel payload)
+				for _, m := range payload.Metadata.Media {
+					for _, p := range m.Part {
+						if filepath.Base(p.File) == filepath.Base(path) {
+							exactMatch = path
+							exactState = state
+							return false
+						}
 					}
 				}
-			}
-			return true
-		})
+				return true
+			})
+		}
 
 		// Pass 1c: IMDB bootstrap — if webhookImdbID is available but no state has it yet,
 		// find the unique registered path of the matching library type with empty ImdbID.
 		// One-time bootstrap: saves webhookImdbID into state so future sessions match via 0a.
-		if exactMatch == "" && webhookImdbID != "" {
+		if !resolved && exactMatch == "" && webhookImdbID != "" {
 			sectionDir := ""
 			switch payload.Metadata.LibrarySectionType {
 			case "show":
@@ -3691,7 +3708,7 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Pass 2: Fuzzy matches only if no exact match found
-		if exactMatch == "" {
+		if !resolved && exactMatch == "" {
 			var bestMatch string
 			var bestState *PlaybackState
 			bestLevel := 0 // higher = better match
@@ -3745,6 +3762,8 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if exactMatch != "" && exactState != nil {
+			// Jellyfin repeats PlaybackProgress every few seconds; log only a new confirmation.
+			wasHealthy := exactState.GetStatus()
 			exactState.SetHealthy(true)
 			exactState.mu.Lock()
 			exactState.IsStopped = false
@@ -3754,14 +3773,18 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 				logger.Printf("[PLEX] IMDB ID cached for future matching: %s → %s", filepath.Base(exactMatch), webhookImdbID)
 			}
 			exactState.mu.Unlock()
-			logger.Printf("[PLEX] Playback confirmed by webhook for: %s", filepath.Base(exactMatch))
+			if !wasHealthy {
+				logger.Printf("[PLEX] Playback confirmed by webhook for: %s", filepath.Base(exactMatch))
+			}
 
 			if exactState.Hash != "" {
 				h := metainfo.NewHashFromHex(exactState.Hash)
 				if t := web.BTS.GetTorrent(h); t != nil {
 					t.IsPriority.Store(true)
 					t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
-					logger.Printf("[PLEX] High Priority + Aggressive Mode for: %s", exactState.Hash)
+					if !wasHealthy {
+						logger.Printf("[PLEX] High Priority + Aggressive Mode for: %s", exactState.Hash)
+					}
 				}
 			}
 		}
@@ -3789,38 +3812,39 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Pass 1: Exact matches (IMDB ID, hash suffix, filename)
-		var stopMatch string
-		var stopState *PlaybackState
-		playbackRegistry.Range(func(key, value interface{}) bool {
-			path := key.(string)
-			state := value.(*PlaybackState)
+		stopMatch, stopState := fileMatch, fileState
+		if !resolved {
+			playbackRegistry.Range(func(key, value interface{}) bool {
+				path := key.(string)
+				state := value.(*PlaybackState)
 
-			if imdb := state.GetImdbID(); stopImdbID != "" && imdb != "" && imdb == stopImdbID {
-				stopMatch = path
-				stopState = state
-				return false
-			}
+				if imdb := state.GetImdbID(); stopImdbID != "" && imdb != "" && imdb == stopImdbID {
+					stopMatch = path
+					stopState = state
+					return false
+				}
 
-			if stopTargetSuffix != "" && extractHashSuffix(path) == stopTargetSuffix {
-				stopMatch = path
-				stopState = state
-				return false
-			}
+				if stopTargetSuffix != "" && extractHashSuffix(path) == stopTargetSuffix {
+					stopMatch = path
+					stopState = state
+					return false
+				}
 
-			for _, m := range payload.Metadata.Media {
-				for _, p := range m.Part {
-					if filepath.Base(p.File) == filepath.Base(path) {
-						stopMatch = path
-						stopState = state
-						return false
+				for _, m := range payload.Metadata.Media {
+					for _, p := range m.Part {
+						if filepath.Base(p.File) == filepath.Base(path) {
+							stopMatch = path
+							stopState = state
+							return false
+						}
 					}
 				}
-			}
-			return true
-		})
+				return true
+			})
+		}
 
 		// Pass 2: Fuzzy matches only if no exact match
-		if stopMatch == "" {
+		if !resolved && stopMatch == "" {
 			bestLevel := 0
 			playbackRegistry.Range(func(key, value interface{}) bool {
 				path := key.(string)
@@ -4064,6 +4088,7 @@ func main() {
 		// a removed stub is held here until the release replacing it arrives, which for
 		// the reaper's dead releases can be runs later, or after a restart.
 		reporter.UsePendingStore(filepath.Join(GetStateDir(), "carry-pending.json"))
+		jellyfinReporter = reporter
 		gate := warmup.NewHeadGate(reporter.Changed,
 			func(path string) (string, int, bool) {
 				m, err := vfs.ReadMetadataFromFile(path)
