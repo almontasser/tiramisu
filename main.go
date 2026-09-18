@@ -30,7 +30,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"tiramisu/internal/ai"
 	"tiramisu/internal/cache"
 	"tiramisu/internal/catalog"
 	"tiramisu/internal/catalog/mediaserver"
@@ -58,6 +57,7 @@ import (
 	"tiramisu/internal/syncer/engines"
 	"tiramisu/internal/syncer/scheduler"
 	"tiramisu/internal/telemetry"
+	"tiramisu/internal/tuner"
 	"tiramisu/internal/updater"
 	"tiramisu/internal/vfs"
 	"tiramisu/internal/warmup"
@@ -98,12 +98,7 @@ func gc() *config.Config { return globalConfig.Load() }
 // Global Prowlarr client for indexer queries (nil when disabled).
 var prowlarrClient *prowlarr.Client
 
-// GetEffectiveConcurrencyLimit returns AI limit if set, otherwise globalConfig default
 func GetEffectiveConcurrencyLimit() int {
-	aiLimit := int(atomic.LoadInt32(&ai.CurrentLimit))
-	if aiLimit > 0 {
-		return aiLimit
-	}
 	return gc().MasterConcurrencyLimit
 }
 
@@ -900,7 +895,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	headReady := false
 	tailReady := false
 	if warmup.DiskWarmup != nil && hashStr != "" {
-		headReady = warmup.DiskWarmup.GetAvailableRange(hashStr, urlFileIdx) > 0
+		headReady = warmup.DiskWarmup.HeadReady(hashStr, urlFileIdx)
 		tailReady = warmup.DiskWarmup.TailReady(hashStr, urlFileIdx)
 	}
 	ttffRegister(n.vMeta.Path, n.vMeta.Size, hashStr, headReady, tailReady)
@@ -2095,6 +2090,7 @@ func (h *MkvHandle) Read(fuseCtx context.Context, dest []byte, off int64) (fuse.
 		fuseShortReadFailed.Add(1)
 		logger.Printf("[ShortRead] Unfillable %d/%d bytes at offset %d for %s - EIO (a partial read would cache zeros)",
 			total, len(dest), off, filepath.Base(h.path))
+		ttffReadFailed(h.path)
 		return nil, syscall.EIO
 	}
 
@@ -2707,6 +2703,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	}
 
 	// If everything fails, return EAGAIN as last resort
+	ttffReadFailed(h.path)
 	return nil, syscall.EAGAIN
 
 DATA_READY:
@@ -4169,30 +4166,7 @@ func main() {
 
 	nativeBridge = native.NewNativeClient()
 
-	if gc().AIURL != "" {
-		provider := ai.AIProvider{
-			URL:     gc().AIURL,
-			APIKey:  gc().AI_API_KEY,
-			Model:   gc().AIModel,
-			IsLocal: gc().AIProvider == "" || gc().AIProvider == "local",
-			GetBufferPct: func() int {
-				total, _, _ := raCache.Stats()
-				budget := gc().ReadAheadBudget
-				if budget <= 0 {
-					return 100
-				}
-				pct := int(total * 100 / budget)
-				if pct > 100 {
-					pct = 100
-				}
-				return pct
-			},
-			GetSaturation: func() int {
-				return len(masterDataSemaphore)
-			},
-		}
-		go ai.StartAITuner(context.Background(), provider)
-	}
+	go tuner.Start(context.Background())
 
 	if gc().BlockListEnabled && gc().BlockListURL != "" {
 		startBlockListLoop(gc().BlockListURL)
@@ -4248,23 +4222,30 @@ func main() {
 					torrent.V304LoadBans(ips)
 					logger.Printf("[V304] Restored %d persisted peer bans", len(ips))
 				}
-				// Metadata resolution outcomes: the sync engines read the counter to
-				// tell a dead swarm from a slow one before dropping a title.
+				// Reachability outcomes: the sync engines read the counter to tell a dead
+				// release from a slow one before dropping a title.
 				failDB := stateDB
-				native.MetadataOutcome = func(hash string, resolved bool) {
+				native.ReachabilityOutcome = func(hash string, resolved bool) {
 					var err error
 					if resolved {
-						// Success is the common case: read first so the usual Open costs a
+						// Success is the common case: read first so the usual read costs a
 						// lookup instead of a write transaction.
 						if n, qerr := failDB.MetadataFailureCount(hash); qerr != nil || n == 0 {
 							return
 						}
 						err = failDB.ClearMetadataFailure(hash)
 					} else {
+						short := hash
+						if len(short) > 8 {
+							short = short[:8]
+						}
+						// Deliberately does not say why: the session layer that condemned
+						// already logged its own reason, with duration and outcome.
+						logger.Printf("[DeadSwarm] %s did not answer", short)
 						err = failDB.RecordMetadataFailure(hash)
 					}
 					if err != nil {
-						logger.Printf("WARNING: metadata failure bookkeeping for %s: %v", hash, err)
+						logger.Printf("WARNING: reachability bookkeeping for %s: %v", hash, err)
 					}
 				}
 
@@ -4322,8 +4303,8 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				// Cleanup stale entries: negative cache 12h TTL, fullpack cache 7 days TTL
-				globalSyncCacheManager.CleanupStaleEntries(12*time.Hour, 7*24*time.Hour)
+				// Cleanup stale entries: negative cache 12h TTL
+				globalSyncCacheManager.CleanupStaleEntries(12 * time.Hour)
 			case <-backgroundStopChan:
 				return
 			}

@@ -41,10 +41,33 @@ func NewNativeClient() *NativeClient {
 	}
 }
 
-// MetadataOutcome reports each resolution the bridge had to wait for: true when
-// the swarm answered, false on timeout. Injected by main so this package stays
-// unaware of the state DB; nil when no DB is wired.
-var MetadataOutcome func(hash string, resolved bool)
+// ReachabilityOutcome reports whether a release answered. Injected by main so this
+// package stays unaware of the state DB; nil when no DB is wired.
+//
+// Two reporters, and both watch something a single read cannot show:
+//
+//   - Wake acquits when the metainfo had to be waited for and arrived, which is the
+//     one thing that proves peers are there right now. It never condemns: the Open
+//     that called it registered a session, and that session is what condemns, once.
+//   - The session layer acquits on bytes served straight from the swarm, and condemns
+//     a whole playback session that ends with a read that gave up and nothing served.
+//
+// What neither does is judge one read: the 8s fetch timeout bounds a FUSE read under
+// the smbd D-state watchdog, and a swarm's health was never a question it could
+// answer.
+var ReachabilityOutcome func(hash string, resolved bool)
+
+// ActivePeers counts connections that exist for a hash, 0 when the torrent is not
+// hydrated. Deliberately not TotalPeers or PendingPeers: both count t.peers, which
+// AddTorrent refills from the PeerAddrs cached in the DB, so a release nobody is
+// sharing any more would carry phantom peers for good.
+func ActivePeers(hash string) int {
+	t := torr.PeekTorrent(hash)
+	if t == nil || t.Torrent == nil {
+		return 0
+	}
+	return t.Torrent.Stats().ActivePeers
+}
 
 // Wake triggers the start of a torrent (Ghost -> Active) entirely in-memory
 // Synchronous & Deduplicated.
@@ -98,11 +121,19 @@ func (c *NativeClient) Wake(magnetUrl string, fileIdx int) error {
 
 			select {
 			case <-t.Torrent.GotInfo():
-			case <-timer.C:
-				log.Printf("[NativeBridge] Metadata timeout for %s", hash)
-				if MetadataOutcome != nil {
-					MetadataOutcome(hash, false)
+				// Reported only here, where the metainfo demonstrably came from the swarm.
+				// Below it may just as well have been injected from the DB, which says
+				// nothing about whether anybody is still sharing the release.
+				if ReachabilityOutcome != nil {
+					ReachabilityOutcome(hash, true)
 				}
+			case <-timer.C:
+				// Not reported: the FUSE Open that called this registered a session
+				// first, and that session condemns once when it closes. Reporting here
+				// too made a single playback attempt count three times, because a player
+				// that retries opens again and each 45s wait wrote its own failure. The
+				// counter counts occasions, not attempts.
+				log.Printf("[NativeBridge] Metadata timeout for %s", hash)
 				return fmt.Errorf("torrent metadata timeout (45s): %s", hash)
 			}
 		}
@@ -110,12 +141,6 @@ func (c *NativeClient) Wake(magnetUrl string, fileIdx int) error {
 		if t.Torrent != nil {
 			if info := t.Torrent.Info(); info != nil {
 				pieceLenKB = int(info.PieceLength) / 1024
-				// Reported here, not inside the wait above: a torrent that recovered
-				// arrives with its metadata already in hand and would never clear the
-				// failures it collected while the swarm was down.
-				if MetadataOutcome != nil {
-					MetadataOutcome(hash, true)
-				}
 			}
 		}
 		log.Printf("[NativeBridge] Metadata ready for %s (piece=%dKB)", hash, pieceLenKB)
@@ -445,8 +470,8 @@ func (r *NativeReader) IsIdle(d time.Duration) bool {
 }
 
 // fetchBlockTimeout bounds a stateless fetch. 3 retries x 8s = 27s max FUSE block, under the
-// 60s smbd D-state watchdog.
-const fetchBlockTimeout = 8 * time.Second
+// 60s smbd D-state watchdog. A var so a test can wait it out in milliseconds.
+var fetchBlockTimeout = 8 * time.Second
 
 // FetchReadyTimeout bounds how long a single block fetch may wait for its first
 // bytes before the read is abandoned with an error. It exists because a swarm
@@ -620,7 +645,7 @@ func (c *NativeClient) FetchBlock(hash string, fileID int, offset int64, p []byt
 	pr, pw := io.Pipe()
 	// V283: 8s timeout (was 30s). 6 retries × 30s = 180s FUSE block → smbd D-state.
 	// 3 retries × 8s = 27s max → under 60s watchdog threshold.
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchBlockTimeout)
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", "/stream", nil)
