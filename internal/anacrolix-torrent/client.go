@@ -1231,7 +1231,7 @@ func (t *Torrent) churnIfUselessForWarmup(pc *PeerConn) {
 	if entry, ok := t.churnCooldown[key]; ok {
 		if now.Before(entry.until) {
 			if entry.probed {
-				t.logger.WithDefaultLevel(log.Warning).Printf("[PEXChurn] hash=%s dropping peer %v - still in %v cooldown after its second-chance probe also failed", t.infoHash.HexString(), pc.RemoteAddr, churnCooldownDur)
+				t.logger.WithDefaultLevel(log.Debug).Printf("[PEXChurn] hash=%s dropping peer %v - still in %v cooldown after its second-chance probe also failed", t.infoHash.HexString(), pc.RemoteAddr, churnCooldownDur)
 				pc.drop()
 				t.cl.unlock()
 				return
@@ -1262,7 +1262,7 @@ func (t *Torrent) churnIfUselessForWarmup(pc *PeerConn) {
 			return // has something relevant to the warmup region, keep the connection
 		}
 	}
-	t.logger.WithDefaultLevel(log.Warning).Printf("[PEXChurn] hash=%s dropping peer %v - no warmup-region pieces (file range [%d,%d)) after %v probe", t.infoHash.HexString(), pc.RemoteAddr, begin, end, probeWindow)
+	t.logger.WithDefaultLevel(log.Debug).Printf("[PEXChurn] hash=%s dropping peer %v - no warmup-region pieces (file range [%d,%d)) after %v probe", t.infoHash.HexString(), pc.RemoteAddr, begin, end, probeWindow)
 	if t.churnCooldown == nil {
 		t.churnCooldown = make(map[string]churnCooldownEntry)
 	}

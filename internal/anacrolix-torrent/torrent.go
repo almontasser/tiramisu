@@ -1247,7 +1247,7 @@ func (t *Torrent) fireHedge(r RequestIndex, req Request, currentPeer *Peer, trig
 	candidate.validReceiveChunks[r]++
 	candidate.peerImpl._request(req)
 	t.hedgeTriggerCount.Add(1)
-	t.logger.WithDefaultLevel(log.Warning).Printf("[TailHedge] hash=%s Hedging piece=%d begin=%d to %v (original request exceeded %s)", t.infoHash.HexString(), req.Index, req.Begin, candidate.RemoteAddr, trigger)
+	t.logger.WithDefaultLevel(log.Debug).Printf("[TailHedge] hash=%s Hedging piece=%d begin=%d to %v (original request exceeded %s)", t.infoHash.HexString(), req.Index, req.Begin, candidate.RemoteAddr, trigger)
 }
 
 // maxWarmupLatencySamples caps the ring buffer per chunk size - only enough recent samples to
