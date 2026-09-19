@@ -121,8 +121,20 @@ func (tr *TorrentRemover) deriveTitleFromPath(path string) string {
 		return parts[len(parts)-2]
 	}
 
+	// Movies sit side by side in one folder, which names none of them: every
+	// removed movie blacklisted the title "movies", and the movie sync filed the
+	// film again from another release.
+	if m := reMovieStub.FindStringSubmatch(filepath.Base(path)); m != nil {
+		return m[1]
+	}
+
 	return lastDir
 }
+
+// reMovieStub reads the title out of library.BuildMovieFilename's
+// Title[_Year]_1080p[_tags]_hash8.mkv. The title is the shortest match, so a
+// year inside it, as in Blade_Runner_2049_2017, stays in it.
+var reMovieStub = regexp.MustCompile(`^(.+?)(?:_(?:19|20)\d{2})?_(?:2160p|1080p)_`)
 
 // addToBlacklist adds a hash and title to the persistent blacklist file
 func (tr *TorrentRemover) addToBlacklist(hash, title string) {
