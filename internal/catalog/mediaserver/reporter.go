@@ -334,29 +334,17 @@ func (c *JellyfinClient) locations(ctx context.Context) ([]string, error) {
 // listed reports whether Jellyfin holds any of these items. The items are counted,
 // not TotalRecordCount: with limit=0 Jellyfin 12.1 counts every id asked for, held or not.
 func (c *JellyfinClient) listed(ctx context.Context, ids ...string) (bool, error) {
-	_, n, err := c.query(ctx, "/Items?enableImages=false&enableUserData=false&ids="+url.QueryEscape(strings.Join(ids, ",")))
-	return n > 0, err
-}
-
-// episodes counts the episodes on disk under a season or show.
-func (c *JellyfinClient) episodes(ctx context.Context, id string) (int, error) {
-	total, _, err := c.query(ctx, "/Items?limit=1&enableImages=false&recursive=true&includeItemTypes=Episode&isMissing=false&parentId="+url.QueryEscape(id))
-	return total, err
-}
-
-// query returns an item query's TotalRecordCount and how many items it returned.
-func (c *JellyfinClient) query(ctx context.Context, endpoint string) (int, int, error) {
-	resp, err := c.send(ctx, http.MethodGet, endpoint, nil)
+	resp, err := c.send(ctx, http.MethodGet,
+		"/Items?enableImages=false&enableUserData=false&ids="+url.QueryEscape(strings.Join(ids, ",")), nil)
 	if err != nil {
-		return 0, 0, err
+		return false, err
 	}
 	defer resp.Body.Close()
 	var body struct {
-		TotalRecordCount int               `json:"TotalRecordCount"`
-		Items            []json.RawMessage `json:"Items"`
+		Items []json.RawMessage `json:"Items"`
 	}
 	err = json.NewDecoder(resp.Body).Decode(&body)
-	return body.TotalRecordCount, len(body.Items), err
+	return len(body.Items) > 0, err
 }
 
 // refresh queues a refresh of one item. On a library, mode None only walks its

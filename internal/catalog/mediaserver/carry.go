@@ -186,42 +186,29 @@ func (r *Reporter) trackLoop() {
 	}
 }
 
-// forget drops a removed stub or folder from Jellyfin, then the season and show it
-// leaves with no episode. Reporting the path made Jellyfin refresh the nearest item
-// still on disk, which for a movie, or a show removed whole, is the whole library.
+// forget drops a removed stub or folder from Jellyfin: its own item only. Reporting
+// the path made Jellyfin refresh the nearest item still on disk, which for a movie, or
+// a show removed whole, is the whole library.
+//
+// A season or show goes on its folder's own report. A folder is removed only once it
+// is empty, so that report queues here behind every stub in it, and each episode's
+// watch state is read before the folder's item, which takes its episodes along, is
+// dropped. Counting the episodes left instead doesn't work: Jellyfin groups shows by
+// TMDB id, so a show in two folders counts the other folder's episodes as its own.
 func (r *Reporter) forget(ctx context.Context, p string) error {
 	libs, err := r.client.libraries(ctx)
 	if err != nil {
 		return err
 	}
-	for _, it := range lineage(r.root, p) {
-		// Jellyfin deletes an item's path along with it, and the mount can't remove a
-		// folder, so a folder still on disk stops here, and so does all above it.
-		if _, err := os.Stat(it.path); err == nil {
-			return nil
-		}
-		ids, _ := jellyfinIDs(libs, r.root, it.path)
-		if len(ids) == 0 {
-			return nil
-		}
-		if listed, err := r.client.listed(ctx, ids[0]); err != nil || !listed {
-			if err != nil {
-				return err
-			}
-			continue
-		}
-		// A season or show goes with its last episode: episodes still queued here read
-		// their watch state from their items, and dropping the folder drops them too.
-		if it.class == seasonClass || it.class == seriesClass {
-			if n, err := r.client.episodes(ctx, ids[0]); err != nil || n > 0 {
-				return err
-			}
-		}
-		if err := r.client.deleteItem(ctx, ids[0]); err != nil {
-			return err
-		}
+	ids, _ := jellyfinIDs(libs, r.root, p)
+	if len(ids) == 0 {
+		return nil
 	}
-	return nil
+	listed, err := r.client.listed(ctx, ids[0])
+	if err != nil || !listed {
+		return err
+	}
+	return r.client.deleteItem(ctx, ids[0])
 }
 
 // removed reads what the users had on a stub that has just gone, and either carries it

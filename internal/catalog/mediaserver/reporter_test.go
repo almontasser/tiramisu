@@ -18,10 +18,9 @@ import (
 // fakeLibrary is a Jellyfin holding the items in listed. It records every report,
 // refresh and delete as one line, in order.
 type fakeLibrary struct {
-	mu       sync.Mutex
-	listed   map[string]bool
-	episodes map[string]int // parent id -> episodes left under it
-	calls    []string
+	mu     sync.Mutex
+	listed map[string]bool
+	calls  []string
 }
 
 func (f *fakeLibrary) has(id string) bool {
@@ -54,11 +53,6 @@ func (f *fakeLibrary) serve(t *testing.T) *httptest.Server {
 			w.Write([]byte(`[{"ItemId":"movieslib","Locations":["/media/library/movies"]},{"ItemId":"tvlib","Locations":["/media/library/tv/"]}]`))
 		case r.URL.Path == "/Users":
 			w.Write([]byte(`[{"Id":"u1"}]`))
-		case r.URL.Path == "/Items" && q.Get("parentId") != "":
-			f.mu.Lock()
-			n := f.episodes[q.Get("parentId")]
-			f.mu.Unlock()
-			json.NewEncoder(w).Encode(map[string]int{"TotalRecordCount": n})
 		case r.URL.Path == "/Items":
 			items := []map[string]string{}
 			for _, id := range strings.Split(q.Get("ids"), ",") {
@@ -164,9 +158,11 @@ func TestReporterNeverRefreshesALibraryForAnAdd(t *testing.T) {
 	none.Changed(movie) // must not panic
 }
 
-// A show removed whole leaves Jellyfin item by item, once each watch state is read,
-// and its season and show go with the last episode, with nothing refreshed.
-func TestForgetDropsTheShowWithItsLastEpisode(t *testing.T) {
+// A show removed whole leaves Jellyfin report by report, with nothing refreshed. Each
+// stub drops its episode once its watch state is read, and each emptied folder, whose
+// report comes after its stubs', drops its season or show. The show here shares its TMDB
+// id with another folder, so counting its episodes would never reach zero.
+func TestForgetDropsEachItemOnItsOwnReport(t *testing.T) {
 	root := t.TempDir()
 	on := "/media/library/tv/Show (2020)"
 	e1 := itemID(episodeClass, on+"/Season.01/Show_S01E01_aaaaaaaa.mkv")
@@ -174,37 +170,35 @@ func TestForgetDropsTheShowWithItsLastEpisode(t *testing.T) {
 	season := itemID(seasonClass, on+"/Season.01")
 	show := itemID(seriesClass, on)
 
-	f := &fakeLibrary{
-		listed:   map[string]bool{e1: true, e2: true, season: true, show: true},
-		episodes: map[string]int{season: 1, show: 1}, // E02 is still in Jellyfin
-	}
+	f := &fakeLibrary{listed: map[string]bool{e1: true, e2: true, season: true, show: true}}
 	r := NewReporter("jellyfin", f.serve(t).URL, "tok", root, log.New(io.Discard, "", 0))
 
-	// The stubs and folders are gone from disk; E01 is examined first.
-	r.Track(filepath.Join(root, "tv", "Show (2020)", "Season.01", "Show_S01E01_aaaaaaaa.mkv"))
-	if got := waitCalls(t, f, 1); !reflect.DeepEqual(got, []string{"delete " + e1}) {
-		t.Fatalf("got %q: the season went while an episode was left", got)
-	}
-
-	f.mu.Lock()
-	f.episodes = map[string]int{}
-	f.mu.Unlock()
-	r.Track(filepath.Join(root, "tv", "Show (2020)", "Season.01", "Show_S01E02_aaaaaaaa.mkv"))
+	// All of it is gone from disk, and Tiramisu reports it in this order.
+	dir := filepath.Join(root, "tv", "Show (2020)")
+	r.Track(filepath.Join(dir, "Season.01", "Show_S01E01_aaaaaaaa.mkv"))
+	r.Track(filepath.Join(dir, "Season.01", "Show_S01E02_aaaaaaaa.mkv"))
+	r.Track(filepath.Join(dir, "Season.01"))
+	r.Track(dir)
 	want := []string{"delete " + e1, "delete " + e2, "delete " + season, "delete " + show}
 	if got := waitCalls(t, f, 4); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 
-	// A season folder still on disk keeps its item, and the show's.
+	// A stub whose season stays drops its episode alone, and a folder still on disk
+	// is never dropped: Jellyfin would try to delete it through the mount.
 	kept := filepath.Join(root, "tv", "Kept (2020)", "Season.01")
 	if err := os.MkdirAll(kept, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	keptEpisode := itemID(episodeClass, "/media/library/tv/Kept (2020)/Season.01/Kept_S01E01_aaaaaaaa.mkv")
 	f.mu.Lock()
+	f.listed[keptEpisode] = true
 	f.listed[itemID(seasonClass, "/media/library/tv/Kept (2020)/Season.01")] = true
 	f.mu.Unlock()
 	r.Track(filepath.Join(kept, "Kept_S01E01_aaaaaaaa.mkv"))
-	if got := waitCalls(t, f, 4); len(got) != 4 {
-		t.Fatalf("got %q: dropped an item whose folder is on disk", got)
+	r.Track(kept)
+	want = append(want, "delete "+keptEpisode)
+	if got := waitCalls(t, f, 5); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
