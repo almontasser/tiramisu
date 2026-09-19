@@ -201,4 +201,22 @@ func TestForgetDropsEachItemOnItsOwnReport(t *testing.T) {
 	if got := waitCalls(t, f, 5); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
+
+	// A stub another release replaced keeps its item: the refresh that lists the new
+	// stub drops it, so the episode is never missing in between.
+	touch(t, filepath.Join(kept, "Kept_S01E02_bbbbbbbb.mkv"))
+	old := itemID(episodeClass, "/media/library/tv/Kept (2020)/Season.01/Kept_S01E02_aaaaaaaa.mkv")
+	marker := itemID(episodeClass, "/media/library/tv/Kept (2020)/Season.01/Kept_S01E03_aaaaaaaa.mkv")
+	f.mu.Lock()
+	f.listed[old] = true
+	f.listed[marker] = true
+	f.mu.Unlock()
+	r.Track(filepath.Join(kept, "Kept_S01E02_aaaaaaaa.mkv"))
+	// Removed with nothing replacing it; the queue is in order, so once this one is
+	// dropped the replaced stub has been examined.
+	r.Track(filepath.Join(kept, "Kept_S01E03_aaaaaaaa.mkv"))
+	want = append(want, "delete "+marker)
+	if got := waitCalls(t, f, 6); !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q, want %q: dropped the item of a replaced stub", got, want)
+	}
 }

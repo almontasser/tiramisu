@@ -168,15 +168,20 @@ func (r *Reporter) trackLoop() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		_, statErr := os.Stat(p)
 		var err error
+		replaced := false
 		if id := identity(r.root, p); id != "" {
 			if statErr == nil {
 				err = r.written(ctx, id, p)
 			} else {
 				err = r.removed(ctx, id, p)
+				replaced = r.sibling(p, id) != ""
 			}
 		}
-		// Only after the watch state is read: dropping the item first would lose it.
-		if err == nil && os.IsNotExist(statErr) {
+		// Only after the watch state is read: dropping the item first would lose it. A
+		// stub another release replaced is left to Jellyfin, whose refresh that lists the
+		// new stub drops the old one in the same pass. Dropping it here left 240 episodes
+		// of Bleach missing for as long as a pack swap took.
+		if err == nil && os.IsNotExist(statErr) && !replaced {
 			err = r.forget(ctx, p)
 		}
 		cancel()
