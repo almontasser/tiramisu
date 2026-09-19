@@ -442,8 +442,11 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 			return "", "", errf(http.StatusBadRequest,
 				"file_index needs an episode: a season pack files every file it can name")
 		}
-		if req.Season <= 0 {
-			return "", "", errf(http.StatusBadRequest, "season is required for tv")
+		// A pack files each episode under the season its file name gives, so only a
+		// single episode needs one. Requiring it refused a multi-season pack, which
+		// has no one season to give.
+		if req.Episode > 0 && req.Season <= 0 {
+			return "", "", errf(http.StatusBadRequest, "season is required for a single episode")
 		}
 		if m.cfg.Registry == nil {
 			return "", "", errf(http.StatusServiceUnavailable,
