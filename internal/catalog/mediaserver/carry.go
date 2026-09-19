@@ -17,10 +17,12 @@ import (
 )
 
 // The .NET types Jellyfin hashes with a path to make an item id, for the two kinds of
-// stub Tiramisu writes.
+// stub Tiramisu writes and the folders that hold episodes.
 const (
 	movieClass   = "MediaBrowser.Controller.Entities.Movies.Movie"
 	episodeClass = "MediaBrowser.Controller.Entities.TV.Episode"
+	seasonClass  = "MediaBrowser.Controller.Entities.TV.Season"
+	seriesClass  = "MediaBrowser.Controller.Entities.TV.Series"
 )
 
 // carryPoll is how often a carry looks for the replacement item, carryLimit how long it
@@ -31,7 +33,8 @@ const (
 var (
 	carryPoll  = 30 * time.Second
 	carryLimit = 30 * time.Minute
-	trackQueue = 256
+	// A show removed whole is one change per episode, and ONE PIECE has over 1,100.
+	trackQueue = 1 << 14
 )
 
 // An episode stub is Show_S01E02_1a2b3c4d.mkv, a movie stub Title_1994_1080p_5.1_hash.mkv.
@@ -162,22 +165,63 @@ func (r *Reporter) Track(path string) {
 
 func (r *Reporter) trackLoop() {
 	for p := range r.track {
-		id := identity(r.root, p)
-		if id == "" {
-			continue
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		_, statErr := os.Stat(p)
 		var err error
-		if _, statErr := os.Stat(p); statErr == nil {
-			err = r.written(ctx, id, p)
-		} else {
-			err = r.removed(ctx, id, p)
+		if id := identity(r.root, p); id != "" {
+			if statErr == nil {
+				err = r.written(ctx, id, p)
+			} else {
+				err = r.removed(ctx, id, p)
+			}
+		}
+		// Only after the watch state is read: dropping the item first would lose it.
+		if err == nil && os.IsNotExist(statErr) {
+			err = r.forget(ctx, p)
 		}
 		cancel()
 		if err != nil {
 			r.logger.Printf("[Jellyfin] WARNING: cannot track %s: %v", filepath.Base(p), err)
 		}
 	}
+}
+
+// forget drops a removed stub or folder from Jellyfin, then the season and show it
+// leaves with no episode. Reporting the path made Jellyfin refresh the nearest item
+// still on disk, which for a movie, or a show removed whole, is the whole library.
+func (r *Reporter) forget(ctx context.Context, p string) error {
+	libs, err := r.client.libraries(ctx)
+	if err != nil {
+		return err
+	}
+	for _, it := range lineage(r.root, p) {
+		// Jellyfin deletes an item's path along with it, and the mount can't remove a
+		// folder, so a folder still on disk stops here, and so does all above it.
+		if _, err := os.Stat(it.path); err == nil {
+			return nil
+		}
+		ids, _ := jellyfinIDs(libs, r.root, it.path)
+		if len(ids) == 0 {
+			return nil
+		}
+		if listed, err := r.client.listed(ctx, ids[0]); err != nil || !listed {
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		// A season or show goes with its last episode: episodes still queued here read
+		// their watch state from their items, and dropping the folder drops them too.
+		if it.class == seasonClass || it.class == seriesClass {
+			if n, err := r.client.episodes(ctx, ids[0]); err != nil || n > 0 {
+				return err
+			}
+		}
+		if err := r.client.deleteItem(ctx, ids[0]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removed reads what the users had on a stub that has just gone, and either carries it

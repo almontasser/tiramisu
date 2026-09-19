@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -979,6 +980,7 @@ func (m *Manager) Remove(ctx context.Context, req RemoveRequest) (*RemoveRespons
 	}
 
 	for _, path := range resp.Removed {
+		m.pruneEmptyDirs(path)
 		m.scheduleRefresh(m.section(m.kindOf(path)))
 	}
 	m.cfg.Logger.Printf("[LibraryAPI] Removed %d stub(s)", len(resp.Removed))
@@ -987,6 +989,20 @@ func (m *Manager) Remove(ctx context.Context, req RemoveRequest) (*RemoveRespons
 			"removed %d stub(s), cannot delete: %s", len(resp.Removed), strings.Join(failed, ", "))
 	}
 	return resp, nil
+}
+
+// pruneEmptyDirs removes the season and show folders a removal left empty, and
+// reports each: Jellyfin keeps a show while its folder is on disk. The media
+// directories themselves stay.
+func (m *Manager) pruneEmptyDirs(path string) {
+	for dir := filepath.Dir(path); m.insideMediaDirs(dir) && !slices.Contains(m.mediaDirs(), dir); dir = filepath.Dir(dir) {
+		if os.Remove(dir) != nil {
+			return // not empty
+		}
+		if m.cfg.InvalidatePath != nil {
+			m.cfg.InvalidatePath(dir)
+		}
+	}
 }
 
 func (m *Manager) forgetEpisode(path string) {
