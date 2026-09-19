@@ -456,6 +456,16 @@
     const esc = s => (s || '').replace(/[&<>"']/g, c =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+    // A proxy such as Cloudflare answers a 502 or 504 with its own HTML page, which
+    // hides Tiramisu's message. Say what those statuses mean here instead.
+    function failure(status, txt) {
+      if (!/^\s*</.test(txt)) return txt.slice(0, 300);
+      if (status === 504 || status === 524) return 'No file list arrived from the swarm in time. The engine keeps ' +
+        'looking for peers, so try again in a minute; if it still fails, the release has no reachable seeders.';
+      if (status === 502 || status === 521 || status === 522) return 'Tiramisu did not answer. It may be restarting; try again shortly.';
+      return 'HTTP ' + status + ' from the proxy in front of Tiramisu.';
+    }
+
     function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
     const debouncedReload = debounce(() => reload(0), 300);
 
@@ -539,7 +549,7 @@
         });
         if (!r.ok) {
           el('rmMsg').innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' +
-            esc((await r.text()).slice(0, 240)) + '</span>';
+            esc(failure(r.status, await r.text())) + '</span>';
           return;
         }
         el('rmDlg').close();
@@ -571,10 +581,12 @@
       if (!magnet) { msg.innerHTML = '<span class="text-red-400">Paste a magnet or infohash first.</span>'; return; }
       const body = /^[0-9a-fA-F]{40}$/.test(magnet)
         ? { hash: magnet.toLowerCase() } : { magnet };
-      body.metadata_wait = 60;
+      // The longest wait under Cloudflare's 100-second cut-off; some releases take
+      // over a minute to send their file list.
+      body.metadata_wait = 90;
 
       el('inspectBtn').disabled = true;
-      msg.innerHTML = '<span class="text-slate-400">Fetching metadata from the swarm — up to 60s…</span>';
+      msg.innerHTML = '<span class="text-slate-400">Fetching the file list from the swarm — up to 90s…</span>';
       try {
         const r = await fetch('/api/library/inspect', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -582,7 +594,7 @@
         });
         const txt = await r.text();
         if (!r.ok) {
-          msg.innerHTML = '<span class="text-red-400">' + esc(txt.slice(0, 300)) + '</span>';
+          msg.innerHTML = '<span class="text-red-400">' + esc(failure(r.status, txt)) + '</span>';
           return;
         }
         inspected = JSON.parse(txt);
@@ -720,7 +732,8 @@
         type: el('a_type').value, title,
         year: +el('a_year').value || 0,
         imdb: el('a_imdb').value.trim(),
-        file_index: +el('a_fileindex').value || 0
+        file_index: +el('a_fileindex').value || 0,
+        metadata_wait: 90
       };
       if (/^[0-9a-fA-F]{40}$/.test(magnet)) body.hash = magnet.toLowerCase();
       else body.magnet = magnet;
@@ -742,7 +755,7 @@
         });
         const txt = await r.text();
         if (!r.ok) {
-          msg.innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' + esc(txt.slice(0, 300)) + '</span>';
+          msg.innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' + esc(failure(r.status, txt)) + '</span>';
           return;
         }
         let n = 0;
@@ -778,7 +791,7 @@
       try {
         const r = await fetch('/api/library/missing?type=' + el('mkind').value + (refresh ? '&refresh=1' : ''));
         const txt = await r.text();
-        if (!r.ok) throw new Error(txt.slice(0, 300));
+        if (!r.ok) throw new Error(failure(r.status, txt));
         missing = JSON.parse(txt);
       } catch (e) {
         el('mrows').innerHTML = '<tr><td colspan="6" class="text-red-400 p-4">' + esc(String(e.message || e)) + '</td></tr>';
