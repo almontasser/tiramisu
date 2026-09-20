@@ -32,6 +32,12 @@ func TestJellyfinWebhookMatchesTheItemsFile(t *testing.T) {
 		defer playbackRegistry.Delete(p)
 	}
 
+	// The file's own handle is still open when the stop arrives; the file match must
+	// be honored anyway, or the pump lives on until the idle timeout.
+	h := &MkvHandle{path: e2}
+	activeHandles.Store(h, true)
+	defer activeHandles.Delete(h)
+
 	send := func(event string) {
 		body := `{"event":"` + event + `","itemId":"item2","Metadata":{"title":"Pilot","grandparentTitle":"Show","librarySectionType":"Episode"}}`
 		req := httptest.NewRequest(http.MethodPost, "/plex/webhook", strings.NewReader(body))

@@ -348,6 +348,23 @@ func (t *Torrent) setChunkSize(size pp.Integer) {
 	}
 }
 
+// Get a chunk buffer from the pool. It should be returned when it's no longer in use.
+// Backported from anacrolix/torrent upstream (commit 4f0e00d).
+func (t *Torrent) getChunkBuffer() []byte {
+	b := *t.chunkPool.Get().(*[]byte)
+	b = b[:t.chunkSize.Int()]
+	return b
+}
+
+func (t *Torrent) putChunkBuffer(b []byte) {
+	// chunkSize is fixed when the Torrent is created (setChunkSize) and never changes while a hash
+	// is in flight, so the capacity of a buffer taken by getChunkBuffer still matches here.
+	if cap(b) != t.chunkSize.Int() {
+		panic("chunk buffer returned with unexpected capacity")
+	}
+	t.chunkPool.Put(&b)
+}
+
 func (t *Torrent) pieceComplete(piece pieceIndex) bool {
 	return t._completedPieces.Contains(bitmap.BitIndex(piece))
 }
@@ -1531,7 +1548,7 @@ func (t *Torrent) smartBanBlockCheckingWriter(piece pieceIndex) *blockCheckingWr
 	return &blockCheckingWriter{
 		cache:        &t.smartBanCache,
 		requestIndex: t.pieceRequestIndexOffset(piece),
-		chunkSize:    t.chunkSize.Int(),
+		chunkBuffer:  t.getChunkBuffer(),
 	}
 }
 
@@ -1557,6 +1574,10 @@ func (t *Torrent) hashPiece(piece pieceIndex) (
 	hash := pieceHash.New()
 	const logPieceContents = false
 	smartBanWriter := t.smartBanBlockCheckingWriter(piece)
+	defer func() {
+		t.putChunkBuffer(smartBanWriter.chunkBuffer)
+		smartBanWriter.chunkBuffer = nil
+	}()
 	writers := []io.Writer{hash, smartBanWriter}
 	var examineBuf bytes.Buffer
 	if logPieceContents {
@@ -1730,6 +1751,10 @@ func getPeerConnSlice(cap int) []*PeerConn {
 func (t *Torrent) withUnclosedConns(f func([]*PeerConn)) {
 	sl := t.appendUnclosedConns(getPeerConnSlice(len(t.conns)))
 	f(sl)
+	// Don't let the pooled backing array keep conns alive until the pool drains. The full capacity
+	// is cleared, not just the length, because a longer earlier use can have left conns beyond the
+	// current length. Backported from anacrolix/torrent upstream.
+	clear(sl[:cap(sl)])
 	peerConnSlices.Put(sl)
 }
 
@@ -2105,7 +2130,9 @@ func appendMissingStrings(old, new []string) (ret []string) {
 	ret = old
 new:
 	for _, n := range new {
-		for _, o := range old {
+		// Compare against ret, not old: this skips URLs repeated within new too.
+		// Backported from anacrolix/torrent upstream (#1099).
+		for _, o := range ret {
 			if o == n {
 				continue new
 			}
@@ -2124,6 +2151,11 @@ func appendMissingTrackerTiers(existing [][]string, minNumTiers int) (ret [][]st
 }
 
 func (t *Torrent) addTrackers(announceList [][]string) {
+	if t.closed.IsSet() {
+		// A closed torrent may have skipped registering announce states, so don't alter it.
+		// Backported from anacrolix/torrent upstream (commit 77e010b).
+		return
+	}
 	fullAnnounceList := &t.metainfo.AnnounceList
 	t.metainfo.AnnounceList = appendMissingTrackerTiers(*fullAnnounceList, len(announceList))
 	for tierIndex, trackerURLs := range announceList {
@@ -3042,13 +3074,16 @@ func (t *Torrent) finishHash(index pieceIndex) {
 	t.cl.activePieceHashers--
 }
 
-// Return the connections that touched a piece, and clear the entries while doing it.
+// Forget the connections that touched a piece, on both the piece and the peers.
 func (t *Torrent) clearPieceTouchers(pi pieceIndex) {
 	p := t.piece(pi)
 	for c := range p.dirtiers {
 		delete(c.peerTouchedPieces, pi)
-		delete(p.dirtiers, c)
 	}
+	// Release the map instead of just emptying it. Go maps never shrink, so an emptied map retains
+	// its backing storage for the life of the Torrent; onDirtiedPiece remakes it on demand.
+	// Backported from anacrolix/torrent upstream.
+	p.dirtiers = nil
 }
 
 func (t *Torrent) queuePieceCheck(pieceIndex pieceIndex) {
@@ -3315,6 +3350,7 @@ func (t *Torrent) addWebSeed(url string, opts ...AddWebSeedsOpt) {
 		},
 		activeRequests: make(map[Request]webseed.Request, maxRequests),
 	}
+	ws.peer.initClosedCtx()
 	ws.peer.initRequestState()
 	for _, opt := range opts {
 		opt(&ws.client)
