@@ -1657,12 +1657,17 @@ func (t *Torrent) AvailableRange(off, max int64, responsive bool) (avail int64) 
 		}
 
 		pieceIdx := pieceIndex(req.Index)
-		pieceOffset := t.requestOffset(req)
-		pieceLen := t.info.PieceLength
+		// requestOffset gives the CHUNK's offset, not the piece's: Begin is chunk-aligned
+		// inside the piece. Subtracting it as if it were the piece start credits every
+		// chunk before off's as available, so the reader is handed a length that runs past
+		// this piece into the next, still-incomplete one - where MemPiece.ReadAt returns
+		// whatever its recycled buffer happened to hold. That is served as file content.
+		pieceStart := int64(pieceIdx) * t.info.PieceLength
+		pieceLen := int64(t.pieceLength(pieceIdx))
 
 		// If piece is complete, we can serve the rest of it (or up to max)
 		if t.pieceComplete(pieceIdx) {
-			canServe := pieceLen - (off - pieceOffset)
+			canServe := pieceLen - (off - pieceStart)
 			if canServe > max {
 				canServe = max
 			}
@@ -1705,8 +1710,8 @@ func (t *Torrent) AvailableRange(off, max int64, responsive bool) (avail int64) 
 		// Convert ready chunks to bytes
 		canServe := (int64(readyChunks) * int64(t.chunkSize)) - (off - t.requestOffset(req))
 		// Ensure we don't over-read the piece or the request
-		if canServe > (pieceLen - (off - pieceOffset)) {
-			canServe = pieceLen - (off - pieceOffset)
+		if canServe > (pieceLen - (off - pieceStart)) {
+			canServe = pieceLen - (off - pieceStart)
 		}
 		if canServe > max {
 			canServe = max
