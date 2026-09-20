@@ -713,7 +713,16 @@ type PipeResponseWriter struct {
 
 func (w *PipeResponseWriter) Header() http.Header         { return w.header }
 func (w *PipeResponseWriter) Write(p []byte) (int, error) { return w.writer.Write(p) }
-func (w *PipeResponseWriter) WriteHeader(statusCode int)  {}
+
+// WriteHeader fails the pipe on an error status instead of letting the body through.
+// The pipe carries file bytes, so a discarded status turns ServeContent's "seeker can't
+// seek" or a 404 body into content at the read offset: the player decodes the text as
+// video. Closing with an error makes the reader see a failed read, which it retries.
+func (w *PipeResponseWriter) WriteHeader(statusCode int) {
+	if statusCode >= 300 {
+		w.writer.CloseWithError(fmt.Errorf("gostorm stream: HTTP %d %s", statusCode, http.StatusText(statusCode)))
+	}
+}
 
 // convertStatusToStats maps internal TorrentStatus to our local TorrentStats struct
 func convertStatusToStats(st *state.TorrentStatus) *TorrentStats {
