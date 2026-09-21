@@ -9,6 +9,7 @@ import (
 
 	"tiramisu/internal/catalog/tmdb"
 	"tiramisu/internal/config"
+	"tiramisu/internal/library"
 	"tiramisu/internal/metadb"
 	"tiramisu/internal/prowlarr"
 )
@@ -59,6 +60,7 @@ type TVSyncerConfig struct {
 	QualityScoring  config.QualityScoringConfig
 	MaxSeasons      int
 	DB              *metadb.DB // V1.7.1: Optional SQLite backend
+	AudioRegistry   library.AudioRegistry
 	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
@@ -108,6 +110,7 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		Weights:         cfg.QualityScoring.TVWeights(),
 		MaxSeasons:      cfg.MaxSeasons,
 		InvalidatePath:  cfg.InvalidatePath,
+		AudioRegistry:   cfg.AudioRegistry,
 	}
 
 	engine := NewTVGoEngine(engineCfg, cfg.DB)

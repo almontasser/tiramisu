@@ -11,24 +11,26 @@ import (
 	"strings"
 )
 
-// InspectRequest asks what is inside a torrent without filing anything.
+// InspectRequest identifies a torrent to read the file list of. It selects
+// nothing: naming and file choice stay with the caller.
 type InspectRequest struct {
-	Magnet string `json:"magnet"`
-	Hash   string `json:"hash"`
-	// Title only helps the engine label the torrent while metadata is fetched.
+	Hash         string `json:"hash"`
+	Magnet       string `json:"magnet"`
 	Title        string `json:"title"`
 	MetadataWait int    `json:"metadata_wait"`
 }
 
-// InspectFile is one file inside the torrent, with whatever the name gives away.
+// InspectFile is one source file as the engine sees it. source_path is what a
+// caller selects by; file_index is GoStorm's own resolved state. The rest is
+// what the name gives away.
 type InspectFile struct {
-	ID      int    `json:"id"`
-	Path    string `json:"path"`
-	Name    string `json:"name"`
-	Size    int64  `json:"size"`
-	Video   bool   `json:"video"`
-	Season  int    `json:"season,omitempty"`
-	Episode int    `json:"episode,omitempty"`
+	SourcePath string `json:"source_path"`
+	FileIndex  int    `json:"file_index"`
+	Size       int64  `json:"size"`
+	Name       string `json:"name"`
+	Video      bool   `json:"video"`
+	Season     int    `json:"season,omitempty"`
+	Episode    int    `json:"episode,omitempty"`
 }
 
 // InspectResponse is the torrent's contents plus a guess at how it should be filed.
@@ -36,9 +38,9 @@ type InspectFile struct {
 // the caller still sends an explicit AddRequest.
 type InspectResponse struct {
 	Hash       string        `json:"hash"`
+	Files      []InspectFile `json:"files"`
 	Title      string        `json:"title"`
 	Size       int64         `json:"size"`
-	Files      []InspectFile `json:"files"`
 	VideoCount int           `json:"video_count"`
 
 	// Kind is "movie" or "tv": a torrent whose files carry episode numbers is
@@ -80,49 +82,88 @@ func resolutionOf(s string) string {
 	return ""
 }
 
-// Inspect registers the torrent with the engine long enough to read its file
-// list, then classifies it.
+// Inspect reports a torrent's files and classifies them. Metadata that never
+// arrives is an error, not an empty list: "not ready" and "no files" are
+// different answers.
 //
 // Filing decisions hinge on things only the torrent's contents reveal - whether
 // it holds one episode or a whole season, which file is the feature rather than
-// a sample - and until now the only way to find out was to file it and look at
-// what appeared.
+// a sample - so the guess rides along for the video form. Audio callers read
+// source_path and file_index and ignore the rest.
 func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResponse, error) {
-	hash := strings.ToLower(strings.TrimSpace(req.Hash))
-	magnet := strings.TrimSpace(req.Magnet)
-	if hash == "" && magnet != "" {
-		hash = HashFromMagnet(magnet)
+	if err := ctx.Err(); err != nil {
+		return nil, errf(http.StatusRequestTimeout, "request cancelled: %v", err)
 	}
-	if !reInfoHash.MatchString(hash) {
-		return nil, errf(http.StatusBadRequest, "need a magnet or a 40-character info hash")
+	// Optional, unlike upstream: the engine names an untitled torrent from its
+	// metadata, and the library browser inspects before it knows a title.
+	title := strings.TrimSpace(req.Title)
+	// Identity resolution mirrors validate(): a magnet's own info hash wins, so
+	// cleanup later removes the torrent the engine was actually asked to add.
+	hash, magnet, err := resolveAudioIdentity(req.Hash, req.Magnet)
+	if err != nil {
+		return nil, err
 	}
 	if magnet == "" {
-		magnet = BuildMagnet(hash, req.Title, DefaultTrackers())
+		magnet = BuildMagnet(hash, title, DefaultTrackers())
 	}
 
-	if _, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, req.Title); err != nil {
-		return nil, errf(http.StatusBadGateway, "engine refused the torrent: %v", err)
+	// Held across ownership, add and cleanup, keyed on the canonical spelling so a
+	// base32 magnet and its hex form are one torrent.
+	lockKey := canonicalHashKey(hash)
+	defer m.lockHash(lockKey)()
+
+	known, ok := m.knownTorrentHashes(ctx)
+	if !ok {
+		// Adding without knowing what was already there would leak on failure:
+		// there would be no way to tell whether this call hydrated the torrent.
+		return nil, errf(http.StatusBadGateway, "cannot list torrents to establish ownership")
 	}
+	preexisting := known[lockKey]
+
+	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, title)
+	if err != nil || addedHash == "" {
+		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
+	}
+	engineHash := strings.ToLower(strings.TrimSpace(addedHash))
+	if !reInfoHash.MatchString(engineHash) {
+		// Hydrated under the hash we asked for, so that is the one to drop.
+		if !preexisting {
+			m.dropTorrent(ctx, hash)
+		}
+		return nil, errf(http.StatusBadGateway, "gostorm returned a malformed info hash %q", addedHash)
+	}
+	// A base32 magnet comes back in hex, and everything from here is keyed on the
+	// spelling the engine reported, so the lock has to cover it too.
+	if engineKey := canonicalHashKey(engineHash); engineKey != lockKey {
+		defer m.lockHash(engineKey)()
+		preexisting = preexisting || known[engineKey]
+	}
+
 	wait := req.MetadataWait
 	if wait <= 0 {
-		wait = 60
+		wait = defaultMetadataWait
+	} else if wait > maxMetadataWait {
+		wait = maxMetadataWait
 	}
-	stats, err := m.cfg.GoStorm.GetTorrentInfo(ctx, hash, wait)
-	if err != nil {
-		return nil, errf(http.StatusGatewayTimeout,
-			"no metadata after %ds - the swarm may be dead: %v", wait, err)
+	info, err := m.cfg.GoStorm.GetTorrentInfo(ctx, engineHash, wait)
+	if err != nil || info == nil {
+		if !preexisting {
+			m.dropTorrent(ctx, engineHash)
+		}
+		return nil, errf(http.StatusGatewayTimeout, "no metadata after %ds: %v", wait, err)
 	}
 
-	out := &InspectResponse{Hash: hash, Title: stats.Title, Size: stats.Length, Files: []InspectFile{}}
+	// Non-nil even when empty: an empty array and a null are different answers.
+	out := &InspectResponse{Hash: engineHash, Title: info.Title, Size: info.Length, Files: make([]InspectFile, 0, len(info.FileStats))}
 
 	var biggest InspectFile
 	seasonSet := map[int]bool{}
 	episodes := 0
-	for _, f := range stats.FileStats {
+	for _, f := range info.FileStats {
 		name := filepath.Base(f.Path)
 		season, episode := ParseSeasonEpisode(name)
 		item := InspectFile{
-			ID: f.ID, Path: f.Path, Name: name, Size: f.Length,
+			SourcePath: f.Path, FileIndex: f.ID, Name: name, Size: f.Length,
 			Video: IsVideoFile(f.Path), Season: season, Episode: episode,
 		}
 		out.Files = append(out.Files, item)
@@ -138,10 +179,6 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 			seasonSet[season] = true
 		}
 	}
-	if len(out.Files) == 0 {
-		return nil, errf(http.StatusBadGateway, "engine returned no files for %s", hash)
-	}
-
 	// The engine reports a torrent-level length of 0 for some torrents even
 	// though every file length is right, which showed as "0 B" next to a 9 GB
 	// season pack. The files are the authority.
@@ -159,7 +196,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	// The stream URL addresses files by their 1-based id; 0 means "largest video
 	// file", which is what a single-feature torrent wants anyway.
 	out.FileIndex = 0
-	out.Resolution = resolutionOf(stats.Title)
+	out.Resolution = resolutionOf(info.Title)
 	if out.Resolution == "" {
 		out.Resolution = resolutionOf(biggest.Name)
 	}
@@ -179,13 +216,13 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	case episodes == 1:
 		out.Kind = "tv"
 		out.Season, out.Episode = biggest.Season, biggest.Episode
-		out.FileIndex = biggest.ID
+		out.FileIndex = biggest.FileIndex
 		out.Note = "single episode S" + pad2(out.Season) + "E" + pad2(out.Episode)
 
 	default:
 		// No episode numbering anywhere. A season marker in the torrent name
 		// still means a pack whose files simply are not numbered.
-		if mm := reSeasonOnly.FindStringSubmatch(stats.Title); mm != nil && out.VideoCount > 1 {
+		if mm := reSeasonOnly.FindStringSubmatch(info.Title); mm != nil && out.VideoCount > 1 {
 			out.Kind, out.Pack = "tv", true
 			out.Season = atoiSafe(mm[1])
 			out.Seasons = []int{out.Season}
@@ -194,7 +231,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 			break
 		}
 		out.Kind = "movie"
-		out.FileIndex = biggest.ID
+		out.FileIndex = biggest.FileIndex
 		if out.VideoCount > 1 {
 			out.Note = plural(out.VideoCount, "video file") +
 				" with no episode numbering — largest picked (" + biggest.Name + ")"
@@ -203,6 +240,23 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 		}
 	}
 	return out, nil
+}
+
+// knownTorrentHashes snapshots what the engine already holds. A failed listing
+// reports not-ok: the caller must not add without it.
+func (m *Manager) knownTorrentHashes(ctx context.Context) (map[string]bool, bool) {
+	torrents, err := m.cfg.GoStorm.ListTorrents(ctx)
+	if err != nil {
+		// Logged because this fails the whole request: without it the caller sees
+		// only "cannot establish ownership" and the cause is invisible.
+		m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot list torrents: %v", err)
+		return nil, false
+	}
+	known := make(map[string]bool, len(torrents))
+	for _, torrent := range torrents {
+		known[canonicalHashKey(torrent.Hash)] = true
+	}
+	return known, true
 }
 
 // Small formatting helpers for the Note line. Kept local: they exist only to

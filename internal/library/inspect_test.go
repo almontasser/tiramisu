@@ -8,8 +8,9 @@ import (
 // fakeGoStorm answers with a fixed file list. Inspect only reads the engine, so
 // this is all a classification test needs.
 type fakeGoStorm struct {
-	stats TorrentStats
-	err   error
+	stats   TorrentStats
+	err     error
+	removed []string
 }
 
 func (f *fakeGoStorm) AddTorrent(ctx context.Context, magnet, title string) (string, error) {
@@ -24,7 +25,10 @@ func (f *fakeGoStorm) GetTorrentInfo(ctx context.Context, hash string, maxWait i
 	return &s, nil
 }
 
-func (f *fakeGoStorm) RemoveTorrent(ctx context.Context, hash string) error { return nil }
+func (f *fakeGoStorm) RemoveTorrent(ctx context.Context, hash string) error {
+	f.removed = append(f.removed, hash)
+	return nil
+}
 
 func (f *fakeGoStorm) ListTorrents(ctx context.Context) ([]TorrentStats, error) { return nil, nil }
 
@@ -42,9 +46,9 @@ const testHash = "f12d8fd29e4fce1d54968698b23e00b104d6b9fc"
 
 func inspectWith(t *testing.T, title string, fs []FileStat) *InspectResponse {
 	t.Helper()
-	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{
+	m := New(Config{GoStorm: &fakeGoStorm{
 		stats: TorrentStats{Hash: testHash, Title: title, Length: 1234, FileStats: fs},
-	}}}
+	}})
 	got, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash})
 	if err != nil {
 		t.Fatalf("Inspect(%q): %v", title, err)
@@ -171,7 +175,7 @@ func TestInspectClassifies(t *testing.T) {
 }
 
 func TestInspectRejectsBadHash(t *testing.T) {
-	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{}}}
+	m := New(Config{GoStorm: &fakeGoStorm{}})
 	if _, err := m.Inspect(context.Background(), InspectRequest{Hash: "nope"}); err == nil {
 		t.Fatal("expected an error for a malformed info hash")
 	}
@@ -189,7 +193,7 @@ func TestInspectPackHasNoEpisode(t *testing.T) {
 // GoStorm reports Length 0 for some torrents while the per-file lengths are
 // correct, which showed a 9 GB season pack as "0 B".
 func TestInspectFallsBackToSummedFileSizes(t *testing.T) {
-	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{
+	m := New(Config{GoStorm: &fakeGoStorm{
 		stats: TorrentStats{
 			Hash: testHash, Title: "Show.S01.1080p", Length: 0,
 			FileStats: []FileStat{
@@ -197,7 +201,7 @@ func TestInspectFallsBackToSummedFileSizes(t *testing.T) {
 				{ID: 2, Path: "Show.S01E02.mkv", Length: 300},
 			},
 		},
-	}}}
+	}})
 	got, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash})
 	if err != nil {
 		t.Fatal(err)
@@ -210,17 +214,30 @@ func TestInspectFallsBackToSummedFileSizes(t *testing.T) {
 // A reported length must win over the sum, since a multi-file torrent's total
 // legitimately exceeds what the selected files add up to.
 func TestInspectKeepsReportedSize(t *testing.T) {
-	m := &Manager{cfg: Config{GoStorm: &fakeGoStorm{
+	m := New(Config{GoStorm: &fakeGoStorm{
 		stats: TorrentStats{
 			Hash: testHash, Title: "Film.2020.1080p", Length: 4242,
 			FileStats: []FileStat{{ID: 1, Path: "Film.mkv", Length: 10}},
 		},
-	}}}
+	}})
 	got, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Size != 4242 {
 		t.Fatalf("Size = %d, want 4242 (reported)", got.Size)
+	}
+}
+
+// Metadata that never arrives must not leave behind a torrent this call added:
+// an inspect nobody follows up with would otherwise sit in the engine forever.
+func TestInspectDropsTorrentItAddedOnTimeout(t *testing.T) {
+	gs := &fakeGoStorm{stats: TorrentStats{Hash: testHash}, err: context.DeadlineExceeded}
+	m := New(Config{GoStorm: gs})
+	if _, err := m.Inspect(context.Background(), InspectRequest{Hash: testHash}); err == nil {
+		t.Fatal("expected an error when metadata never arrives")
+	}
+	if len(gs.removed) != 1 || gs.removed[0] != testHash {
+		t.Fatalf("removed = %v, want [%s]", gs.removed, testHash)
 	}
 }

@@ -622,8 +622,8 @@
         '<span></span><span></span></label>'];
       for (const f of d.files || []) {
         const se = f.episode ? 'S' + String(f.season).padStart(2, '0') + 'E' + String(f.episode).padStart(2, '0') : '';
-        rows.push('<label class="filerow" title="' + esc(f.path) + '">' +
-          '<input type="radio" name="fidx" value="' + f.id + '" ' + (d.file_index === f.id ? 'checked' : '') + '>' +
+        rows.push('<label class="filerow" title="' + esc(f.source_path) + '">' +
+          '<input type="radio" name="fidx" value="' + f.file_index + '" ' + (d.file_index === f.file_index ? 'checked' : '') + '>' +
           '<span class="' + (f.video ? 'text-slate-200' : 'text-slate-500') + ' truncate">' + esc(f.name) + '</span>' +
           '<span class="mono text-slate-400 text-right">' + fmtSize(f.size) + '</span>' +
           '<span class="mono text-[11px] ' + (se ? 'text-amber-300' : 'text-slate-600') + '">' + (se || (f.video ? 'video' : '—')) + '</span>' +

@@ -47,6 +47,7 @@ type TVGoEngine struct {
 	registry     map[string]TVEpisodeEntry
 	registryFile string
 	db           *metadb.DB // V1.7.1: Optional SQLite backend
+	audioReg     library.AudioRegistry
 
 	processedThisRun map[string]bool
 	stats            TVSyncStats
@@ -141,7 +142,8 @@ type TVEngineConfig struct {
 	Weights        config.TVWeights
 	// MaxSeasons caps how many of the most recent seasons are considered.
 	// <= 0 means every season.
-	MaxSeasons int
+	MaxSeasons    int
+	AudioRegistry library.AudioRegistry
 }
 
 // TV thresholds
@@ -314,6 +316,7 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		logger:           logger,
 		registryFile:     regFile,
 		db:               db,
+		audioReg:         cfg.AudioRegistry,
 		processedThisRun: make(map[string]bool),
 		knownTitles:      make(map[int][]string),
 		blacklistFile:    blFile,
@@ -337,7 +340,7 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 // failed RemoveTorrent doesn't block the stub deletion.
 func (e *TVGoEngine) removeStub(ctx context.Context, path, hash string) {
 	if hash != "" {
-		if err := e.gostorm.RemoveTorrent(ctx, hash); err != nil {
+		if _, err := e.dropTorrent(ctx, hash); err != nil {
 			e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
 		}
 		// Same reason as the movie engine: the counter outlives the release otherwise.
@@ -473,7 +476,7 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 	e.rehydrateMissingTorrents(ctx)
 	if e.mergeRegistryFromDB() {
 		e.cleanupOrphanedFiles(ctx)
-		e.cleanupOrphanedTorrents(ctx)
+		_ = e.cleanupOrphanedTorrents(ctx)
 	}
 
 	e.logger.Printf("TV sync complete: %d shows, %d episodes created, %d skipped, %d upgrades",
@@ -1427,7 +1430,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 
 	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 90)
 	if err != nil {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
@@ -1441,12 +1444,12 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 	}
 
 	if len(videoFiles) == 0 {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
 	if !e.contentsBelongToShow(videoFiles, knownTitles, showName, stream.Title) {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
@@ -1498,7 +1501,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 		e.logger.Printf("  fullpack skipped: %d/%d eps already at sufficient quality (score %d)", skipped, len(videoFiles), stream.QualityScore)
 	}
 	if created == 0 {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 	}
 
 	return created
@@ -1536,7 +1539,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 
 	info, err := e.gostorm.GetTorrentInfo(ctx, hash, 45)
 	if err != nil {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
@@ -1551,12 +1554,12 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 		}
 	}
 	if bestFile == nil {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
 	if !e.contentsBelongToShow([]FileStat{*bestFile}, knownTitles, showName, title) {
-		e.gostorm.RemoveTorrent(ctx, hash)
+		_, _ = e.dropTorrent(ctx, hash)
 		return 0
 	}
 
@@ -1763,10 +1766,12 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 	}
 }
 
-func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) {
+// Returns how many torrents were actually removed; a torrent withheld because
+// audio still owns it is not counted.
+func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) int {
 	torrents, err := e.gostorm.ListTorrents(ctx)
 	if err != nil {
-		return
+		return 0
 	}
 
 	registryHashes := make(map[string]bool)
@@ -1821,7 +1826,9 @@ func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) {
 		if registryHashes[h] || diskHashes[h] {
 			continue
 		}
-		if e.gostorm.RemoveTorrent(ctx, h) == nil {
+		// Only an actual removal counts: a torrent withheld because audio still
+		// owns it is not an orphan that was reaped.
+		if didRemove, _ := e.dropTorrent(ctx, h); didRemove {
 			removed++
 			e.logger.Printf("Removed orphaned torrent: %s...", h[:8])
 		}
@@ -1830,6 +1837,7 @@ func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) {
 	if removed > 0 {
 		e.logger.Printf("Removed %d orphaned torrents", removed)
 	}
+	return removed
 }
 
 func (e *TVGoEngine) isVideoFile(path string) bool {

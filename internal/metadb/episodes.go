@@ -152,12 +152,18 @@ func folderEpisodeKey(key, path string) string {
 	return reKeyNonWord.ReplaceAllString(strings.ToLower(filepath.Base(filepath.Dir(season))), "") + key[i:]
 }
 
-// rekeyEpisodes moves tv_episodes and episode_gaps to folder keys, once, as schema
-// version 9. Keys used to drop the year, so ONE PIECE (2023) and ONE PIECE (1999)
-// shared "onepiece_s01e01", and filing an episode of either deleted the other's.
+// rekeyEpisodes moves tv_episodes and episode_gaps to folder keys, once. Keys used to
+// drop the year, so ONE PIECE (2023) and ONE PIECE (1999) shared "onepiece_s01e01",
+// and filing an episode of either deleted the other's.
+//
+// The migration is recorded by description under version 1000, clear of upstream's
+// numbering. Databases migrated before that hold it as version 9, which upstream
+// has since given to audio_projections.
+const rekeyEpisodesMigration = "key tv episodes by show folder"
+
 func (d *DB) rekeyEpisodes() error {
 	var done int
-	if err := d.db.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE version = 9`).Scan(&done); err != nil || done > 0 {
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM schema_version WHERE description = ?`, rekeyEpisodesMigration).Scan(&done); err != nil || done > 0 {
 		return err
 	}
 	tx, err := d.db.Begin()
@@ -204,7 +210,7 @@ func (d *DB) rekeyEpisodes() error {
 		}
 		moved += len(renames)
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (9, 'key tv episodes by show folder')`); err != nil {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO schema_version (version, description) VALUES (1000, ?)`, rekeyEpisodesMigration); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
