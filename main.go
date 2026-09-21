@@ -4623,6 +4623,11 @@ func main() {
 				_ = nativeBridge.Wake(context.Background(), "magnet:?xt=urn:btih:"+hash, fileID)
 			})
 		library.StubChanged = func(path string) {
+			// Audio projections take no SSD warmup (upstream's policy), and an album
+			// folder would read to the reporter as a show.
+			if !pathUsesSSDWarmup(path) {
+				return
+			}
 			reporter.Track(path)
 			gate.Changed(path)
 		}
