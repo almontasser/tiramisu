@@ -727,7 +727,7 @@ func (e *MovieGoEngine) evaluateTitle(ctx context.Context, imdbID, title, releas
 		if bestFile == nil {
 			e.logger.Printf("[MovieSync] %s: cannot tell which file of %s is the movie, skipping it", title, c.Hash[:8])
 			e.setCache(e.noMKVCache, hash, CacheEntry{Reason: "ambiguous_files", TS: time.Now().Unix()})
-			e.gostorm.RemoveTorrent(ctx, hash)
+			_, _ = e.dropTorrent(ctx, hash)
 			continue
 		}
 
