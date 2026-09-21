@@ -47,8 +47,12 @@ func EnsureSectionRoots(sourcePath string) error {
 	for _, section := range []Section{SectionMusic, SectionAudiobooks} {
 		root := filepath.Join(sourcePath, string(section))
 		// Mkdir rather than MkdirAll: an existing root keeps its own mode and
-		// contents, and only the one missing level is ever created.
-		if err := os.Mkdir(root, 0755); err != nil {
+		// contents, and only the one missing level is ever created. A new root
+		// takes the source tree's owner, like every other directory Tiramisu makes.
+		err := os.Mkdir(root, 0755)
+		if err == nil {
+			chownPath(root)
+		} else {
 			if !errors.Is(err, os.ErrExist) {
 				return err
 			}
