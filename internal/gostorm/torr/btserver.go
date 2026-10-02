@@ -35,6 +35,11 @@ type BTServer struct {
 	tickerStop chan struct{}
 
 	mu sync.Mutex
+
+	// dropMu serialises "check the client still holds it, then Drop" across wrappers:
+	// two *Torrent for the same hash have different muTorrent, and an unguarded
+	// second Drop panics with "no such torrent".
+	dropMu sync.Mutex
 }
 
 var privateIPBlocks []*net.IPNet
@@ -331,7 +336,10 @@ func (bt *BTServer) configure(ctx context.Context) {
 		}
 	}
 	if bt.config.PublicIp4 == nil {
-		bt.config.PublicIp4, err = publicip.Get4(ctx)
+		// Bound the lookup: an unreachable public-ip service must not stall startup.
+		ipCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		bt.config.PublicIp4, err = publicip.Get4(ipCtx)
+		cancel()
 		if err != nil {
 			log.Printf("error getting public ipv4 address: %v", err)
 		}
@@ -350,7 +358,10 @@ func (bt *BTServer) configure(ctx context.Context) {
 		}
 	}
 	if bt.config.PublicIp6 == nil && settings.BTsets.EnableIPv6 {
-		bt.config.PublicIp6, err = publicip.Get6(ctx)
+		// Bound the lookup: an unreachable public-ip service must not stall startup.
+		ipCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		bt.config.PublicIp6, err = publicip.Get6(ipCtx)
+		cancel()
 		if err != nil {
 			log.Printf("error getting public ipv6 address: %v", err)
 		}

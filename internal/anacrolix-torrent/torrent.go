@@ -1241,6 +1241,15 @@ const (
 	hedgeNoBaselineCeiling = 4 * time.Second
 )
 
+// hedgeThreshold is how long a request may stay unanswered before it is hedged: the measured p95
+// when there is one, even above the ceiling (spec §3 decision 1), otherwise the stateless ceiling.
+func hedgeThreshold(p95 time.Duration, ok bool) (time.Duration, string) {
+	if ok {
+		return p95, "p95"
+	}
+	return hedgeNoBaselineCeiling, "ceiling"
+}
+
 // hedgeWatchdog periodically scans in-flight requests within whichever region is currently
 // active (warmup, or playback pressure - see SetWarmupActive/SetPlaybackPressure) and fires a
 // duplicate request to a next-best peer for any exceeding the observed p95 for its size (or the
@@ -1344,16 +1353,8 @@ func (t *Torrent) checkAndFireHedges() {
 		if pieceIdx < begin || pieceIdx >= end {
 			continue // outside the warmed file's piece range - not a warmup-region request
 		}
-		threshold, ok := t.warmupP95(int64(req.Length))
-		trigger := "p95"
-		if !ok {
-			// No trustworthy latency baseline (dead-swarm cold start, or resumed torrent
-			// whose warmup never ran): fall back to the stateless absolute ceiling.
-			// Deliberately NOT a clamp - when p95 exists it always wins, even above the
-			// ceiling (see spec §3 decision 1).
-			threshold = hedgeNoBaselineCeiling
-			trigger = "ceiling"
-		}
+		p95, ok := t.warmupP95(int64(req.Length))
+		threshold, trigger := hedgeThreshold(p95, ok)
 		if now.Sub(rs.when) < threshold {
 			continue
 		}
@@ -2077,7 +2078,13 @@ func (t *Torrent) updatePiecePriorityNoTriggers(piece pieceIndex) (pendingChange
 }
 
 func (t *Torrent) updatePiecePriority(piece pieceIndex, reason string) {
-	if t.updatePiecePriorityNoTriggers(piece) && !t.disableTriggers {
+	changed := t.updatePiecePriorityNoTriggers(piece)
+	if changed && !t._pendingPieces.Contains(uint32(piece)) {
+		// Nothing wants the piece any more (the reader moved away): its outstanding requests only
+		// fill the peers' pipelines, delaying the pieces now wanted by a whole queue drain.
+		t.cancelRequestsForPiece(piece)
+	}
+	if changed && !t.disableTriggers {
 		t.onPiecePendingTriggers(piece, reason)
 	}
 	t.updatePieceRequestOrderPiece(piece)
@@ -2554,10 +2561,10 @@ func (t *Torrent) startScrapingTracker(_url string) {
 		return
 	}
 	if u.Scheme == "udp" {
-		u.Scheme = "udp4"
-		t.startScrapingTracker(u.String())
-		u.Scheme = "udp6"
-		t.startScrapingTracker(u.String())
+		for _, scheme := range udpTrackerSchemes(u.Hostname()) {
+			u.Scheme = scheme
+			t.startScrapingTracker(u.String())
+		}
 		return
 	}
 	if _, ok := t.trackerAnnouncers[_url]; ok {
@@ -2594,6 +2601,21 @@ func (t *Torrent) startScrapingTracker(_url string) {
 		t.trackerAnnouncers = make(map[string]torrentTrackerAnnouncer)
 	}
 	t.trackerAnnouncers[_url] = sl
+}
+
+// udpTrackerSchemes lists the address families a udp tracker is announced over. A host name
+// may resolve to either family, so it gets both; an IP literal belongs to one, and an announcer
+// for the other would fail on every attempt with "no acceptable ips".
+func udpTrackerSchemes(host string) []string {
+	ip := net.ParseIP(host)
+	switch {
+	case ip == nil:
+		return []string{"udp4", "udp6"}
+	case ip.To4() != nil:
+		return []string{"udp4"}
+	default:
+		return []string{"udp6"}
+	}
 }
 
 // Adds and starts tracker scrapers for tracker URLs that aren't already
@@ -3861,13 +3883,14 @@ func (t *Torrent) Announce() {
 // AnnounceTracked forces a tracker announce for all trackers and reports the aggregate
 // result once every announce has returned: peers is the sum of the tracker responses, errs
 // counts the announces that failed, total is the number of trackers announced to, and
-// failures carries one "url: error" entry per failed announce. onDone runs on a separate
-// goroutine and may be nil.
+// failures carries one "url: error" entry per failed announce. Trackers still backing off a
+// failure are skipped and not counted. onDone runs on a separate goroutine and may be nil.
 func (t *Torrent) AnnounceTracked(onDone func(peers, errs, total int, failures []string)) {
 	t.cl.lock()
+	now := time.Now()
 	scrapers := make([]*trackerScraper, 0, len(t.trackerAnnouncers))
 	for _, ta := range t.trackerAnnouncers {
-		if ts, ok := ta.(*trackerScraper); ok {
+		if ts, ok := ta.(*trackerScraper); ok && ts.retryDue(now) {
 			scrapers = append(scrapers, ts)
 		}
 	}

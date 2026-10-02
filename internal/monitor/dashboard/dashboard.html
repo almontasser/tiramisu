@@ -47,7 +47,6 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
         <span style="width:16px;height:7px;border-radius:3px;background:rgba(234,179,8,0.50);display:inline-block;flex-shrink:0"></span>Strict Mode
       </span>
       <span class="text-[10px] text-slate-500">Banned Peers: <span id="v304BannedPeers">0</span> / Blocked List: <span id="ipBlocklistIPs" title="distinct addresses rejected">0</span></span>
-      <span class="text-[10px] text-slate-500">Audio Library: <span id="audioNamespaceState" title="committed audio namespace readiness">—</span> (<span id="audioNamespaceEntries">0</span>)</span>
     </div>
   </div>
   <div class="glass rounded-xl p-4">
@@ -143,6 +142,7 @@ body{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);min-height:100vh
         <option value="movies-sync">movies-sync</option>
         <option value="tv-sync">tv-sync</option>
         <option value="watchlist-sync">watchlist-sync</option>
+        <option value="music-sync">music-sync</option>
       </select>
     </div>
     <div id="logView" class="bg-slate-900/80 rounded-lg p-3 max-h-48 overflow-y-auto text-xs font-mono text-slate-400">
@@ -282,10 +282,6 @@ async function load(){
     document.getElementById('fuseBudget').textContent=h.fuse_budget_mb.toFixed(0)+' MB budget';
     document.getElementById('cacheHitRatePct').textContent=(h.cache_hit_rate_pct==null)?'—':h.cache_hit_rate_pct.toFixed(1)+'%';
     document.getElementById('v304BannedPeers').textContent=h.v304_banned_peers ?? 0;
-    const ans=document.getElementById('audioNamespaceState');
-    ans.textContent=h.audio_namespace_state ?? '—';
-    ans.className=h.audio_namespace_state==='Ready'?'text-emerald-400':(h.audio_namespace_state==='Failed'?'text-red-400':'text-amber-400');
-    document.getElementById('audioNamespaceEntries').textContent=h.audio_namespace_entries ?? 0;
     const ipk=document.getElementById('ipBlocklistIPs');
     ipk.textContent=h.ip_blocklist_ips ?? 0;
     ipk.title=`${h.ip_blocklist_ips ?? 0} distinct addresses, ${h.ip_blocklist_rejections ?? 0} rejections`;
@@ -342,7 +338,9 @@ async function load(){
     const sr=await fetch('/api/scheduler/status');
     if(sr.ok){
       const sched=await sr.json();const el=document.getElementById('scheduler');
-      const jobs=Object.entries(sched);
+      const order=['movies','tv','watchlist','music'];
+      const rank=n=>{const i=order.indexOf(n);return i<0?order.length:i;};
+      const jobs=Object.entries(sched).sort(([a],[b])=>rank(a)-rank(b));
       if(!jobs.length){el.innerHTML='<div class="text-slate-500 text-sm">No jobs configured</div>';return;}
       el.innerHTML=jobs.map(([name,st])=>{
         const running=st.running;

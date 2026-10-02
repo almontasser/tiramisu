@@ -59,6 +59,7 @@ type SchedulerConfig struct {
 	MoviesSync    DailyJobConfig
 	TVSync        DailyJobConfig
 	AnimeSync     DailyJobConfig
+	MusicSync     DailyJobConfig
 	WatchlistSync WatchlistSyncConfig
 }
 
@@ -228,6 +229,8 @@ func jobConfig(cfg SchedulerConfig, name string) (DailyJobConfig, bool) {
 		return cfg.TVSync, true
 	case "anime":
 		return cfg.AnimeSync, true
+	case "music":
+		return cfg.MusicSync, true
 	case "watchlist":
 		return DailyJobConfig{Enabled: cfg.WatchlistSync.Enabled, IntervalHours: cfg.WatchlistSync.IntervalHours}, true
 	}

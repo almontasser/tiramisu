@@ -67,6 +67,9 @@ type Config struct {
 	MediaServer  MediaServer
 	MovieSection int
 	TVSection    int
+	// MusicSection is the music library id: an audio add or removal is invisible to
+	// the media server until it rescans, like a stub. 0 leaves Plex alone.
+	MusicSection int
 	// RefreshDelay is how long refreshes are coalesced for; 0 means the default.
 	RefreshDelay time.Duration
 	// AudioRegistry, when set, is asked whether an audio projection still
@@ -90,6 +93,9 @@ type Config struct {
 	// UnpublishAudioPath, when set, drops a removed projection from the namespace the
 	// VFS dispatches on, before its stub is unlinked.
 	UnpublishAudioPath func(AudioProjection)
+	// ActiveSession, when set, reports whether a hash has an open playback session.
+	// The list exposes it so a reaper can skip an album that is being listened to.
+	ActiveSession func(hash string) bool
 }
 
 // Manager adds and removes library entries on behalf of external clients: it does what
@@ -151,6 +157,9 @@ type AddRequest struct {
 	FirstAirDate string `json:"first_air_date"`
 	// FileIndex picks one file inside the torrent; 0 means the largest video file.
 	FileIndex int `json:"file_index"`
+	// TorrentFile is the release's .torrent (base64 in JSON), when the caller fetched
+	// one: the engine gets the metadata at once and keeps the file's own trackers.
+	TorrentFile []byte `json:"torrent_file,omitempty"`
 	// QualityScore is stored in the TV registry. Left at 0, the next TV sync is free
 	// to replace the episode with any release it scores above zero.
 	QualityScore int `json:"quality_score"`
@@ -183,11 +192,17 @@ type RemoveRequest struct {
 	// and may omit it.
 	Type string `json:"type"`
 	Path string `json:"path"`
-	Hash string `json:"hash"`
+	// Prefix removes every projection under a section-relative album prefix. Path
+	// and Prefix are mutually exclusive.
+	Prefix string `json:"prefix"`
+	Hash   string `json:"hash"`
 	// Blacklist keeps the release out: without it the sync engines are free to add the
 	// title back on their next run, which is what you want when removing to upgrade
 	// and not what you want when removing for good.
 	Blacklist bool `json:"blacklist"`
+	// DropTorrent (audio only) also removes the torrent and its failure counter once
+	// no projection or stub references it; audio removal otherwise leaves it in place.
+	DropTorrent bool `json:"drop_torrent"`
 }
 
 // Gap is an episode removed because its release died and nothing live replaced it.
@@ -261,11 +276,13 @@ func cleanupCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 }
 
-func (m *Manager) dropTorrent(ctx context.Context, hash string) {
+// dropTorrent reports whether the engine removed the torrent.
+func (m *Manager) dropTorrent(ctx context.Context, hash string) bool {
 	cctx, cancel := cleanupCtx(ctx)
 	defer cancel()
-	if err := m.cfg.GoStorm.RemoveTorrent(cctx, hash); err != nil {
-		m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot remove torrent %s: %v", hash, err)
+	removeErr := m.cfg.GoStorm.RemoveTorrent(cctx, hash)
+	if removeErr != nil {
+		m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot remove torrent %s: %v", hash, removeErr)
 	}
 	// The failure counter outlives the torrent otherwise: the same release added again
 	// later would arrive already condemned, and the reaper would drop it on sight.
@@ -274,6 +291,7 @@ func (m *Manager) dropTorrent(ctx context.Context, hash string) {
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot clear the failure counter for %s: %v", hash, err)
 		}
 	}
+	return removeErr == nil
 }
 
 // Add registers the torrent with GoStorm, waits for its file list, and writes the stub
@@ -335,12 +353,17 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 		return &AddResponse{Hash: hash, Title: req.Title, Type: kind, Files: existing, AlreadyPresent: true}, nil
 	}
 
+	file, err := releaseFile(req.TorrentFile, hash)
+	if err != nil {
+		return nil, err
+	}
 	magnet := req.Magnet
 	if magnet == "" {
-		magnet = BuildMagnet(hash, req.Title, DefaultTrackers())
+		magnet = BuildMagnet(hash, req.Title, MergeTrackers(DefaultTrackers(), file.Trackers))
 	}
 
 	requestedHash := hash
+	m.uploadReleaseFile(ctx, file, req.Title)
 	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, req.Title)
 	if err != nil || addedHash == "" {
 		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
@@ -782,17 +805,18 @@ func (m *Manager) deleteStub(_ context.Context, path string) error {
 // which holds that lock across the whole metadata wait with its stub not yet written,
 // would look absent here and end up registered against a torrent this call had just
 // removed; two concurrent Removes would both see the last stub gone and drop twice.
-func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) {
+// It reports whether the torrent was dropped.
+func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) bool {
 	// A stub that carries no hash identifies no torrent: findByHash would match on a
 	// bare "_.mkv" suffix and the engine would be asked to remove the empty hash.
 	if hash == "" {
-		return
+		return false
 	}
 	// Never wait: whoever holds this hash is adding that same release right now, so
 	// either it needs the torrent or its own cleanup will drop it.
 	unlock, ok := m.hashLocks.TryLock(hash)
 	if !ok {
-		return
+		return false
 	}
 	defer unlock()
 
@@ -800,10 +824,10 @@ func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) {
 		found, err := m.findByHash(kind, hash)
 		if err != nil {
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: keeping torrent %s, cannot check its stubs: %v", hash, err)
-			return
+			return false
 		}
 		if len(found) > 0 {
-			return
+			return false
 		}
 	}
 	// Audio lives in the projection registry, not as a stub under the media
@@ -814,13 +838,13 @@ func (m *Manager) dropTorrentIfUnused(ctx context.Context, hash string) {
 		referenced, err := m.cfg.AudioRegistry.AudioHashReferenced(hash)
 		if err != nil {
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: keeping torrent %s, cannot check its audio projections: %v", hash, err)
-			return
+			return false
 		}
 		if referenced {
-			return
+			return false
 		}
 	}
-	m.dropTorrent(ctx, hash)
+	return m.dropTorrent(ctx, hash)
 }
 
 // pickFileForEpisode prefers the file whose name carries the requested episode number;
@@ -861,6 +885,15 @@ func (m *Manager) pickFileForEpisode(req AddRequest, files []FileStat) (*FileSta
 			"the torrent's only episode file is %s, not S%02dE%02d", filepath.Base(only.Path), req.Season, req.Episode)
 	}
 	return only, nil
+}
+
+// audioSection is the media server library of an audio section; audiobooks have
+// no configured id yet.
+func (m *Manager) audioSection(s Section) int {
+	if s == SectionMusic {
+		return m.cfg.MusicSection
+	}
+	return 0
 }
 
 func (m *Manager) section(kind string) int {

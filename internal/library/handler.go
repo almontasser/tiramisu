@@ -104,6 +104,24 @@ func (h *Handler) Remove(w http.ResponseWriter, r *http.Request) {
 	}
 	// Audio first, falling through on the routing sentinel so every video request
 	// reaches the legacy path unchanged.
+	if section, canonical := SectionForType(req.Type); canonical && IsAudioSection(section) {
+		switch {
+		case req.Path != "" && req.Prefix != "":
+			writeError(w, http.StatusBadRequest, "path and prefix are mutually exclusive")
+			return
+		case req.Path == "" && req.Prefix == "":
+			writeError(w, http.StatusBadRequest, "path or prefix is required")
+			return
+		case req.Prefix != "":
+			audio, err := h.mgr.RemoveAudioPrefix(r.Context(), req)
+			if err != nil {
+				writeAPIError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, audio)
+			return
+		}
+	}
 	if audio, err := h.mgr.RemoveAudio(r.Context(), req); !errors.Is(err, ErrRequestNotAudio) {
 		if err != nil {
 			writeAPIError(w, err)
@@ -201,10 +219,11 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		// A non-numeric limit falls back to the bounded default rather than failing.
 		limit, _ := strconv.Atoi(query.Get("limit"))
 		audio, err := h.mgr.ListAudio(AudioListRequest{
-			Type:   query.Get("type"),
-			Prefix: query.Get("prefix"),
-			Limit:  limit,
-			Cursor: query.Get("cursor"),
+			Type:         query.Get("type"),
+			Prefix:       query.Get("prefix"),
+			Limit:        limit,
+			Cursor:       query.Get("cursor"),
+			WithFailures: query.Get("failures") == "1",
 		})
 		if err != nil {
 			writeAPIError(w, err)

@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"tiramisu/internal/catalog"
+	"tiramisu/internal/library"
 )
 
 const (
@@ -39,7 +42,9 @@ func NewClient(cfg ConfigProwlarr) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			// Slightly above searchTimeout: the per-call deadline must fire first, or
+			// every slow search would be retried up to three times by catalog.Do.
+			Timeout: searchTimeout + 5*time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        10,
 				MaxIdleConnsPerHost: 5,
@@ -205,7 +210,107 @@ func (c *Client) fetchFromProwlarrStatus(imdbID, contentType, title string, year
 	return merged, failures > 0, nil
 }
 
-// queryCtx executes a single Prowlarr API GET request, respecting context cancellation.
+// SearchOptions narrows one free-text search.
+type SearchOptions struct {
+	Categories []int
+	IndexerIDs []int
+}
+
+// SearchWithOptions runs one free-text query with the given narrowing. The whole
+// call is bounded by searchTimeout, so a stalled indexer cannot hold a caller for
+// the retries catalog.Do would otherwise stack on top of it.
+func (c *Client) SearchWithOptions(ctx context.Context, query string, opts SearchOptions) ([]ProwlarrResult, error) {
+	if c == nil {
+		return nil, fmt.Errorf("prowlarr: client is disabled")
+	}
+	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
+	defer cancel()
+
+	params := map[string]string{
+		"apikey": c.cfg.APIKey,
+		"type":   "search",
+		"query":  query,
+		"limit":  "100",
+	}
+	if len(opts.Categories) > 0 {
+		params["categories"] = joinInts(opts.Categories)
+	}
+	if len(opts.IndexerIDs) > 0 {
+		params["indexerIds"] = joinInts(opts.IndexerIDs)
+	}
+	return c.queryCtx(ctx, params)
+}
+
+// Search runs one free-text query and returns the raw results. It is the generic
+// entry point for callers whose query is not an IMDb id, such as the music importer.
+// categories, when non-empty, restricts the search to those indexer category ids.
+func (c *Client) Search(ctx context.Context, query string, categories ...int) ([]ProwlarrResult, error) {
+	return c.SearchWithOptions(ctx, query, SearchOptions{Categories: categories})
+}
+
+func joinInts(values []int) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, strconv.Itoa(value))
+	}
+	return strings.Join(parts, ",")
+}
+
+// ResolveHash follows a result's download link to its magnet and returns the info
+// hash. Indexers like RuTracker expose no hash in the search response, only this
+// link, so callers that gate on the hash resolve it here.
+func (c *Client) ResolveHash(downloadURL string) string {
+	if c == nil || strings.TrimSpace(downloadURL) == "" {
+		return ""
+	}
+	return c.resolveHashFromDownloadURL(downloadURL)
+}
+
+// maxTorrentBytes bounds a .torrent download: real ones are a few hundred KB.
+const maxTorrentBytes = 8 << 20
+
+// FetchTorrent fetches the release a download link points to: a .torrent (an indexer
+// logged in with the user's account serves one, with their passkey tracker and the
+// metadata) or a redirect to a magnet (its trackers). Called for the release a sync
+// picks, never for every result.
+func (c *Client) FetchTorrent(ctx context.Context, downloadURL string) (library.TorrentSource, error) {
+	if c == nil || strings.TrimSpace(downloadURL) == "" {
+		return library.TorrentSource{}, fmt.Errorf("no download link")
+	}
+	ctx, cancel := context.WithTimeout(ctx, resolveHashTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	if err != nil {
+		return library.TorrentSource{}, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	noRedirect := &http.Client{
+		Timeout:       resolveHashTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return library.TorrentSource{}, fmt.Errorf("fetch release: %s", library.RedactSecrets(err.Error()))
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound:
+		return library.ParseMagnetSource(resp.Header.Get("Location"))
+	case resp.StatusCode == http.StatusOK:
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxTorrentBytes+1))
+		if err != nil {
+			return library.TorrentSource{}, err
+		}
+		if len(data) > maxTorrentBytes {
+			return library.TorrentSource{}, fmt.Errorf("release file larger than %d bytes", maxTorrentBytes)
+		}
+		return library.ParseTorrentFile(data)
+	default:
+		return library.TorrentSource{}, fmt.Errorf("fetch release: status %d", resp.StatusCode)
+	}
+}
+
+// queryCtx runs one Prowlarr search and returns the raw results.
 func (c *Client) queryCtx(ctx context.Context, params map[string]string) ([]ProwlarrResult, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.searchURL, nil)
 	if err != nil {
@@ -263,6 +368,7 @@ func (c *Client) toStream(res ProwlarrResult) Stream {
 			res.Title, res.Seeders, res.Leechers, sizeGB),
 		InfoHash:      res.InfoHash,
 		SizeGB:        sizeGB,
+		DownloadURL:   res.DownloadUrl,
 		BehaviorHints: BehaviorHints{BingeGroup: fmt.Sprintf("prowlarr-%s", resTag)},
 	}
 }

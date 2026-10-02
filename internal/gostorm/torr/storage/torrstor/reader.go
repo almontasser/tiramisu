@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -24,7 +25,11 @@ type Reader struct {
 	///Preload
 	lastAccess int64
 	isUse      bool
-	mu         sync.Mutex
+	// inFlight counts reads and seeks inside the underlying reader; guarded by mu. readerOff
+	// must not park a reader while one is in flight: the park seeks the anacrolix reader to the
+	// head, which moves the read itself. Backported from TorrServer 9b3ceff0.
+	inFlight int
+	mu       sync.Mutex
 
 	// Deadline-first scheduling state (deadline.go). Guarded by mu.
 	deadlineBytes  int64
@@ -71,7 +76,8 @@ func (r *Reader) Seek(offset int64, whence int) (n int64, err error) {
 	}
 	r.mu.Unlock()
 
-	r.readerOn()
+	r.beginIO()
+	defer r.endIO()
 	n, err = r.Reader.Seek(offset, whence)
 
 	r.mu.Lock()
@@ -93,7 +99,8 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	r.mu.Unlock()
 
 	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
-		r.readerOn()
+		r.beginIO()
+		defer r.endIO()
 		n, err = r.Reader.Read(p)
 
 		r.mu.Lock()
@@ -120,7 +127,8 @@ func (r *Reader) ReadContext(ctx context.Context, p []byte) (n int, err error) {
 	r.mu.Unlock()
 
 	if r.file.Torrent() != nil && r.file.Torrent().Info() != nil {
-		r.readerOn()
+		r.beginIO()
+		defer r.endIO()
 		n, err = r.Reader.ReadContext(ctx, p)
 
 		r.mu.Lock()
@@ -145,7 +153,7 @@ func (r *Reader) SetReadahead(length int64) {
 	if r.isUse {
 		r.Reader.SetReadahead(length)
 	}
-	r.readahead = length
+	atomic.StoreInt64(&r.readahead, length) // AdjustRA writes it without mu
 }
 
 func (r *Reader) Offset() int64 {
@@ -155,7 +163,7 @@ func (r *Reader) Offset() int64 {
 }
 
 func (r *Reader) Readahead() int64 {
-	return r.readahead
+	return atomic.LoadInt64(&r.readahead)
 }
 
 func (r *Reader) Close() {
@@ -176,6 +184,9 @@ func (r *Reader) Close() {
 		r.Reader.Close()
 	}
 	safeGo(func() {
+		// Serialised with cleanPieces: both rebuild the shared pieceInRange bitmap.
+		r.cache.muRemove.Lock()
+		defer r.cache.muRemove.Unlock()
 		r.cache.getRemPieces()
 	})
 }
@@ -194,7 +205,7 @@ func (r *Reader) getReaderPiece() int {
 func (r *Reader) getReaderRAHPiece() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.getPieceNum(r.offset + r.readahead)
+	return r.getPieceNum(r.offset + atomic.LoadInt64(&r.readahead))
 }
 
 func (r *Reader) getPieceNum(offset int64) int {
@@ -247,12 +258,36 @@ func (r *Reader) checkReader() {
 func (r *Reader) readerOn() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.resume()
+}
+
+// beginIO claims the reader for one read or seek and resumes it if the idle sweep parked it.
+// Registering under mu is what keeps readerOff from parking it until endIO.
+func (r *Reader) beginIO() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Resume before registering the IO: a panic inside resume must not leave inFlight set, which
+	// would make readerOff refuse to park this reader for the rest of the session.
+	r.resume()
+	r.inFlight++
+}
+
+func (r *Reader) endIO() {
+	r.mu.Lock()
+	r.inFlight--
+	r.mu.Unlock()
+}
+
+// resume must be called with mu held.
+func (r *Reader) resume() {
 	if !r.isUse {
 		if pos, err := r.Reader.Seek(0, io.SeekCurrent); err == nil && pos == 0 {
 			r.Reader.Seek(r.offset, io.SeekStart)
 		}
-		r.SetReadahead(r.readahead)
+		// Mark in use before restoring readahead: SetReadahead only propagates while in use, so
+		// restoring it in the other order leaves the underlying reader parked at zero.
 		r.isUse = true
+		r.SetReadahead(atomic.LoadInt64(&r.readahead))
 		r.cache.activeReaders.Add(1)
 	}
 }
@@ -260,8 +295,15 @@ func (r *Reader) readerOn() {
 func (r *Reader) readerOff() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// lastAccess is stamped only when a read returns, so a read blocked on the swarm makes a
+	// busy reader look idle; seeking the anacrolix reader under it moves that read.
+	if r.inFlight > 0 {
+		return
+	}
 	if r.isUse {
-		r.SetReadahead(0)
+		// Park the underlying reader without erasing the desired readahead: SetReadahead(0) would
+		// zero r.readahead too, and resume would then restore nothing.
+		r.Reader.SetReadahead(0)
 		r.isUse = false
 		r.cache.activeReaders.Add(-1)
 		if r.offset > 0 {

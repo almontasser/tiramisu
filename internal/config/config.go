@@ -40,6 +40,83 @@ type WatchlistSyncConfig struct {
 	IntervalHours int  `json:"interval_hours"` // 1,2,3,4,6,8,12,24
 }
 
+// MusicDiscoveryConfig holds the weekly discovery knobs: seed thresholds, the
+// ListenBrainz window and the import pacing. Defaults live in LoadConfig.
+type MusicDiscoveryConfig struct {
+	Mode                   string `json:"mode"` // easy|medium|hard
+	MaxSimilarArtists      int    `json:"max_similar_artists"`
+	MaxRecordingsPerArtist int    `json:"max_recordings_per_artist"`
+	PopBegin               int    `json:"pop_begin"`
+	PopEnd                 int    `json:"pop_end"`
+	MinListenCount         int    `json:"min_listen_count"`
+	SeedsCount             int    `json:"seeds_count"`
+	SeedsMinPlays          int    `json:"seeds_min_plays"`
+	SeedsWindowsDays       []int  `json:"seeds_windows_days"` // ordered, 0 = all-time
+	// SeedsRecencyDays, when set, replaces the windows: ascending age tiers, a play
+	// weighing 1 in the first and half as much in each next one, nothing past the last.
+	SeedsRecencyDays   []int    `json:"seeds_recency_days"`
+	AlbumTypes         []string `json:"album_types"`
+	MaxAlbumsPerRun    int      `json:"max_albums_per_run"`
+	MaxAlbumsPerArtist int      `json:"max_albums_per_artist"`
+	MinSeeders         int      `json:"min_seeders"`
+	MaxSizeGB          float64  `json:"max_size_gb"`
+	PaceSeconds        int      `json:"pace_seconds"`
+	MaxAttempts        int      `json:"max_attempts"`
+	// NewReleases follows the library's artists: their albums released in the last
+	// WindowDays are imported with no cap, independent of the listening discovery.
+	NewReleases MusicNewReleasesConfig `json:"new_releases"`
+	// NewArtists imports the recent albums of artists you do not have whose nearest
+	// artists you do, debut within DebutYears. Shares max_albums_per_run with the
+	// similar-artist pass, and goes first.
+	NewArtists MusicNewArtistsConfig `json:"new_artists"`
+	// Genres imports niche artists of the genres you listen to now, close to your
+	// artists, debut within DebutYears. Shares max_albums_per_run.
+	Genres MusicGenresConfig `json:"genres"`
+	// Similar tunes the similarity pass, read from Deezer's related artists.
+	Similar MusicSimilarConfig `json:"similar"`
+}
+
+type MusicSimilarConfig struct {
+	MinFans    int `json:"min_fans"`    // 0 = no floor
+	MaxFans    int `json:"max_fans"`    // 0 = no limit
+	DebutYears int `json:"debut_years"` // 0 = any age
+}
+
+type MusicGenresConfig struct {
+	Enabled    bool `json:"enabled"`
+	Count      int  `json:"count"`
+	DebutYears int  `json:"debut_years"`
+}
+
+type MusicNewArtistsConfig struct {
+	Enabled    bool `json:"enabled"`
+	WindowDays int  `json:"window_days"` // at most 90
+	DebutYears int  `json:"debut_years"`
+}
+
+type MusicNewReleasesConfig struct {
+	Enabled    bool `json:"enabled"`
+	WindowDays int  `json:"window_days"`
+}
+
+// DefaultMusicDiscovery is the music discovery config a fresh install runs with; the
+// preview tool starts from it too, so the two cannot drift.
+func DefaultMusicDiscovery() MusicDiscoveryConfig {
+	return MusicDiscoveryConfig{
+		// hard reaches similarity ranks 10-100, past the famous peers every seed shares.
+		Mode: "hard", MaxSimilarArtists: 9, MaxRecordingsPerArtist: 3,
+		PopBegin: 10, PopEnd: 60, MinListenCount: 50,
+		SeedsCount: 20, SeedsMinPlays: 3, SeedsWindowsDays: []int{7, 30, 90, 365, 0}, SeedsRecencyDays: []int{1, 7, 30, 60},
+		AlbumTypes:      []string{"Album", "EP"},
+		MaxAlbumsPerRun: 20, MaxAlbumsPerArtist: 1,
+		MinSeeders: 5, MaxSizeGB: 3, PaceSeconds: 10, MaxAttempts: 3,
+		NewReleases: MusicNewReleasesConfig{Enabled: true, WindowDays: 30},
+		NewArtists:  MusicNewArtistsConfig{Enabled: true, WindowDays: 30, DebutYears: 3},
+		Genres:      MusicGenresConfig{Enabled: true, Count: 8, DebutYears: 15},
+		Similar:     MusicSimilarConfig{MinFans: 10000, MaxFans: 100000, DebutYears: 15},
+	}
+}
+
 type SchedulerConfig struct {
 	Enabled    bool           `json:"enabled"`
 	MoviesSync DailyJobConfig `json:"movies_sync"`
@@ -48,6 +125,7 @@ type SchedulerConfig struct {
 	// TV job leaves anime out; while it is not, the TV job covers both, as
 	// upstream does.
 	AnimeSync     DailyJobConfig      `json:"anime_sync"`
+	MusicSync     DailyJobConfig      `json:"music_sync"`
 	WatchlistSync WatchlistSyncConfig `json:"watchlist_sync"`
 }
 
@@ -254,10 +332,11 @@ type Config struct {
 
 	// --- External Services (V1.4.6) ---
 	Plex struct {
-		URL         string `json:"url"`
-		Token       string `json:"token"`
-		LibraryID   int    `json:"library_id"`
-		TVLibraryID int    `json:"tv_library_id"`
+		URL            string `json:"url"`
+		Token          string `json:"token"`
+		LibraryID      int    `json:"library_id"`
+		TVLibraryID    int    `json:"tv_library_id"`
+		MusicLibraryID int    `json:"music_library_id"`
 	} `json:"plex"`
 	TMDBAPIKey   string `json:"tmdb_api_key"`
 	TorrentioURL string `json:"torrentio_url"` // Torrentio base URL (used when Prowlarr is disabled)
@@ -267,6 +346,9 @@ type Config struct {
 
 	// --- Built-in Sync Scheduler ---
 	Scheduler SchedulerConfig `json:"scheduler"`
+
+	// --- Music Discovery (weekly sync) ---
+	MusicDiscovery MusicDiscoveryConfig `json:"music_discovery"`
 
 	// --- Media Server ---
 	MediaServerType string `json:"media_server_type"` // "plex" | "jellyfin"
@@ -395,8 +477,11 @@ func LoadConfig() Config {
 			MoviesSync:    DailyJobConfig{Enabled: true, DaysOfWeek: []int{1, 4}, Hour: 3, Minute: 0},
 			TVSync:        DailyJobConfig{Enabled: true, DaysOfWeek: []int{3, 5}, Hour: 4, Minute: 0},
 			AnimeSync:     DailyJobConfig{Enabled: false, DaysOfWeek: []int{3, 5}, Hour: 5, Minute: 0},
+			MusicSync:     DailyJobConfig{Enabled: true, DaysOfWeek: []int{0}, Hour: 15, Minute: 0},
 			WatchlistSync: WatchlistSyncConfig{Enabled: true, IntervalHours: 1},
 		},
+
+		MusicDiscovery: DefaultMusicDiscovery(),
 
 		TorrentioURL:     "https://torrentio.strem.fun",
 		TVMaxSeasons:     0,

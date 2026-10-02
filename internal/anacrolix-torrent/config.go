@@ -31,6 +31,43 @@ type ClientTrackerConfig struct {
 	// Takes a tracker's hostname and requests DNS A and AAAA records.
 	// Used in case DNS lookups require a special setup (i.e., dns-over-https)
 	LookupTrackerIp func(*url.URL) ([]net.IP, error)
+	// How long to wait before retrying an announce that failed. Each further consecutive failure
+	// doubles the wait, up to FailedAnnounceMaxInterval. A tracker that has gone away is retried
+	// forever, so without a growing interval every torrent keeps knocking at this rate.
+	FailedAnnounceMinInterval time.Duration
+	// The cap on the doubling described above. Set it to FailedAnnounceMinInterval to retry at a
+	// constant interval.
+	FailedAnnounceMaxInterval time.Duration
+}
+
+// Backported from anacrolix/torrent upstream (4aea1d64b, #1116).
+const (
+	defaultFailedAnnounceMinInterval = time.Minute
+	defaultFailedAnnounceMaxInterval = 30 * time.Minute
+)
+
+// failedAnnounceInterval is how long to wait after an announce that failed, given how many
+// consecutive failures there have been (1 for the first).
+func (cfg *ClientTrackerConfig) failedAnnounceInterval(consecutiveFailures int) time.Duration {
+	d := cfg.FailedAnnounceMinInterval
+	if d <= 0 {
+		d = defaultFailedAnnounceMinInterval
+	}
+	maxInterval := cfg.FailedAnnounceMaxInterval
+	if maxInterval <= 0 {
+		maxInterval = defaultFailedAnnounceMaxInterval
+	}
+	if maxInterval < d {
+		maxInterval = d
+	}
+	for i := 1; i < consecutiveFailures; i++ {
+		// Checked before doubling, so a huge configured max cannot overflow into a negative wait.
+		if d >= maxInterval/2 {
+			return maxInterval
+		}
+		d *= 2
+	}
+	return d
 }
 
 type ClientDhtConfig struct {
@@ -81,6 +118,35 @@ type ClientConfig struct {
 	DownloadRateLimiter *rate.Limiter
 	// Maximum unverified bytes across all torrents. Not used if zero.
 	MaxUnverifiedBytes int64
+	// Minimum age an outstanding request must reach before another peer may steal it; zero or
+	// negative disables the check. NewDefaultClientConfig sets 250ms (TORRENT_STEAL_REQUEST_GRACE
+	// overrides it). When the holder has a warmed mean request-to-chunk latency, the grace is
+	// that mean clamped to [250ms, 1s] instead of this fixed value (peerStealGrace), so it can
+	// only extend for a slow holder; an urgent request is capped back at the fixed value, never
+	// exempted (a zero grace would re-open the duplicate window). A steal is a Cancel on the wire, and a Cancel that
+	// reaches the holder after it served the block does nothing: the block arrives twice and one
+	// copy is counted as ConnStats.ChunksReadWasted. Backported from upstream 23d8abf90 (#1095).
+	StealRequestGrace time.Duration
+	// AdaptivePipeline sizes each peer's request queue on its minimum request latency instead of
+	// a fixed 2s of data. On by default; TORRENT_ADAPTIVE_PIPELINE=0 disables it for a
+	// comparison run.
+	AdaptivePipeline bool
+	// PeakEwma vetoes a steal when the stealer, at its recent peak request-to-chunk latency and
+	// queue, would not finish the block sooner than the holder (peak-EWMA placement). Off by
+	// default until measured; TORRENT_PEAK_EWMA=1 enables it.
+	PeakEwma bool
+	// Gradient2 sizes each peer's request queue with Netflix's closed-loop Gradient2 limiter
+	// (average-RTT gradient, app-limited aware) instead of the fixed/adaptive target. On by
+	// default; TORRENT_GRADIENT2=0 disables it. It takes precedence over AdaptivePipeline.
+	Gradient2 bool
+	// Gradient2AIMD backs the Gradient2 limit off on a peer Reject of a request it held
+	// (TORRENT_GRADIENT2_AIMD=1). Gradient2Windowed feeds Gradient2 one median per ~1s window
+	// instead of every chunk (TORRENT_GRADIENT2_WINDOWED=1). Both act only with Gradient2 on.
+	Gradient2AIMD     bool
+	Gradient2Windowed bool
+	// RequestReserve lets a request due within 2s exceed a full queue by a reserved quarter of
+	// the limit (TORRENT_REQUEST_RESERVE=1).
+	RequestReserve bool
 
 	// User-provided Client peer ID. If not present, one is generated automatically.
 	PeerID string
@@ -237,6 +303,13 @@ func NewDefaultClientConfig() *ClientConfig {
 		Extensions:             defaultPeerExtensionBytes(),
 		AcceptPeerConnections:  true,
 		MaxUnverifiedBytes:     64 << 20,
+		StealRequestGrace:      stealRequestGraceFromEnv(),
+		AdaptivePipeline:       adaptivePipelineFromEnv(),
+		PeakEwma:               peakEwmaFromEnv(),
+		Gradient2:              gradient2FromEnv(),
+		Gradient2AIMD:          envFlag(gradient2AIMDEnvKey, gradient2AIMDEffective),
+		Gradient2Windowed:      envFlag(gradient2WindowedEnvKey, gradient2WindowedEffective),
+		RequestReserve:         envFlag(requestReserveEnvKey, requestReserveEffective),
 		DialRateLimiter:        rate.NewLimiter(10, 10),
 		PieceHashersPerTorrent: 2,
 	}
@@ -244,6 +317,11 @@ func NewDefaultClientConfig() *ClientConfig {
 		return func() ([]dht.Addr, error) { return dht.GlobalBootstrapAddrs(network) }
 	}
 	cc.PeriodicallyAnnounceTorrentsToDht = true
+	// Gradient2 takes precedence in nominalMaxRequests: report the adaptive pipeline as the
+	// fallback it then is, not as an active lever.
+	if cc.Gradient2 && cc.AdaptivePipeline {
+		adaptivePipelineEffective.Set("superseded by gradient2")
+	}
 	return cc
 }
 

@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"tiramisu/internal/audio/cue"
 )
 
 // InspectRequest identifies a torrent to read the file list of. It selects
@@ -18,6 +21,8 @@ type InspectRequest struct {
 	Magnet       string `json:"magnet"`
 	Title        string `json:"title"`
 	MetadataWait int    `json:"metadata_wait"`
+	// TorrentFile is the release's .torrent (base64 in JSON), as for an add.
+	TorrentFile []byte `json:"torrent_file,omitempty"`
 }
 
 // InspectFile is one source file as the engine sees it. source_path is what a
@@ -31,6 +36,15 @@ type InspectFile struct {
 	Video      bool   `json:"video"`
 	Season     int    `json:"season,omitempty"`
 	Episode    int    `json:"episode,omitempty"`
+}
+
+// InspectCueTrack is one track of a single-file image, as its cue sheet numbers
+// it: a caller adds it with cue_track, like a file of a multi-file release.
+type InspectCueTrack struct {
+	SourcePath string `json:"source_path"`
+	Track      int    `json:"track"`
+	Title      string `json:"title,omitempty"`
+	Performer  string `json:"performer,omitempty"`
 }
 
 // InspectResponse is the torrent's contents plus a guess at how it should be filed.
@@ -56,7 +70,8 @@ type InspectResponse struct {
 	Resolution string `json:"resolution,omitempty"`
 	// Note explains the guess in one line, so the form can show its reasoning
 	// instead of silently changing fields under the user.
-	Note string `json:"note"`
+	Note      string            `json:"note"`
+	CueTracks []InspectCueTrack `json:"cue_tracks"`
 }
 
 var (
@@ -103,8 +118,12 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	if err != nil {
 		return nil, err
 	}
+	file, err := releaseFile(req.TorrentFile, hash)
+	if err != nil {
+		return nil, err
+	}
 	if magnet == "" {
-		magnet = BuildMagnet(hash, title, DefaultTrackers())
+		magnet = BuildMagnet(hash, title, MergeTrackers(DefaultTrackers(), file.Trackers))
 	}
 
 	// Held across ownership, add and cleanup, keyed on the canonical spelling so a
@@ -120,6 +139,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 	}
 	preexisting := known[lockKey]
 
+	m.uploadReleaseFile(ctx, file, title)
 	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, title)
 	if err != nil || addedHash == "" {
 		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
@@ -239,7 +259,45 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 			out.Note = "single feature"
 		}
 	}
+	out.CueTracks = m.inspectCueTracks(ctx, engineHash, info.FileStats)
 	return out, nil
+}
+
+// inspectCueTracks lists the tracks of every FLAC a cue sheet in the torrent
+// describes. Only folders shaped like an image are examined: a per-track rip keeps
+// one cue beside twelve FLACs and has no image to list. A sheet that cannot be read
+// hides nothing but its own tracks: the image stays addable as a whole file.
+func (m *Manager) inspectCueTracks(ctx context.Context, hash string, files []FileStat) []InspectCueTrack {
+	ctx, cancel := context.WithTimeout(ctx, cueSplitTimeout)
+	defer cancel()
+	out := []InspectCueTrack{}
+	dirs := imageDirs(files)
+	var sheets []*cue.Sheet
+	loaded := false
+	for _, f := range files {
+		if !strings.EqualFold(path.Ext(f.Path), ".flac") || !dirs[path.Dir(f.Path)] {
+			continue
+		}
+		if !loaded {
+			sheets, _ = m.cueSheets(ctx, hash, files)
+			loaded = true
+			if len(sheets) == 0 {
+				return out
+			}
+		}
+		sheet, file, ok := matchCueSheet(sheets, files, f.Path)
+		if !ok || len(file.Tracks) < 2 {
+			continue
+		}
+		for _, t := range file.Tracks {
+			performer := t.Performer
+			if performer == "" {
+				performer = sheet.Performer
+			}
+			out = append(out, InspectCueTrack{SourcePath: f.Path, Track: t.Number, Title: t.Title, Performer: performer})
+		}
+	}
+	return out
 }
 
 // knownTorrentHashes snapshots what the engine already holds. A failed listing

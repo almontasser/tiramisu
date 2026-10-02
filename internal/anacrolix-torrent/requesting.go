@@ -23,11 +23,18 @@ type (
 )
 
 func (t *Torrent) requestStrategyPieceOrderState(i int) requestStrategy.PieceRequestOrderState {
+	prio := t.piece(i).purePriority()
+	// A deadline ranks a piece first, and with a storage cap every piece scanned uses up capacity:
+	// on a piece not wanted or already complete it can only starve the pieces actually needed.
+	var deadline int64
+	if prio != PiecePriorityNone && !t.pieceComplete(i) {
+		deadline = t.pieceDeadlines[i]
+	}
 	return requestStrategy.PieceRequestOrderState{
-		Priority:     t.piece(i).purePriority(),
+		Priority:     prio,
 		Partial:      t.piecePartiallyDownloaded(i),
 		Availability: t.piece(i).availability(),
-		Deadline:     t.pieceDeadlines[i],
+		Deadline:     deadline,
 	}
 }
 
@@ -78,6 +85,42 @@ type desiredPeerRequests struct {
 	requestIndexes []RequestIndex
 	peer           *Peer
 	pieceStates    []requestStrategy.PieceRequestOrderState
+	// Chunk under each reader's position, by piece; set once per request update.
+	readerCursors map[pieceIndex]RequestIndex
+}
+
+// readerCursors maps each piece holding a reader position to the chunk at that position. Call
+// with the client lock held: it guards the readers' positions.
+func (t *Torrent) readerCursors() map[pieceIndex]RequestIndex {
+	if len(t.readers) == 0 || !t.haveInfo() {
+		return nil
+	}
+	m := make(map[pieceIndex]RequestIndex, len(t.readers))
+	for r := range t.readers {
+		abs := r.offset + r.pos
+		if abs < 0 || abs >= t.length() {
+			continue
+		}
+		req, ok := t.offsetRequest(abs)
+		if !ok {
+			continue
+		}
+		ri := t.requestIndexFromRequest(req)
+		piece := pieceIndex(req.Index)
+		if cur, ok := m[piece]; !ok || ri < cur {
+			m[piece] = ri
+		}
+	}
+	return m
+}
+
+// chunkRank orders chunks of one piece for a streaming reader: from the reader's position onwards
+// first, then the chunks before it.
+func (p *desiredPeerRequests) chunkRank(piece pieceIndex, r RequestIndex) uint64 {
+	if cur, ok := p.readerCursors[piece]; ok && r < cur {
+		return 1<<32 + uint64(r)
+	}
+	return uint64(r)
 }
 
 func (p *desiredPeerRequests) lessByValue(leftRequest, rightRequest RequestIndex) bool {
@@ -157,6 +200,10 @@ func (p *desiredPeerRequests) lessByValue(leftRequest, rightRequest RequestIndex
 	} else {
 		ml = ml.Int(t.pieceRequestOrder[leftPieceIndex], t.pieceRequestOrder[rightPieceIndex])
 	}
+	// Within a piece, chunks in order from the reader's position: a streaming reader can only use
+	// a contiguous run from there, so a piece filled in arbitrary order serves its first bytes
+	// only when nearly all of it has arrived.
+	ml = ml.Uint64(p.chunkRank(leftPieceIndex, leftRequest), p.chunkRank(rightPieceIndex, rightRequest))
 	return ml.Less()
 }
 
@@ -181,6 +228,7 @@ func (p *Peer) getDesiredRequestState() (desired desiredRequestState) {
 		peer:           p,
 		pieceStates:    t.requestPieceStates,
 		requestIndexes: t.requestIndexes,
+		readerCursors:  t.readerCursors(),
 	}
 	// Caller-provided allocation for roaring bitmap iteration.
 	var it typedRoaring.Iterator[RequestIndex]
@@ -302,26 +350,64 @@ func (p *Peer) applyRequestState(next desiredRequestState) {
 	// in the same loop can return decreasing values, causing mustRequest to panic
 	// with "too many outstanding requests".
 	maxReq := p.nominalMaxRequests()
+	// With the reserve, a full queue still takes requests due soon, up to urgentCap.
+	reserve := t.cl.config.RequestReserve
+	urgentCap := maxReq
+	if reserve {
+		urgentCap = maxRequests(urgentRequestCap(int(maxReq), int64(p.PeerMaxRequests)))
+	}
+	now := time.Now()
 	for {
 		if requestHeap.Len() == 0 {
 			break
 		}
 		numPending := maxRequests(current.Requests.GetCardinality() + current.Cancelled.GetCardinality())
-		if numPending >= maxReq {
+		if numPending >= urgentCap || (numPending >= maxReq && !reserve) {
 			break
 		}
 		req := heap.Pop(requestHeap)
+		limit := maxReq
+		if numPending >= maxReq {
+			// The heap orders by piece priority, not deadline: an urgent request can follow a
+			// non-urgent one, so a full queue skips the rest instead of stopping.
+			if !requestIsUrgent(t.pieceDeadlines[t.pieceIndexOfRequestIndex(req)], now) {
+				continue
+			}
+			limit = urgentCap
+		}
 		if cap(next.Requests.requestIndexes) != cap(orig) {
 			panic("changed")
 		}
+		// Don't add requests on receipt of a reject: it requests back to a peer that may stay
+		// unresponsive. A peer able to serve more sends Unchoke, which updates requests again.
+		if p.needRequestUpdate == "Peer.remoteRejectedRequest" {
+			continue
+		}
 		existing := t.requestingPeer(req)
 		if existing != nil && existing != p {
-			// Don't steal from the poor.
 			diff := int64(current.Requests.GetCardinality()) + 1 - (int64(existing.uncancelledRequests()) - 1)
-			// Steal a request that leaves us with one more request than the existing peer
-			// connection if the stealer more recently received a chunk.
-			if diff > 1 || (diff == 1 && p.lastUsefulChunkReceived.Before(existing.lastUsefulChunkReceived)) {
+			urgent := requestIsUrgent(t.pieceDeadlines[t.pieceIndexOfRequestIndex(req)], now)
+			if !stealPermitted(p.needRequestUpdate, diff, p.lastUsefulChunkReceived, existing.lastUsefulChunkReceived,
+				func() bool { return t.stealRequestGraceElapsed(req, existing, urgent) }) {
 				continue
+			}
+			if t.cl.config.PeakEwma {
+				now := time.Now()
+				stealerPeak, stealerOK := p.requestPeak.get(now)
+				holderPeak, holderOK := existing.requestPeak.get(now)
+				if !peakEwmaPermits(stealerPeak, stealerOK, int64(current.Requests.GetCardinality()),
+					holderPeak, holderOK, int64(existing.uncancelledRequests())) {
+					torrent.Add("steals vetoed by peak latency", 1)
+					continue
+				}
+			}
+			torrent.Add("requests stolen", 1)
+			// Split by urgency so the dry run can see where steals land before judging whether
+			// the per-peer grace helps or hurts.
+			if urgent {
+				torrent.Add("requests stolen urgent", 1)
+			} else {
+				torrent.Add("requests stolen non-urgent", 1)
 			}
 			t.cancelRequest(req)
 		}
@@ -330,10 +416,13 @@ func (p *Peer) applyRequestState(next desiredRequestState) {
 		// request()), we just stop instead of panicking.
 		var reqMore bool
 		var reqErr error
-		reqMore, reqErr = p.request(req)
+		reqMore, reqErr = p.request(req, limit)
 		if reqErr != nil {
 			// nominalMaxRequests decreased — stop gracefully
 			break
+		}
+		if limit > maxReq {
+			torrent.Add("urgent requests over the limit", 1)
 		}
 		more = reqMore
 		if !more {

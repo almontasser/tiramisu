@@ -228,6 +228,10 @@ var readBufferPool *sync.Pool
 // reImdbID matches "imdb://tt1234567" in the Guid array of Plex webhook payloads.
 var reImdbID = regexp.MustCompile(`"imdb://(tt\d+)"`)
 
+// webhookMaxBody bounds a webhook post. Plex sends multipart with a thumbnail, so
+// the ceiling has to clear a poster, not just the JSON.
+const webhookMaxBody = 10 * 1024 * 1024
+
 // reMbid matches "mbid://<uuid>" in Plex webhook payloads for music. A track
 // payload can carry several: the recording, its release group and the artist.
 var reMbid = regexp.MustCompile(`"mbid://([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"`)
@@ -714,7 +718,7 @@ func (r *VirtualMkvRoot) Lookup(ctx context.Context, name string, out *fuse.Entr
 	if classifyVFSPath(fullPath).Stub {
 		meta, err := stubMeta(fullPath)
 		if err == nil {
-			addFileToInodeMap(fullPath, meta.URL)
+			addMetaToInodeMap(fullPath, meta)
 			ino := getFileInodeFromMap(fullPath)
 			node := &VirtualMkvNode{vMeta: meta}
 			stable := fs.StableAttr{
@@ -966,7 +970,7 @@ func (d *VirtualDirNode) Lookup(ctx context.Context, name string, out *fuse.Entr
 	if classifyVFSPath(fullPath).Stub {
 		meta, err := stubMeta(fullPath)
 		if err == nil {
-			addFileToInodeMap(fullPath, meta.URL)
+			addMetaToInodeMap(fullPath, meta)
 			ino := getFileInodeFromMap(fullPath)
 			node := &VirtualMkvNode{vMeta: meta}
 			stable := fs.StableAttr{
@@ -1213,6 +1217,9 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	if n.vMeta.Audio && audioWriteIntent(flags) {
 		return nil, 0, syscall.EROFS
 	}
+	if len(n.vMeta.SegmentHeader) > 0 {
+		return n.openCueTrack(ctx, flags)
+	}
 
 	// PROACTIVE CLEANUP TRIGGER (V246): must be sync before any Read() can arrive.
 	raCache.SwitchContext(n.vMeta.Path)
@@ -1233,6 +1240,10 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	// puts nothing in its place: demand fetch plus the existing read-ahead is the
 	// whole policy. Decided once here rather than special-cased at each warmup site.
 	usesWarmup := pathUsesSSDWarmup(n.vMeta.Path)
+	// isAudio: audio projections resolve their identity from the registry, which needs no
+	// torrent, so the pump can start while the wake runs behind it instead of serializing
+	// activation before the first read (see the wake branch).
+	isAudio := isAudioSectionPath(n.vMeta.Path)
 
 	headReady := false
 	tailReady := false
@@ -1248,12 +1259,23 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	// With the head warmup ready, waking the torrent waits for a read past the header (see
 	// startDeferred): the SSD serves the first bytes, and a Jellyfin home screen opens every
 	// movie it shows and reads 4KB, which woke 20 torrents and started 20 pumps per refresh.
-	// Without warmup the torrent is needed now.
+	// Audio wakes in the background, its identity coming from the registry so its pump can
+	// start while the wake runs behind it. Otherwise the torrent is needed now.
 	wake := n.wake
 	if wake == nil && nativeBridge != nil {
 		wake = nativeBridge.Wake
 	}
-	if wake != nil && magnetCandidate != "" && !headReady {
+	if wake != nil && magnetCandidate != "" && !headReady && isAudio {
+		// Audio has no SSD head to serve the first reads, so an activation that fails at
+		// once (semaphore exhausted mid-scan) must fail Open as the synchronous path does;
+		// a slower one keeps running behind the pump.
+		if err := vfs.StartWake(func(c context.Context) error {
+			return wake(c, magnetCandidate, urlFileIdx)
+		}, audioWakeGrace, logger.Printf); err != nil {
+			logger.Printf("[VFS] activation failed for %s: %v", n.vMeta.Path, err)
+			return nil, 0, syscall.EIO
+		}
+	} else if wake != nil && magnetCandidate != "" && !headReady {
 		if ctx.Err() != nil {
 			return nil, 0, syscall.EINTR
 		}
@@ -1478,7 +1500,9 @@ func (h *MkvHandle) startDeferred(off int64) {
 	hash, fileID, magnet := h.hash, h.fileID, h.magnet
 	if nativeBridge != nil && magnet != "" {
 		safeGo(func() {
-			_ = nativeBridge.Wake(context.Background(), magnet, fileID)
+			if err := nativeBridge.Wake(context.Background(), magnet, fileID); err != nil {
+				logger.Printf("[VFS] background activation failed for %s: %v", h.path, err)
+			}
 		})
 	}
 	safeGo(func() {
@@ -2367,6 +2391,10 @@ func forceTorrentWarmupActive(hash string, fileID int) {
 }
 
 // safeGo runs a function in a new goroutine with panic recovery.
+// audioWakeGrace is how long Open waits for an audio activation before letting it run behind
+// the pump: long enough to catch an immediate failure, short enough to keep the start fast.
+const audioWakeGrace = 300 * time.Millisecond
+
 func safeGo(fn func()) {
 	go func() {
 		defer func() {
@@ -2381,6 +2409,66 @@ func safeGo(fn func()) {
 // Compile-time interface checks for MkvHandle
 var _ fs.FileReader = (*MkvHandle)(nil)
 var _ fs.FileReleaser = (*MkvHandle)(nil)
+
+// cueHandle serves one cue track of a single-file image: the generated header from
+// memory, then the image's frames through an ordinary MkvHandle whose file ends
+// where the track ends. MkvHandle itself is untouched.
+type cueHandle struct {
+	inner  *MkvHandle
+	header []byte
+	base   int64 // where the track's frames start in the torrent file
+	length int64 // image bytes the track spans
+}
+
+var _ fs.FileReader = (*cueHandle)(nil)
+var _ fs.FileReleaser = (*cueHandle)(nil)
+
+// openCueTrack opens the image through the regular path, sized to end at the end of
+// the track, and wraps it.
+func (n *VirtualMkvNode) openCueTrack(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	length := n.vMeta.Size - int64(len(n.vMeta.SegmentHeader))
+	if length <= 0 {
+		return nil, 0, syscall.EIO
+	}
+	inner := *n.vMeta
+	inner.Size = n.vMeta.SegmentOffset + length
+	inner.SegmentHeader = nil
+	fh, fuseFlags, errno := (&VirtualMkvNode{vMeta: &inner, wake: n.wake}).Open(ctx, flags)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	h, ok := fh.(*MkvHandle)
+	if !ok {
+		return nil, 0, syscall.EIO
+	}
+	return &cueHandle{inner: h, header: n.vMeta.SegmentHeader, base: n.vMeta.SegmentOffset, length: length}, fuseFlags, 0
+}
+
+func (h *cueHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	hdrFrom, hdrTo, innerOff, innerN := vfs.SegmentRead(len(h.header), h.base, h.length, off, len(dest))
+	n := copy(dest, h.header[hdrFrom:hdrTo])
+	if innerN > 0 {
+		want := dest[n : n+innerN]
+		res, errno := h.inner.Read(ctx, want, innerOff)
+		if errno != 0 {
+			// Never the header alone: a short read away from EOF is EOF to the
+			// kernel, and a cold torrent would truncate the track for the player.
+			return nil, errno
+		}
+		data, _ := res.Bytes(want)
+		got := copy(dest[n:], data)
+		res.Done()
+		if got < innerN {
+			return nil, syscall.EIO
+		}
+		n += got
+	}
+	return fuse.ReadResultData(dest[:n]), 0
+}
+
+func (h *cueHandle) Release(ctx context.Context) syscall.Errno {
+	return h.inner.Release(ctx)
+}
 
 // shortAwayFromEOF reports whether a read of n bytes into a want-sized buffer at off leaves a
 // gap before end of file. Short AT eof is normal; short before it is what the kernel turns
@@ -4050,13 +4138,35 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		payloadStr = string(body)
 	} else {
-		if err := r.ParseMultipartForm(10 * 1024 * 1024); err != nil {
+		// A form post is a form post: the plugin may send multipart or the older
+		// application/x-www-form-urlencoded, and ParseMultipartForm reports the
+		// latter as ErrNotMultipart after ParseForm has already filled the values.
+		//
+		// The cap matters for the urlencoded branch: ParseForm reads that body with
+		// ReadAll, unbounded, and this process shares a 2200MB limit with the engine.
+		//
+		// ParseForm runs first on purpose: ParseMultipartForm swallows its error for a
+		// urlencoded body and reports ErrNotMultipart instead, so an oversized post
+		// would otherwise be read until the cap and then answer 200.
+		//
+		// The cap matches the multipart limit below rather than undercutting it: this
+		// reader wraps the body before either branch, so a smaller value here would
+		// reject a Plex webhook whose multipart carries a thumbnail, and a rejected
+		// webhook is a playback session that never gets confirmed.
+		r.Body = http.MaxBytesReader(w, r.Body, webhookMaxBody)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Bad request", 400)
+			return
+		}
+		if err := r.ParseMultipartForm(webhookMaxBody); err != nil && !errors.Is(err, http.ErrNotMultipart) {
 			http.Error(w, "Bad request", 400)
 			return
 		}
 		payloadStr = r.FormValue("payload")
 	}
 	if payloadStr == "" {
+		// Silent 200s make a misconfigured plugin a mystery: say so once per event.
+		logger.Printf("[PLEX] Webhook from %s carried no payload", r.RemoteAddr)
 		return
 	}
 
@@ -4908,11 +5018,14 @@ func main() {
 		// Peer view split by transport - conn slots are capped, so a transport is only worth
 		// the share of useful bytes it returns for the share of slots it takes.
 		peerStats := torr.CollectPeerTransportStats()
+		// Gradient2 closed-loop state: the dry run reads backing_off/limit_max to see the loop
+		// react to queueing before its 32-request ceiling is raised.
+		g2Stats := torr.CollectGradient2Stats()
 
 		shortStream, shortFetch := native.ShortReadCounts()
 		repairedStream, unfilledStream := native.ShortReadRepairCounts()
 
-		fmt.Fprintf(w, `{"version":"%s", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":"%s", "update_available":%t, "warmup_duration_buckets_lt_2_5_10_15_30_60_120_gte120s":%s, "hedge_trigger_count":%d, "hedge_circuit_open":%t, "fetch_singleflight_dedup":%d, "peer_eject_count":%d, "v304_banned_peers":%d, "ip_blocklist_rejections":%d, "ip_blocklist_ips":%d, "fuse_short_reads":%d, "fuse_short_reads_repaired":%d, "fuse_short_reads_failed":%d, "short_read_stream":%d, "short_read_fetch":%d, "short_read_repaired":%d, "short_read_unfilled":%d, "peer_conns_tcp":%d, "peer_conns_utp":%d, "peer_rated_tcp":%d, "peer_rated_utp":%d, "peer_useful_bps_tcp":%.0f, "peer_useful_bps_utp":%.0f, "peer_eject_count_utp":%d, "peer_churn_count":%d, "peer_churn_count_utp":%d, "deadline_pieces":%d, "audio_namespace_state":"%s", "audio_namespace_entries":%d}`,
+		fmt.Fprintf(w, `{"version":"%s", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":"%s", "update_available":%t, "warmup_duration_buckets_lt_2_5_10_15_30_60_120_gte120s":%s, "hedge_trigger_count":%d, "hedge_circuit_open":%t, "fetch_singleflight_dedup":%d, "peer_eject_count":%d, "v304_banned_peers":%d, "ip_blocklist_rejections":%d, "ip_blocklist_ips":%d, "fuse_short_reads":%d, "fuse_short_reads_repaired":%d, "fuse_short_reads_failed":%d, "short_read_stream":%d, "short_read_fetch":%d, "short_read_repaired":%d, "short_read_unfilled":%d, "peer_conns_tcp":%d, "peer_conns_utp":%d, "peer_rated_tcp":%d, "peer_rated_utp":%d, "peer_useful_bps_tcp":%.0f, "peer_useful_bps_utp":%.0f, "peer_eject_count_utp":%d, "peer_churn_count":%d, "peer_churn_count_utp":%d, "deadline_pieces":%d, "audio_namespace_state":"%s", "audio_namespace_entries":%d, "gradient2_peers":%d, "gradient2_backing_off":%d, "gradient2_limit_min":%d, "gradient2_limit_max":%d}`,
 			AppVersion,
 			gc().ConfigPath,
 			time.Since(startTime),
@@ -4936,7 +5049,8 @@ func main() {
 			peerStats.ConnsTCP, peerStats.ConnsUTP, peerStats.RatedTCP, peerStats.RatedUTP,
 			peerStats.UsefulBpsTCP, peerStats.UsefulBpsUTP,
 			peerStats.EjectUTP, peerStats.ChurnTotal, peerStats.ChurnUTP, deadlinePieces,
-			audioNamespaceState(), audioNamespaceEntries())
+			audioNamespaceState(), audioNamespaceEntries(),
+			g2Stats.Peers, g2Stats.BackingOff, g2Stats.LimitMin, g2Stats.LimitMax)
 	})
 
 	// Which blocklist ranges are actually rejecting peers. The aggregate counters say
@@ -5232,6 +5346,7 @@ func main() {
 				MoviesSync:    scheduler.DailyJobConfig(gc().Scheduler.MoviesSync),
 				TVSync:        scheduler.DailyJobConfig(gc().Scheduler.TVSync),
 				AnimeSync:     scheduler.DailyJobConfig(gc().Scheduler.AnimeSync),
+				MusicSync:     scheduler.DailyJobConfig(gc().Scheduler.MusicSync),
 				WatchlistSync: scheduler.WatchlistSyncConfig(gc().Scheduler.WatchlistSync),
 			}
 		}
@@ -5301,6 +5416,16 @@ func main() {
 				return engines.TVModeAll
 			}),
 			"anime": newSeriesSyncer("anime", logsDir, func() engines.TVSyncMode { return engines.TVModeAnime }),
+			"music": engines.NewMusicSyncEngine(engines.MusicSyncConfig{
+				PlexURL:      gc().Plex.URL,
+				PlexToken:    gc().Plex.Token,
+				PlexMusicLib: strconv.Itoa(gc().Plex.MusicLibraryID),
+				LibraryURL:   fmt.Sprintf("http://127.0.0.1:%d", gc().MetricsPort),
+				StateDir:     GetStateDir(),
+				LogsDir:      logsDir,
+				ProwlarrCfg:  gc().Prowlarr,
+				Discovery:    gc().MusicDiscovery,
+			}),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
 				DB:              stateDB,
@@ -5400,7 +5525,10 @@ func main() {
 			// Without this a removed projection keeps resolving until its stub is
 			// gone and the next reconciliation runs.
 			UnpublishAudioPath: unpublishAudioProjectionLive,
-			InvalidatePath:     invalidateSyncRemovedPath,
+			// The audio reaper skips albums with an open session: the swarm counter is
+			// only acquitted when that session closes.
+			ActiveSession:  ttffActiveByHash,
+			InvalidatePath: invalidateSyncRemovedPath,
 			// Read-only view of the holes the reaper left, for a client that can decide
 			// what to do about them.
 			Gaps: func() ([]library.Gap, error) {
@@ -5439,7 +5567,8 @@ func main() {
 			TVSection:    gc().Plex.TVLibraryID,
 			// Read through a func so a key changed in config.json applies to the
 			// missing-episode report without a restart.
-			Catalog: library.NewTMDBCatalog(func() string { return gc().TMDBAPIKey }),
+			Catalog:      library.NewTMDBCatalog(func() string { return gc().TMDBAPIKey }),
+			MusicSection: gc().Plex.MusicLibraryID,
 		})
 		libHandler := library.NewHandler(libMgr)
 		http.HandleFunc("/api/library/add", libHandler.Add)
@@ -5917,7 +6046,7 @@ func publishAudioProjectionsLive(ps []library.AudioProjection) {
 	for _, p := range ps {
 		if globalInodeMap != nil {
 			full := filepath.Join(physicalSourcePath, string(p.Section), filepath.FromSlash(p.VirtualPath))
-			globalInodeMap.AddFile(full, p.Hash, p.FileIndex)
+			globalInodeMap.AddFile(full, vfs.SegmentInodeHash(p.Hash, p.CueTrack), p.FileIndex)
 		}
 	}
 	if globalAudioNamespace != nil {
@@ -5941,6 +6070,23 @@ func addFileToInodeMap(fullPath, url string) uint64 {
 		return 0
 	}
 	return globalInodeMap.AddFile(fullPath, hash, index)
+}
+
+// addMetaToInodeMap registers a virtual file's inode. A cue track joins its track to
+// the key, since the tracks of an image share one torrent file; every other file,
+// video included, goes through addFileToInodeMap unchanged.
+func addMetaToInodeMap(fullPath string, meta *vfs.Metadata) uint64 {
+	if meta.SegmentTrack <= 0 {
+		return addFileToInodeMap(fullPath, meta.URL)
+	}
+	if globalInodeMap == nil {
+		return 0
+	}
+	hash, index := vfs.ExtractHashAndIndex(meta.URL)
+	if hash == "" {
+		return 0
+	}
+	return globalInodeMap.AddFile(fullPath, vfs.SegmentInodeHash(hash, meta.SegmentTrack), index)
 }
 
 func GetInodeMapStats() (files, dirs, hits, misses int64) {
@@ -6112,6 +6258,9 @@ func audioProjectionMeta(fullPath string, p library.AudioProjection) *vfs.Metada
 		ExternalID:          p.ExternalID,
 		ExternalIDNamespace: p.ExternalIDNamespace,
 		Audio:               true,
+		SegmentTrack:        p.CueTrack,
+		SegmentOffset:       p.ByteOffset,
+		SegmentHeader:       p.Header,
 	}
 }
 
