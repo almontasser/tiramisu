@@ -126,19 +126,26 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 
 	// Wait for metadata
 	if t != nil {
-		if t.Torrent != nil && t.Torrent.Info() == nil {
+		// One synchronised snapshot: the wrapper nils its torrent on drop, so reading the
+		// field repeatedly around a wait of up to 45s races with Close().
+		tor := t.UnderlyingTorrent()
+		if tor != nil && tor.Info() == nil {
 			// Metadata NOT ready yet - wait with 45s timeout (Resilience)
 			timer := time.NewTimer(45 * time.Second)
 			defer timer.Stop()
 
 			select {
-			case <-t.Torrent.GotInfo():
+			case <-tor.GotInfo():
 				// Reported only here, where the metainfo demonstrably came from the swarm.
 				// Below it may just as well have been injected from the DB, which says
 				// nothing about whether anybody is still sharing the release.
 				if ReachabilityOutcome != nil {
 					ReachabilityOutcome(hash, true)
 				}
+			case <-tor.Closed():
+				// Dropped while waiting: metadata will never arrive, so stop early
+				// instead of holding the semaphore token for the full 45s.
+				return fmt.Errorf("torrent closed while waiting for metadata: %s", hash)
 			case <-timer.C:
 				// Not reported: the FUSE Open that called this registered a session
 				// first, and that session condemns once when it closes. Reporting here
@@ -154,8 +161,8 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 			}
 		}
 		pieceLenKB := 0
-		if t.Torrent != nil {
-			if info := t.Torrent.Info(); info != nil {
+		if tor != nil {
+			if info := tor.Info(); info != nil {
 				pieceLenKB = int(info.PieceLength) / 1024
 			}
 		}
@@ -528,10 +535,13 @@ func streamRange(ctx context.Context, hash string, fileID int, offset, length in
 	return nil
 }
 
-// fetchFillStep is how much the background fill gathers before reporting progress. Sized around
-// a torrent piece: smaller steps report nothing earlier (data lands piece by piece) and only
-// multiply the caller's re-cache work.
-var fetchFillStep = 4 << 20
+// The background fill reports progress in steps that start at fetchFillFirstStep and double up to
+// fetchFillStep. Chunks now arrive in order from the read position, so the reads right after a
+// miss (a seek) need small first steps; later steps grow to bound the caller's re-cache copies.
+var (
+	fetchFillFirstStep = 256 << 10
+	fetchFillStep      = 4 << 20
+)
 
 // FetchAhead fills buf with [offset, offset+len(buf)) but returns as soon as the first
 // len(dest) bytes are copied into dest. A blocking FUSE read needs one FUSE block, not the
@@ -610,11 +620,13 @@ func (c *NativeClient) FetchAhead(hash string, fileID int, offset int64, buf, de
 		}
 
 		total := n
+		step := min(fetchFillFirstStep, fetchFillStep)
 		for total < len(buf) {
-			end := total + fetchFillStep
+			end := total + step
 			if end > len(buf) {
 				end = len(buf)
 			}
+			step = min(step*2, fetchFillStep)
 			m, stepErr := io.ReadFull(pr, buf[total:end])
 			total += m
 			if stepErr != nil {
