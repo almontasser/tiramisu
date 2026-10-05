@@ -158,6 +158,44 @@ func TestReporterNeverRefreshesALibraryForAnAdd(t *testing.T) {
 	none.Changed(movie) // must not panic
 }
 
+// A walk can answer 204 and list nothing, so a new title not yet listed has its
+// library walked again until it is, and is then refreshed once.
+func TestReporterWalksAgainUntilANewTitleIsListed(t *testing.T) {
+	root := t.TempDir()
+	movie := filepath.Join(root, "movies", "Film_2020_1080p_bbbbbbbb.mkv")
+	touch(t, movie)
+	movieID := itemID(movieClass, "/media/library/movies/Film_2020_1080p_bbbbbbbb.mkv")
+
+	f := &fakeLibrary{listed: map[string]bool{}}
+	oldPoll, oldRewalk := carryPoll, carryRewalk
+	carryPoll, carryRewalk = 5*time.Millisecond, 20*time.Millisecond
+	defer func() { carryPoll, carryRewalk = oldPoll, oldRewalk }()
+
+	r := NewReporter("jellyfin", f.serve(t).URL, "tok", root, log.New(io.Discard, "", 0))
+	r.delay = 10 * time.Millisecond
+	r.Changed(movie)
+
+	waitCalls(t, f, 3) // the first walk and at least two more
+	f.mu.Lock()
+	f.listed[movieID] = true
+	f.mu.Unlock()
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		got := f.seen()
+		if last := got[len(got)-1]; last == "refresh "+movieID+" Default" {
+			for _, c := range got[:len(got)-1] {
+				if c != "refresh movieslib None" {
+					t.Fatalf("unexpected call %q in %q", c, got)
+				}
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never refreshed the title: %q", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // A show removed whole leaves Jellyfin report by report, with nothing refreshed. Each
 // stub drops its episode once its watch state is read, and each emptied folder, whose
 // report comes after its stubs', drops its season or show. The show here shares its TMDB

@@ -126,7 +126,7 @@ func (r *Reporter) flush() {
 			continue
 		}
 		walk[lib] = true
-		r.listThenRefresh(ids[len(ids)-1], filepath.Base(p))
+		r.listThenRefresh(lib, ids[len(ids)-1], filepath.Base(p))
 	}
 	if len(known) > 0 {
 		if err := r.client.reportChanged(ctx, r.root, known); err != nil {
@@ -140,9 +140,15 @@ func (r *Reporter) flush() {
 	}
 }
 
-// listThenRefresh waits for the library walk to list a new movie or show, then
-// refreshes that title alone: the walk fetched nothing for it.
-func (r *Reporter) listThenRefresh(id, name string) {
+// carryRewalk is how long a new title waits to be listed before its library is
+// walked again. On 5 October 2026 a walk answered 204 yet listed none of four new
+// shows, and one sent by hand the next night listed them in 10 seconds.
+var carryRewalk = 10 * time.Minute
+
+// listThenRefresh waits for the library walk to list a new movie or show, walking
+// lib again every carryRewalk, then refreshes that title alone: the walk fetched
+// nothing for it.
+func (r *Reporter) listThenRefresh(lib, id, name string) {
 	r.mu.Lock()
 	if r.awaiting[id] {
 		r.mu.Unlock()
@@ -162,6 +168,9 @@ func (r *Reporter) listThenRefresh(id, name string) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), carryLimit+time.Minute)
 		defer cancel()
+		// ponytail: each waiting title walks on its own; share one walk per library
+		// if many new titles at once ever make the walks pile up.
+		walked := time.Now()
 		for deadline := time.Now().Add(carryLimit); ; {
 			if ok, err := r.client.listed(ctx, id); err == nil && ok {
 				break
@@ -169,6 +178,12 @@ func (r *Reporter) listThenRefresh(id, name string) {
 			if time.Now().After(deadline) {
 				r.logger.Printf("[Jellyfin] WARNING: %s never reached the library", name)
 				return
+			}
+			if time.Since(walked) >= carryRewalk {
+				if err := r.client.refresh(ctx, lib, "None"); err != nil {
+					r.logger.Printf("[Jellyfin] WARNING: cannot list a new title: %v", err)
+				}
+				walked = time.Now()
 			}
 			select {
 			case <-ctx.Done():
