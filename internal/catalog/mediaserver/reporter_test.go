@@ -258,3 +258,17 @@ func TestForgetDropsEachItemOnItsOwnReport(t *testing.T) {
 		t.Fatalf("got %q, want %q: dropped the item of a replaced stub", got, want)
 	}
 }
+
+// The YouTube libraries reuse the names tv and movies; Tiramisu's paths must land
+// under Tiramisu's own locations, which hold more of its trees.
+func TestServerPathsSkipsSameNamedLibraries(t *testing.T) {
+	locations := []string{"/media/youtube/movies", "/media/tiramisu/library/anime", "/media/youtube/tv",
+		"/media/tiramisu/library/movies", "/media/youtube/mahmoud", "/media/tiramisu/library/tv"}
+	got := serverPaths(locations, "/src", "/src/tv/Loudermilk (2017)")
+	if len(got) != 1 || got[0] != "/media/tiramisu/library/tv/Loudermilk (2017)" {
+		t.Fatalf("got %v", got)
+	}
+	if got := itemID(seriesClass, got[0]); got != "6b01ce53c5772f1cd23dcf659e754f9c" {
+		t.Fatalf("series id %s", got)
+	}
+}

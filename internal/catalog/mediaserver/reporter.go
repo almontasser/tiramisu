@@ -275,19 +275,35 @@ func (c *JellyfinClient) reportChanged(ctx context.Context, root string, paths [
 }
 
 // serverPaths moves a path in Tiramisu's tree onto the folders the media server's
-// libraries point at: a path under root/tv goes under every location whose last element
-// is tv. Empty when the path sits outside root, or under a directory no location is
-// named for.
+// libraries point at: a path under root/tv goes under a location whose last element
+// is tv. When other libraries reuse the name (a YouTube tv beside Tiramisu's), only
+// the locations whose parent holds the most of Tiramisu's trees count. Empty when the
+// path sits outside root, or under a directory no location is named for.
 func serverPaths(locations []string, root, p string) []string {
 	rel, err := filepath.Rel(root, p)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return nil
 	}
 	top, rest, _ := strings.Cut(filepath.ToSlash(rel), "/")
-	var out []string
+	trees := map[string]int{}
 	for _, loc := range locations {
 		loc = strings.TrimRight(loc, "/")
-		if path.Base(loc) == top {
+		switch path.Base(loc) {
+		case "movies", "tv", "anime":
+			trees[path.Dir(loc)]++
+		}
+	}
+	var out []string
+	best := 0
+	for _, loc := range locations {
+		loc = strings.TrimRight(loc, "/")
+		if path.Base(loc) != top {
+			continue
+		}
+		switch n := trees[path.Dir(loc)]; {
+		case n > best:
+			best, out = n, []string{path.Join(loc, rest)}
+		case n == best:
 			out = append(out, path.Join(loc, rest))
 		}
 	}
