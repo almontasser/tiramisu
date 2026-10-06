@@ -271,4 +271,14 @@ func TestServerPathsSkipsSameNamedLibraries(t *testing.T) {
 	if got := itemID(seriesClass, got[0]); got != "6b01ce53c5772f1cd23dcf659e754f9c" {
 		t.Fatalf("series id %s", got)
 	}
+	// jellyfinIDs must weigh every library's locations together, not one library at a time.
+	libs := []jfLibrary{{"arabic-movies", locations[:1]}, {"anime", locations[1:2]}, {"arabic-series", locations[2:3]},
+		{"movies", locations[3:4]}, {"workouts", locations[4:5]}, {"tv", locations[5:6]}}
+	ids, lib := jellyfinIDs(libs, "/src", "/src/tv/Loudermilk (2017)/Season.01/Loudermilk_S01E01_bf7e5d1b.mkv")
+	if lib != "tv" || len(ids) != 3 || ids[2] != "6b01ce53c5772f1cd23dcf659e754f9c" {
+		t.Fatalf("got %v in %s", ids, lib)
+	}
+	if _, lib := jellyfinIDs(libs, "/src", "/src/movies/Godzilla_Minus_One_2023_1080p_5.1_3d1c08c6.mkv"); lib != "movies" {
+		t.Fatalf("movie went to %s", lib)
+	}
 }

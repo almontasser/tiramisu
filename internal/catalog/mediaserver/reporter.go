@@ -228,13 +228,23 @@ func lineage(root, p string) []jellyfinItem {
 
 // jellyfinIDs returns the ids of the items p stands for, deepest first, and the id of
 // the library holding them. Nothing when p is in no library.
+// serverPaths needs every library's locations at once to tell same-named ones apart.
 func jellyfinIDs(libs []jfLibrary, root, p string) (ids []string, lib string) {
+	var locations []string
+	for _, l := range libs {
+		locations = append(locations, l.Locations...)
+	}
 	for _, it := range lineage(root, p) {
+		on := serverPaths(locations, root, it.path)
+		if len(on) == 0 {
+			continue
+		}
 		for _, l := range libs {
-			if on := serverPaths(l.Locations, root, it.path); len(on) > 0 {
-				ids = append(ids, itemID(it.class, on[0]))
-				lib = l.ItemId
-				break
+			for _, loc := range l.Locations {
+				if strings.HasPrefix(on[0], strings.TrimRight(loc, "/")+"/") {
+					ids = append(ids, itemID(it.class, on[0]))
+					lib = l.ItemId
+				}
 			}
 		}
 	}
