@@ -92,33 +92,49 @@ func (d *DB) PruneMissing(validFiles map[string]bool) (int, error) {
 		return 0, nil
 	}
 
-	// Build placeholders for the valid files
-	placeholders := make([]interface{}, 0, len(validFiles))
-	for fp := range validFiles {
-		placeholders = append(placeholders, fp)
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
 	}
+	defer tx.Rollback()
 
-	// Delete file entries not in validFiles
-	query := "DELETE FROM inodes WHERE type = 'file' AND full_path NOT IN ("
-	for i := 0; i < len(placeholders); i++ {
-		if i > 0 {
-			query += ", "
+	// Diff in Go: a NOT IN list with one variable per valid file fails with "too many
+	// SQL variables" once the library holds more than SQLite's 32766.
+	rows, err := tx.Query("SELECT full_path FROM inodes WHERE type = 'file' AND full_path IS NOT NULL")
+	if err != nil {
+		return 0, err
+	}
+	var missing []string
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			rows.Close()
+			return 0, err
 		}
-		query += "?"
+		if !validFiles[fp] {
+			missing = append(missing, fp)
+		}
 	}
-	query += ")"
-
-	result, err := d.db.Exec(query, placeholders...)
+	err = rows.Err()
+	rows.Close()
 	if err != nil {
 		return 0, err
 	}
 
-	rows, err := result.RowsAffected()
+	stmt, err := tx.Prepare("DELETE FROM inodes WHERE type = 'file' AND full_path = ?")
 	if err != nil {
 		return 0, err
 	}
-
-	return int(rows), nil
+	defer stmt.Close()
+	for _, fp := range missing {
+		if _, err := stmt.Exec(fp); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(missing), nil
 }
 
 // LoadAll returns all inode entries for populating in-memory maps at startup.
