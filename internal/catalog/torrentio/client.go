@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -21,6 +22,81 @@ import (
 // Cloudflare edge, so retrying it would only spend another rate-limit slot before failing.
 var ErrCloudflareChallenge = errors.New("torrentio cloudflare challenge")
 
+// ErrRateLimited marks an HTTP 429. The fallback URL shares the rate limit, so it is not retried.
+var ErrRateLimited = errors.New("torrentio rate limited")
+
+// Backoff after a 429 without Retry-After: backoffBase, doubling up to backoffMax. Variables
+// so tests can shorten them.
+var (
+	backoffBase = 30 * time.Second
+	backoffMax  = 10 * time.Minute
+)
+
+// backoff holds requests to one Torrentio host after a 429. Every engine builds its own Client
+// against the same host and egress, so the clients share one backoff per base URL.
+type backoff struct {
+	mu    sync.Mutex
+	until time.Time
+	delay time.Duration // last exponential delay; zero after a success
+}
+
+var (
+	backoffsMu sync.Mutex
+	backoffs   = map[string]*backoff{}
+)
+
+func backoffFor(baseURL string) *backoff {
+	backoffsMu.Lock()
+	defer backoffsMu.Unlock()
+	b := backoffs[baseURL]
+	if b == nil {
+		b = &backoff{}
+		backoffs[baseURL] = b
+	}
+	return b
+}
+
+// wait blocks until the backoff ends or ctx is done.
+func (b *backoff) wait(ctx context.Context) error {
+	b.mu.Lock()
+	d := time.Until(b.until)
+	b.mu.Unlock()
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// hit starts a backoff after a 429: Retry-After seconds when given, else the next
+// exponential step. It returns the backoff length.
+func (b *backoff) hit(retryAfter string) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var d time.Duration
+	if secs, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && secs > 0 {
+		d = time.Duration(secs) * time.Second
+	} else {
+		b.delay = min(max(backoffBase, 2*b.delay), backoffMax)
+		d = b.delay
+	}
+	d = min(d, backoffMax)
+	b.until = time.Now().Add(d)
+	return d
+}
+
+func (b *backoff) reset() {
+	b.mu.Lock()
+	b.delay = 0
+	b.mu.Unlock()
+}
+
 // Client is a Torrentio API client with rate limiting.
 type Client struct {
 	http     *http.Client
@@ -28,6 +104,7 @@ type Client struct {
 	baseURL  string
 	config   string
 	fallback string
+	backoff  *backoff
 }
 
 // NewClient creates a Torrentio client with 1 req/s rate limit.
@@ -38,6 +115,7 @@ func NewClient(baseURL, config string) *Client {
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		config:   config,
 		fallback: strings.TrimRight(baseURL, "/"),
+		backoff:  backoffFor(strings.TrimRight(baseURL, "/")),
 	}
 }
 
@@ -72,8 +150,8 @@ func (c *Client) fetchStreams(ctx context.Context, contentType, imdbID string, _
 
 	streams, err := c.doFetch(ctx, url)
 	if err != nil {
-		if errors.Is(err, ErrCloudflareChallenge) {
-			// Same edge, same block: the fallback URL would be challenged too.
+		if errors.Is(err, ErrCloudflareChallenge) || errors.Is(err, ErrRateLimited) {
+			// Same edge, same block or rate limit: the fallback URL would fail too.
 			return nil, err
 		}
 		// Fallback: retry without config
@@ -91,6 +169,9 @@ func (c *Client) fetchStreams(ctx context.Context, contentType, imdbID string, _
 }
 
 func (c *Client) doFetch(ctx context.Context, url string) ([]Stream, error) {
+	if err := c.backoff.wait(ctx); err != nil {
+		return nil, err
+	}
 	if err := c.limiter.Wait(ctx); err != nil {
 		return nil, err
 	}
@@ -111,6 +192,11 @@ func (c *Client) doFetch(ctx context.Context, url string) ([]Stream, error) {
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		d := c.backoff.hit(resp.Header.Get("Retry-After"))
+		return nil, fmt.Errorf("%w (HTTP %d), backing off %s", ErrRateLimited, resp.StatusCode, d)
+	}
+
 	if resp.StatusCode == 403 || strings.Contains(strings.ToLower(string(data)), "cloudflare") {
 		// The curl fallback that used to live here could never work: curl is absent from the
 		// published Docker image, and from datacenter/VPN egress curl receives the same
@@ -119,6 +205,11 @@ func (c *Client) doFetch(ctx context.Context, url string) ([]Stream, error) {
 		// part of them is served with status 200.
 		return nil, fmt.Errorf("%w (HTTP %d), egress IP likely blocked; use Prowlarr from a non-datacenter egress", ErrCloudflareChallenge, resp.StatusCode)
 	}
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, fmt.Errorf("torrentio HTTP %d", resp.StatusCode)
+	}
+	c.backoff.reset()
 
 	var result struct {
 		Streams []json.RawMessage `json:"streams"`
