@@ -99,7 +99,7 @@ func New(cfg func() SchedulerConfig, jobs map[string]Syncer, statePath string) *
 	}
 
 	// Calculate initial NextRun times
-	s.updateNextRuns(cfg())
+	s.updateNextRuns(cfg(), nil)
 
 	return s
 }
@@ -189,6 +189,7 @@ func (s *Scheduler) conflicting(name string) string {
 
 func (s *Scheduler) tick() {
 	cfg := s.cfg()
+	blocked := map[string]bool{}
 	if cfg.Enabled {
 		names := make([]string, 0, len(s.jobs))
 		for name := range s.jobs {
@@ -205,6 +206,9 @@ func (s *Scheduler) tick() {
 			s.mu.Lock()
 			if s.conflicting(name) != "" {
 				// Still due on the next tick, so it starts once the other finishes.
+				// Its NextRun stays put: advancing it would make a daily job wait
+				// for tomorrow.
+				blocked[name] = true
 				s.mu.Unlock()
 				continue
 			}
@@ -215,7 +219,7 @@ func (s *Scheduler) tick() {
 		}
 	}
 
-	s.updateNextRuns(cfg)
+	s.updateNextRuns(cfg, blocked)
 	s.state.Save()
 }
 
@@ -342,8 +346,13 @@ func (s *Scheduler) runJob(syncer Syncer, jt *JobTracker) {
 	s.state.Save()
 }
 
-func (s *Scheduler) updateNextRuns(cfg SchedulerConfig) {
+// updateNextRuns recomputes every job's NextRun except the blocked ones: those
+// were due this tick but deferred for a conflicting job, and stay due.
+func (s *Scheduler) updateNextRuns(cfg SchedulerConfig, blocked map[string]bool) {
 	for name := range s.jobs {
+		if blocked[name] {
+			continue
+		}
 		jt := s.state.Tracker(name)
 		state := jt.Snapshot()
 

@@ -123,3 +123,35 @@ func TestDisabledSchedulerStartsNothing(t *testing.T) {
 		t.Error("a disabled scheduler started a job")
 	}
 }
+
+// A daily job that comes due while a job it must not overlap is running used to
+// have its NextRun moved to tomorrow by the same tick, so it lost the day.
+func TestBlockedDailyJobRunsOnceTheBlockerEnds(t *testing.T) {
+	slot := time.Now().Truncate(time.Minute)
+	anime := DailyJobConfig{Enabled: true, DaysOfWeek: []int{0, 1, 2, 3, 4, 5, 6}, Hour: slot.Hour(), Minute: slot.Minute()}
+	s := newTestScheduler(t, SchedulerConfig{Enabled: true, AnimeSync: anime}, "tv", "anime")
+	// As the tick before the slot left it.
+	s.state.Tracker("anime").SetNextRun(slot)
+
+	if err := s.TriggerRun("tv"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		s.tick()
+		if st := s.Status()["anime"]; st.Running || !st.NextRun.Equal(slot) {
+			t.Fatalf("tick %d: blocked anime should wait and stay due: %+v", i, st)
+		}
+	}
+	stop(t, s, "tv")
+
+	s.tick()
+	if !s.Status()["anime"].Running {
+		t.Fatal("anime did not start once tv ended")
+	}
+	stop(t, s, "anime")
+
+	s.tick()
+	if st := s.Status()["anime"]; st.Running || !st.NextRun.After(time.Now()) {
+		t.Errorf("anime should run once and its NextRun advance: %+v", st)
+	}
+}
