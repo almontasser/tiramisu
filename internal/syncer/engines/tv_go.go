@@ -3,6 +3,7 @@ package engines
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -886,7 +887,7 @@ func (e *TVGoEngine) processShow(ctx context.Context, show tmdb.TVShow, seasons 
 
 	// Get streams
 	t1 := time.Now()
-	streams, searched := e.getStreams(ctx, imdbID, show.ID, showName, details, seasons...)
+	streams, searched := e.getStreams(ctx, imdbID, show.ID, showName, details, skippedSeasons, seasons...)
 	e.logger.Printf("  getStreams: %v (%d streams)", time.Since(t1).Round(time.Millisecond), len(streams))
 	if len(streams) == 0 {
 		return searched
@@ -1027,7 +1028,10 @@ type seasonSearch struct {
 // seasons, when non-empty, replaces the default window (seasonWindow): the reaper
 // needs the seasons a dead release actually covers, which for an old pack are
 // nowhere near the end of the show.
-func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, showName string, details *tmdb.TVDetail, seasons ...int) ([]TVStream, map[int]seasonSearch) {
+//
+// skip names seasons already complete at a good score. Neither source is asked for
+// them, and they get no entry in the returned map: not searched, so never conclusive.
+func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, showName string, details *tmdb.TVDetail, skip map[int]bool, seasons ...int) ([]TVStream, map[int]seasonSearch) {
 	numSeasons := details.NumberOfSeasons
 	if numSeasons == 0 {
 		numSeasons = 5
@@ -1080,7 +1084,9 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 		tp := time.Now()
 		var targetSeasons []int
 		for s := startSeason; s <= endSeason; s++ {
-			targetSeasons = append(targetSeasons, s)
+			if !skip[s] {
+				targetSeasons = append(targetSeasons, s)
+			}
 		}
 		streams, complete, err := e.prowlarr.FetchTorrentsStatus(imdbID, "series", showName, 0, nil, targetSeasons...)
 		if err != nil {
@@ -1112,7 +1118,7 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 	}
 	var missing []int
 	for s := startSeason; s <= endSeason; s++ {
-		if !covered[s] {
+		if !covered[s] && !skip[s] {
 			missing = append(missing, s)
 		}
 	}
@@ -1140,12 +1146,15 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 
 	seasonComplete := make(map[int]seasonSearch, endSeason-startSeason+1)
 	for s := startSeason; s <= endSeason; s++ {
-		seasonComplete[s] = seasonSearch{Complete: prowlarrComplete && covered[s], RawSeen: rawSeen[s]}
+		if !skip[s] {
+			seasonComplete[s] = seasonSearch{Complete: prowlarrComplete && covered[s], RawSeen: rawSeen[s]}
+		}
 	}
 
 	if len(missing) > 0 {
 		tt := time.Now()
 		epsFetched := 0
+	fallback:
 		for _, season := range missing {
 			epCount := airedSeasonEps[season]
 			if epCount == 0 {
@@ -1154,6 +1163,14 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 			seasonFetchFailed := false
 			for ep := 1; ep <= epCount; ep++ {
 				tioStreams, err := e.torrentio.FetchEpisodeStreams(ctx, imdbID, season, ep)
+				if errors.Is(err, torrentio.ErrRateLimited) {
+					// The client already waits out the backoff before each request; walking
+					// the remaining episodes would only queue more 429s. This season and the
+					// ones after it keep Complete false, so nothing reads them as searched.
+					e.logger.Printf("    Torrentio rate limited on S%02dE%02d, giving up on %s: %v", season, ep, showName, err)
+					seasonComplete[season] = seasonSearch{RawSeen: rawSeen[season]}
+					break fallback
+				}
 				if err != nil {
 					seasonFetchFailed = true
 					continue
