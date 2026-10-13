@@ -223,13 +223,9 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 	currentOffset := r.offset
 	r.mu.Unlock()
 
-	// V243-Fix: Reader Protected Range Safety Factor (0.85)
-	// We MUST leave room (15%) for swappable chunks, otherwise cleanPieces can't remove anything
-	// when cache is full, leading to deadlock/OOM.
-	safetyFactor := 0.85
-
-	beginOffset := currentOffset - int64(float64(r.cache.capacity/readers)*safetyFactor*float64(100-prc)/100.0)
-	endOffset := currentOffset + int64(float64(r.cache.capacity/readers)*safetyFactor*float64(prc)/100.0)
+	// V243-Fix: only protectedShare of the reader's slice is protected (see its comment).
+	beginOffset := currentOffset - int64(float64(r.cache.capacity/readers)*protectedShare*float64(100-prc)/100.0)
+	endOffset := currentOffset + protectedAhead(r.cache.capacity, int(readers), prc)
 
 	if beginOffset < 0 {
 		beginOffset = 0

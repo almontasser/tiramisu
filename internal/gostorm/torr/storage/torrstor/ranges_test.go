@@ -93,3 +93,16 @@ func TestInRanges(t *testing.T) {
 		})
 	}
 }
+
+// The torrent must never be asked to fetch past the protected window: what lands there is evicted
+// on arrival while the cache is over capacity, then fetched again.
+func TestPerReaderReadaheadStaysInWindow(t *testing.T) {
+	const capacity, prc = 128 << 20, 75  // production config.json
+	total := int64(capacity * prc / 100) // updateRA
+	for readers := 1; readers <= 12; readers++ {
+		ra := perReaderReadahead(total, capacity, readers, prc)
+		if ahead := protectedAhead(capacity, readers, prc); ra > ahead || ra <= 0 {
+			t.Errorf("readers=%d: readahead %d, protected window ahead %d", readers, ra, ahead)
+		}
+	}
+}

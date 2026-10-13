@@ -39,12 +39,9 @@ func fillPieceInRange(dst []bool, ranges []Range, pieceCount int) {
 	}
 }
 
-// pieceEvictable reports whether a cached piece may be dropped. A partially
-// written piece must stay: anacrolix keeps its own chunk bookkeeping, so
-// dropping one fails the hash check and bans the peer that supplied it.
-func pieceEvictable(size int64, complete, inReaderWindow bool) bool {
-	return size > 0 && complete && !inReaderWindow
-}
+// stalePartialSecs is how long a partial piece outside every reader window must go without a write
+// before it is discarded, so chunks still arriving for a request cancelled moments ago settle first.
+const stalePartialSecs = 30
 
 func mergeRange(ranges []Range) []Range {
 	if len(ranges) <= 1 {
@@ -106,11 +103,26 @@ func pieceBudgetCount(count int, capacity, pieceLength int64) int {
 // Matches the floor updateRA already applies to the undivided value.
 const minPerReaderReadahead = 8 << 20
 
-// perReaderReadahead splits a whole-cache readahead across the active readers, the same divisor
-// getOffsetRange uses for the protected window. Undivided, a second reader asks the torrent to
-// prefetch more than the cache promises to keep, and what arrives outside the window is evictable
-// on arrival - or pinned and unevictable while still incomplete.
-func perReaderReadahead(total int64, readers int) int64 {
+// protectedShare is the part of a reader's slice of the cache that eviction keeps around it. The
+// other 15% is room for swappable pieces: protecting all of it leaves cleanPieces nothing to remove
+// when the cache is full.
+const protectedShare = 0.85
+
+// protectedAhead is how far past its position a reader's protected window reaches: the protected
+// share of its slice of the capacity, times the ReaderReadAHead percentage.
+func protectedAhead(capacity int64, readers int, prc int64) int64 {
+	if readers < 1 {
+		readers = 1
+	}
+	return int64(float64(capacity/int64(readers)) * protectedShare * float64(prc) / 100.0)
+}
+
+// perReaderReadahead splits a whole-cache readahead across the active readers and stops it at the
+// edge of the protected window. Past that edge a piece is evictable the moment it completes; while
+// the cache is over capacity it is evicted on arrival, the reader still wants it, and the torrent
+// fetches it again - a loop that ran at link speed: 96MB readahead against an 81.6MB window pulled
+// 211GB for one 4GB film.
+func perReaderReadahead(total, capacity int64, readers int, prc int64) int64 {
 	if readers < 1 {
 		readers = 1
 	}
@@ -120,6 +132,9 @@ func perReaderReadahead(total int64, readers int) int64 {
 	}
 	if ra > total {
 		ra = total
+	}
+	if ahead := protectedAhead(capacity, readers, prc); ra > ahead {
+		ra = ahead
 	}
 	return ra
 }

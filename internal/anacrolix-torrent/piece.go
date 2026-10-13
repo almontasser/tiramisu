@@ -250,6 +250,42 @@ func (p *Piece) UpdateCompletion() {
 	p.t.updatePieceCompletion(p.index)
 }
 
+// DiscardPartial forgets an incomplete piece nobody wants any more and calls drop to free its
+// storage while the client lock is still held. Storage must not be freed behind the client's back:
+// the chunks would still count as written, and the hash check after the next download would fail
+// and blame the peers that sent them. Returns false without calling drop when the piece is
+// complete, wanted (a set priority, a reader's window or a file priority), being hashed, or has a
+// chunk write in flight.
+func (p *Piece) DiscardPartial(drop func()) bool {
+	p.t.cl.lock()
+	defer p.t.cl.unlock()
+	return p.discardPartialLocked(drop)
+}
+
+func (p *Piece) discardPartialLocked(drop func()) bool {
+	t := p.t
+	if t.closed.IsSet() || t.pieceComplete(p.index) || p.hashing || p.marking || p.queuedForHash() ||
+		p.purePriority() != PiecePriorityNone {
+		return false
+	}
+	// receiveChunk marks a chunk dirty and counts the write before it unlocks to write it, and
+	// uncounts it only after relocking. With no write counted, nothing touches the storage until
+	// we unlock, and anything arriving after that lands in an emptied piece.
+	p.pendingWritesMutex.Lock()
+	writing := p.pendingWrites != 0
+	p.pendingWritesMutex.Unlock()
+	if writing {
+		return false
+	}
+	t.cancelRequestsForPiece(p.index)
+	t.pendAllChunkSpecs(p.index)
+	t.clearPieceTouchers(p.index)
+	drop()
+	t.updatePieceRequestOrderPiece(p.index)
+	t.publishPieceStateChange(p.index)
+	return true
+}
+
 func (p *Piece) completion() (ret storage.Completion) {
 	ret.Complete = p.t.pieceComplete(p.index)
 	ret.Ok = p.storageCompletionOk
