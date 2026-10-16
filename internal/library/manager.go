@@ -476,6 +476,14 @@ func (m *Manager) validate(req *AddRequest) (string, string, error) {
 	if req.ReleaseTitle == "" {
 		req.ReleaseTitle = req.Title
 	}
+	// The Library page prefills tv for any episode, since the engine cannot tell anime
+	// from tv, so a show filed only as anime stays anime. Filed into tv, S01E11 of The
+	// Exiled Heavy Knight replaced the anime episode under the shared registry key and
+	// split the show across two libraries (16 October 2026).
+	if kind == "tv" && m.showFiled("anime", req.Title, req.FirstAirDate) && !m.showFiled("tv", req.Title, req.FirstAirDate) {
+		m.cfg.Logger.Printf("[LibraryAPI] %q is filed as anime: adding it there, not to tv", req.Title)
+		kind = "anime"
+	}
 	if req.ReleaseDate == "" && req.Year > 0 {
 		req.ReleaseDate = fmt.Sprintf("%d", req.Year)
 	}
@@ -779,6 +787,9 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 			m.cfg.Logger.Printf("[LibraryAPI] WARNING: cannot remove the replaced stub %s: %v", p.entry.FilePath, err)
 			continue
 		}
+		// A release filed under another folder or tree leaves that one empty, and
+		// Jellyfin keeps a show while its folder is on disk.
+		m.pruneEmptyDirs(p.entry.FilePath)
 		if p.entry.Hash != "" && p.entry.Hash != hash {
 			dropped[p.entry.Hash] = true
 		}
@@ -918,6 +929,16 @@ func (m *Manager) dirFor(kind string) string {
 	default:
 		return m.cfg.MoviesDir
 	}
+}
+
+// showFiled reports whether the kind's tree already holds this show's folder.
+func (m *Manager) showFiled(kind, title, firstAirDate string) bool {
+	root := m.dirFor(kind)
+	if root == "" {
+		return false
+	}
+	_, err := os.Stat(ShowDir(root, title, firstAirDate))
+	return err == nil
 }
 
 // kindOf tells which media directory a path belongs to. Anime is tested before

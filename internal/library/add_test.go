@@ -85,3 +85,40 @@ func TestRemovePrunesTheFoldersItEmpties(t *testing.T) {
 		t.Errorf("reported %q, want the season and show folders among them", reported)
 	}
 }
+
+// The Library page prefills tv for any episode, so a show filed only as anime
+// stays anime. A release replaced from another tree takes its emptied folders along.
+func TestAddKeepsAnAnimeShowInTheAnimeTree(t *testing.T) {
+	tv, anime := t.TempDir(), t.TempDir()
+	const other = "0123456789abcdef0123456789abcdef01234567"
+	gs := &fakeGoStorm{stats: TorrentStats{FileStats: files("Show.S01E01.mkv")}}
+	m := New(Config{TVDir: tv, AnimeDir: anime, Registry: mapRegistry{}, GoStorm: gs})
+	add := func(kind, title, hash string) string {
+		t.Helper()
+		gs.stats.Hash = hash
+		got, err := m.Add(context.Background(), AddRequest{
+			Type: kind, Hash: hash, Title: title, FirstAirDate: "2020", Season: 1, Episode: 1})
+		if err != nil {
+			t.Fatalf("Add %s %s: %v", kind, title, err)
+		}
+		return got.Type
+	}
+
+	add("anime", "Show", testHash)
+	if got := add("tv", "Show", other); got != "anime" {
+		t.Errorf("filed as %s, want anime", got)
+	}
+	if _, err := os.Stat(filepath.Join(tv, "Show (2020)")); !os.IsNotExist(err) {
+		t.Error("the tv add made a show folder in the tv tree")
+	}
+
+	// Anime asked for by name moves a tv show, and the tv folders go with it.
+	add("tv", "Other", testHash)
+	add("anime", "Other", other)
+	if _, err := os.Stat(filepath.Join(tv, "Other (2020)")); !os.IsNotExist(err) {
+		t.Error("the replaced episode left its tv show folder behind")
+	}
+	if _, err := os.Stat(tv); err != nil {
+		t.Error("pruned the tv tree itself")
+	}
+}
