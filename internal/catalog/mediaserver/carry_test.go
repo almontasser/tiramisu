@@ -232,3 +232,53 @@ func TestCarryRetriesHeldStateWhenTiramisuStarts(t *testing.T) {
 		t.Fatalf("carried %+v, want the watched state", d)
 	}
 }
+
+// A remove and a re-add of the same release reuse the stub's path. The add can land
+// while the removal is being tracked, and dropping the item then made Jellyfin delete
+// the new stub.
+func TestForgetLeavesAStubWrittenAgainAtThePath(t *testing.T) {
+	root := t.TempDir()
+	season := filepath.Join(root, "tv", "Show (2020)", "Season.01")
+	if err := os.MkdirAll(season, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(season, "Show_S01E03_aaaaaaaa.mkv")
+	var deletes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete:
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/Library/VirtualFolders":
+			w.Write([]byte(`[{"Locations":["/media/library/tv"]}]`))
+		case r.URL.Path == "/Items":
+			// The re-add writes the stub while the removal is being tracked.
+			os.WriteFile(path, []byte("{}"), 0o644)
+			w.Write([]byte(`{"Items":[{}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	r := NewReporter("jellyfin", srv.URL, "tok", root, log.New(io.Discard, "", 0))
+	if err := r.forget(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
+	if deletes.Load() != 0 {
+		t.Fatal("dropped the item of a stub that is back on disk")
+	}
+	os.Remove(path)
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete:
+			deletes.Add(1)
+		case r.URL.Path == "/Library/VirtualFolders":
+			w.Write([]byte(`[{"Locations":["/media/library/tv"]}]`))
+		default:
+			w.Write([]byte(`{"Items":[{}]}`))
+		}
+	})
+	if err := r.forget(t.Context(), path); err != nil || deletes.Load() != 1 {
+		t.Fatalf("a stub that stays gone: err %v, %d deletes, want 1", err, deletes.Load())
+	}
+}

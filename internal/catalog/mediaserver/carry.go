@@ -214,6 +214,15 @@ func (r *Reporter) forget(ctx context.Context, p string) error {
 	if err != nil || !listed {
 		return err
 	}
+	// Jellyfin deletes the item's path too, and a remove followed by an add of the
+	// same release writes a new stub there while the watch state is being read. On
+	// 2026-10-20 that deleted three re-filed American Horror Story stubs, and the
+	// mount's unlink handler blacklisted their packs and the show's title.
+	// ponytail: a stub written between this stat and the DELETE still goes; a lock
+	// shared with the Library API's add would close that last window.
+	if _, err := os.Stat(p); err == nil {
+		return nil
+	}
 	return r.client.deleteItem(ctx, ids[0])
 }
 
