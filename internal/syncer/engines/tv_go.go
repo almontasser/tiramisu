@@ -1477,13 +1477,11 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 	showDir := library.ShowDir(targetDir, showName, firstAirDate)
 
 	for _, vf := range videoFiles {
-		filename := filepath.Base(vf.Path)
-		epInfo := e.extractEpisodeFromFilename(filename)
-		if epInfo[0] == 0 && epInfo[1] == 0 {
+		season, episode, last := library.ParseEpisodeRange(filepath.Base(vf.Path))
+		if season == 0 && episode == 0 {
 			continue
 		}
 
-		season, episode := epInfo[0], epInfo[1]
 		key := e.episodeKey(showName, firstAirDate, season, episode)
 
 		if e.processedThisRun[key] {
@@ -1500,7 +1498,7 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 		}
 
 		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season.%02d", season))
-		epFilename := e.buildFilename(showName, season, episode, hash[:8])
+		epFilename := library.EpisodeRangeFilename(showName, season, episode, last, hash[:8])
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
 
@@ -1562,16 +1560,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 		return 0
 	}
 
-	var bestFile *FileStat
-	for i := range info.FileStats {
-		f := &info.FileStats[i]
-		if e.isVideoFile(f.Path) && f.Length >= tvMinEpisodeSize {
-			if bestFile == nil || f.Length > bestFile.Length {
-				cp := *f
-				bestFile = &cp
-			}
-		}
-	}
+	bestFile, last := singleEpisodeFile(info.FileStats, season, episode, e.isVideoFile)
 	if bestFile == nil {
 		_, _ = e.dropTorrent(ctx, hash)
 		return 0
@@ -1583,7 +1572,7 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	}
 
 	seasonDir := filepath.Join(library.ShowDir(targetDir, showName, firstAirDate), fmt.Sprintf("Season.%02d", season))
-	epFilename := e.buildFilename(showName, season, episode, hash[:8])
+	epFilename := library.EpisodeRangeFilename(showName, season, episode, last, hash[:8])
 	epPath := filepath.Join(seasonDir, epFilename)
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
@@ -1599,6 +1588,42 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	}
 
 	return 0
+}
+
+// singleEpisodeFile picks the file of one episode in a release Torrentio returned
+// for it, and the last episode the file holds. Torrentio answers an episode
+// with whole packs too, and the largest file of "American Horror Story Seasons 1
+// to 8" is S05E02, which became S01E01 and S01E02. A file named for the episode
+// wins; a file named for another episode never does; and among files that name
+// no episode, only a lone one is taken.
+func singleEpisodeFile(files []FileStat, season, episode int, isVideo func(string) bool) (*FileStat, int) {
+	var named, unnamed *FileStat
+	last, unnamedCount := episode, 0
+	for i := range files {
+		f := &files[i]
+		if !isVideo(f.Path) || f.Length < tvMinEpisodeSize || library.IsExtrasPath(f.Path) {
+			continue
+		}
+		s, first, l := library.ParseEpisodeRange(filepath.Base(f.Path))
+		switch {
+		case first == 0:
+			unnamedCount++
+			if unnamed == nil || f.Length > unnamed.Length {
+				unnamed = f
+			}
+		case s == season && first == episode && (named == nil || f.Length > named.Length):
+			named, last = f, l
+		}
+	}
+	if named != nil {
+		cp := *named
+		return &cp, last
+	}
+	if unnamedCount == 1 {
+		cp := *unnamed
+		return &cp, episode
+	}
+	return nil, episode
 }
 
 func (e *TVGoEngine) getCompleteSeasons(showName, firstAirDate string, details *tmdb.TVDetail) map[int]float64 {
@@ -1863,17 +1888,8 @@ func (e *TVGoEngine) isVideoFile(path string) bool {
 	return library.IsVideoFile(path)
 }
 
-func (e *TVGoEngine) extractEpisodeFromFilename(filename string) [2]int {
-	season, episode := library.ParseSeasonEpisode(filename)
-	return [2]int{season, episode}
-}
-
 func (e *TVGoEngine) sanitizeName(name string) string {
 	return library.SanitizeShowName(name)
-}
-
-func (e *TVGoEngine) buildFilename(show string, season, episode int, hash8 string) string {
-	return library.EpisodeFilename(show, season, episode, hash8)
 }
 
 // createMKV writes an episode stub. The imdb field stays empty on purpose: the

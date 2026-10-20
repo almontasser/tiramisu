@@ -627,6 +627,7 @@ type episodeFile struct {
 	file    FileStat
 	season  int
 	episode int
+	last    int // past episode for a file holding several, such as "S01E01-E02"
 }
 
 // packEpisodes names the episodes in a pack by their files' own SxxExx. Files
@@ -640,11 +641,11 @@ func packEpisodes(files []FileStat) []episodeFile {
 		if !IsVideoFile(f.Path) || IsExtrasPath(f.Path) {
 			continue
 		}
-		season, episode := ParseSeasonEpisode(filepath.Base(f.Path))
+		season, episode, last := ParseEpisodeRange(filepath.Base(f.Path))
 		if season == 0 || episode == 0 {
 			continue
 		}
-		out = append(out, episodeFile{f, season, episode})
+		out = append(out, episodeFile{f, season, episode, last})
 	}
 	return out
 }
@@ -657,7 +658,15 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 		if err != nil {
 			return nil, err
 		}
-		wanted = append(wanted, episodeFile{*file, req.Season, req.Episode})
+		// A chosen file_index may carry another numbering than the request's, so
+		// only a file the add matched by name says how many episodes it holds.
+		last := req.Episode
+		if req.FileIndex <= 0 {
+			if s, f, l := ParseEpisodeRange(filepath.Base(file.Path)); s == req.Season && f == req.Episode {
+				last = l
+			}
+		}
+		wanted = append(wanted, episodeFile{*file, req.Season, req.Episode, last})
 	} else {
 		wanted = packEpisodes(info.FileStats)
 		if len(wanted) == 0 {
@@ -722,7 +731,7 @@ func (m *Manager) addEpisodes(ctx context.Context, kind string, req AddRequest, 
 
 	for _, w := range wanted {
 		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season.%02d", w.season))
-		path := filepath.Join(seasonDir, EpisodeFilename(req.Title, w.season, w.episode, hash[:8]))
+		path := filepath.Join(seasonDir, EpisodeRangeFilename(req.Title, w.season, w.episode, w.last, hash[:8]))
 		key := EpisodeKey(req.Title, req.FirstAirDate, w.season, w.episode)
 
 		// Read the previous state before touching anything: a registry we cannot read

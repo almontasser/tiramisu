@@ -33,6 +33,8 @@ var (
 	reNonWord     = regexp.MustCompile(`[^a-z0-9]`)
 	reEpSxxExx    = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
 	reEpNxN       = regexp.MustCompile(`(\d+)x(\d+)`)
+	// A file holding several episodes: S01E01-E02, S01E01E02, S01E01-02, 1x01-02.
+	reEpRange = regexp.MustCompile(`(?i)s(\d+)e(\d+)(?:-?e|-)(\d+)(p?)|(\d+)x(\d+)-(\d+)(p?)`)
 )
 
 // MovieName is everything the movie filename is built from. ReleaseTitle is the raw
@@ -130,7 +132,19 @@ func ShowFolderName(showName, firstAirDate string) string {
 }
 
 func EpisodeFilename(show string, season, episode int, hash8 string) string {
-	return fmt.Sprintf("%s_S%02dE%02d_%s.mkv", SanitizeShowName(show), season, episode, hash8)
+	return EpisodeRangeFilename(show, season, episode, episode, hash8)
+}
+
+// EpisodeRangeFilename names the stub of a file holding episodes first to last.
+// Jellyfin reads "S01E01-E02" as one item spanning both, so a two-part pilot
+// released as one file shows as both parts instead of leaving part 2 a hole that
+// the gap fill files with the same pilot again.
+func EpisodeRangeFilename(show string, season, first, last int, hash8 string) string {
+	ep := fmt.Sprintf("S%02dE%02d", season, first)
+	if last > first {
+		ep += fmt.Sprintf("-E%02d", last)
+	}
+	return fmt.Sprintf("%s_%s_%s.mkv", SanitizeShowName(show), ep, hash8)
 }
 
 // ShowDir is the show's folder under root. A folder that differs only in case is
@@ -177,6 +191,27 @@ func ParseSeasonEpisode(filename string) (int, int) {
 		}
 	}
 	return 0, 0
+}
+
+// ParseEpisodeRange reads the episodes a filename holds: first and last are equal
+// for one episode, and last is past first for "S01E01-E02". An end more than four
+// past the start is not a range ("S01E01-1080p").
+func ParseEpisodeRange(filename string) (season, first, last int) {
+	season, first = ParseSeasonEpisode(filename)
+	last = first
+	if m := reEpRange.FindStringSubmatch(filename); m != nil {
+		g := m[1:5]
+		if m[1] == "" {
+			g = m[5:9]
+		}
+		s, _ := strconv.Atoi(g[0])
+		f, _ := strconv.Atoi(g[1])
+		l, _ := strconv.Atoi(g[2])
+		if s == season && f == first && g[3] == "" && l > f && l <= f+4 {
+			last = l
+		}
+	}
+	return season, first, last
 }
 
 func IsVideoFile(path string) bool {
