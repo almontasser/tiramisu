@@ -186,3 +186,28 @@ func TestAiredFromSeasons(t *testing.T) {
 		t.Errorf("no last-aired episode = %v", got)
 	}
 }
+
+// A stub holding a two-part pilot files both parts.
+func TestMissingCountsARangeStub(t *testing.T) {
+	tv := t.TempDir()
+	const folder = "Stargate_SG-1 (1997)"
+	dir := filepath.Join(tv, folder, "Season.01")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, EpisodeRangeFilename("Stargate SG-1", 1, 1, 2, "ac9c4dbc")), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileStub(t, tv, folder, 1, 3)
+	m := &Manager{cfg: Config{TVDir: tv, Catalog: fakeCatalog{
+		shows: map[string]CatalogShow{"Stargate SG-1": {ID: 4629}},
+		aired: map[int]map[int]int{4629: {1: 3}},
+	}}}
+	rep, err := m.Missing(context.Background(), "tv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := findShow(t, rep, folder); got.Filed != 3 || got.Missing != 0 {
+		t.Fatalf("filed/missing = %d/%d, want 3/0", got.Filed, got.Missing)
+	}
+}

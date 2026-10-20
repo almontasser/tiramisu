@@ -177,6 +177,7 @@ func TestIdentityIgnoresTheRelease(t *testing.T) {
 	cases := []struct{ path, want string }{
 		{root + "/tv/Show (2020)/Season.01/Show_S01E01_aaaaaaaa.mkv", "tv/Show (2020)|S01E01"},
 		{root + "/anime/ONE_PIECE (1999)/Season.07/ONE_PIECE_S07E222_3e321958.mkv", "anime/ONE_PIECE (1999)|S07E222"},
+		{root + "/tv/Stargate_SG-1 (1997)/Season.01/Stargate_SG-1_S01E01-E02_ac9c4dbc.mkv", "tv/Stargate_SG-1 (1997)|S01E01"},
 		{root + "/movies/12_Angry_Men_1957_1080p_5.1_c52440b1.mkv", "movies|12_Angry_Men_1957"},
 		{root + "/movies/12_Angry_Men_1957_1080p_de489883.mkv", "movies|12_Angry_Men_1957"},
 		{root + "/movies/not-a-stub.txt", ""},

@@ -38,8 +38,9 @@ var (
 )
 
 // An episode stub is Show_S01E02_1a2b3c4d.mkv, a movie stub Title_1994_1080p_5.1_hash.mkv.
+// A file holding several episodes is Show_S01E01-E02_hash.mkv, the first episode's item.
 var (
-	reEpisodeStub = regexp.MustCompile(`(?i)_(s\d{1,2}e\d{1,4})_[0-9a-f]{8}\.mkv$`)
+	reEpisodeStub = regexp.MustCompile(`(?i)_(s\d{1,2}e\d{1,4})(?:-e\d{1,4})?_[0-9a-f]{8}\.mkv$`)
 	reMovieStub   = regexp.MustCompile(`^(.+_(?:19|20)\d{2})_.*\.mkv$`)
 	reEpisodeID   = regexp.MustCompile(`(?i)^s\d{1,2}e\d{1,4}$`)
 )

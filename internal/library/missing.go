@@ -81,7 +81,7 @@ type MissingReport struct {
 }
 
 var (
-	reEpisodeStub = regexp.MustCompile(`_S(\d+)E(\d+)_[0-9a-f]{8}\.mkv$`)
+	reEpisodeStub = regexp.MustCompile(`_S(\d+)E(\d+)(?:-E(\d+))?_[0-9a-f]{8}\.mkv$`)
 	reFolderYear  = regexp.MustCompile(`^(.*) \((\d{4})\)$`)
 )
 
@@ -216,13 +216,20 @@ func (m *Manager) missingFor(ctx context.Context, tree, dir, folder string) Miss
 			return nil
 		}
 		s, _ := strconv.Atoi(mm[1])
-		e, _ := strconv.Atoi(mm[2])
+		first, _ := strconv.Atoi(mm[2])
+		last := first
+		if mm[3] != "" {
+			last, _ = strconv.Atoi(mm[3])
+		}
 		if filed[s] == nil {
 			filed[s] = map[int]bool{}
 		}
-		if !filed[s][e] {
-			filed[s][e] = true
-			show.Filed++
+		// A stub holding several episodes files each of them.
+		for e := first; e <= last; e++ {
+			if !filed[s][e] {
+				filed[s][e] = true
+				show.Filed++
+			}
 		}
 		return nil
 	})
