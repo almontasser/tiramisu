@@ -6,14 +6,23 @@ func TestParseEpisodeRange(t *testing.T) {
 	for name, want := range map[string][3]int{
 		"Stargate SG-1 (1997) - S01E01-E02 - Children of the Gods (1080p BluRay x265 Celdra).mkv": {1, 1, 2},
 		"01x01-02 [2009 FINAL CUT] Children of the Gods {DVD}.mkv":                                {1, 1, 2},
-		"Show.S04E03E04.1080p.mkv":          {4, 3, 4},
-		"Show.S02E05-06.mkv":                {2, 5, 6},
-		"Show.S01E03.The.Enemy.Within.mkv":  {1, 3, 3},
-		"Show.S01E01-1080p.mkv":             {1, 1, 1},
-		"Show.S01E01-720p.mkv":              {1, 1, 1},
-		"Show.S01E09-E20.mkv":               {1, 9, 9},
-		"Show - S01E01 - 2 Broke Girls.mkv": {1, 1, 1},
-		"No numbers here.mkv":               {0, 0, 0},
+		"Show.S04E03E04.1080p.mkv":            {4, 3, 4},
+		"Show.S02E05-06.mkv":                  {2, 5, 6},
+		"Show.S01E03.The.Enemy.Within.mkv":    {1, 3, 3},
+		"Show.S01E01-1080p.mkv":               {1, 1, 1},
+		"Show.S01E01-720p.mkv":                {1, 1, 1},
+		"Show.S01E09-E20.mkv":                 {1, 9, 9},
+		"Show - S01E01 - 2 Broke Girls.mkv":   {1, 1, 1},
+		"No numbers here.mkv":                 {0, 0, 0},
+		"Show.Name.1x05.HDTV.mkv":             {1, 5, 5},
+		"Show - 3x07 - Title (1920x1080).mkv": {3, 7, 7},
+		// Batch files named by absolute number, with a resolution and no SxxExx,
+		// were filed as S1920E1080, S1444E1080 and S720E480.
+		"[Almighty] Boruto - Naruto Next Generations - 65 [BD 1920x1080 x264 10bit FLAC].mkv":          {0, 0, 0},
+		"Ranma ½ - 095 (BDRip 1444x1080p x265 HEVC FLAC,AAC 2.0x2)(Dual Audio)[sxales].mkv":            {0, 0, 0},
+		"Ranma ½ Videogram (BDRip 720x480p x265 HEVC FLAC 2.0)[sxales].mkv":                            {0, 0, 0},
+		"Naruto Shippuden Episode 006 Mission Cleared_2.25x_1920x1080_alq-10.mp4":                      {0, 0, 0},
+		"[Beatrice-Raws] Tensei Shitara Slime Datta Ken 3rd Season 23 [BDRip 1920x1080 HEVC FLAC].mkv": {0, 0, 0},
 	} {
 		s, f, l := ParseEpisodeRange(name)
 		if got := [3]int{s, f, l}; got != want {

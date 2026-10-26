@@ -32,9 +32,12 @@ var (
 	reSpaces      = regexp.MustCompile(`\s+`)
 	reNonWord     = regexp.MustCompile(`[^a-z0-9]`)
 	reEpSxxExx    = regexp.MustCompile(`[Ss](\d+)[Ee](\d+)`)
-	reEpNxN       = regexp.MustCompile(`(\d+)x(\d+)`)
+	// 1x05 or 01x01, but not a resolution or an audio layout: "1920x1080" filed a
+	// batch's largest 1080p file as S1920E1080, and "AAC 2.0x2" would read as S00E02.
+	// So the season is one or two digits after a separator, never after "<digit>.".
+	reEpNxN = regexp.MustCompile(`(?:^|[^0-9A-Za-z.]|[^0-9]\.)(\d{1,2})x(\d{1,4})(?:[^0-9]|$)`)
 	// A file holding several episodes: S01E01-E02, S01E01E02, S01E01-02, 1x01-02.
-	reEpRange = regexp.MustCompile(`(?i)s(\d+)e(\d+)(?:-?e|-)(\d+)(p?)|(\d+)x(\d+)-(\d+)(p?)`)
+	reEpRange = regexp.MustCompile(`(?i)s(\d+)e(\d+)(?:-?e|-)(\d+)(p?)|(?:^|[^0-9a-z.]|[^0-9]\.)(\d{1,2})x(\d{1,4})-(\d+)(p?)`)
 )
 
 // MovieName is everything the movie filename is built from. ReleaseTitle is the raw
