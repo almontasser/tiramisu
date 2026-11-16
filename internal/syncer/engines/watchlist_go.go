@@ -383,7 +383,7 @@ func (e *WatchlistGoEngine) isAlreadyPresent(item WatchlistItem, imdbSet map[str
 
 func (e *WatchlistGoEngine) getStreams(ctx context.Context, imdbID, title string, year int) ([]prowlarr.Stream, error) {
 	if e.prowlarr != nil {
-		streams, err := e.prowlarr.FetchTorrents(imdbID, "movie", title, year)
+		streams, err := e.prowlarr.FetchTorrents(ctx, imdbID, "movie", title, year)
 		if err != nil {
 			e.logger.Printf("Prowlarr search failed for %s: %v", title, err)
 			streams = nil
@@ -540,14 +540,9 @@ func (e *WatchlistGoEngine) createMKV(hash, streamTitle string, fileIndex int, f
 		return "", err
 	}
 
-	if err := os.WriteFile(path, jsonData, 0644); err != nil {
+	if err := library.WriteStubData(path, jsonData); err != nil {
 		return "", err
 	}
-	// This engine assembles the stub inline rather than calling WriteStub, so
-	// it has to apply the ownership itself; without this its stubs would be the
-	// one remaining thing left owned by root.
-	library.ApplyOwner(path)
-	library.StubChanged(path)
 
 	return path, nil
 }

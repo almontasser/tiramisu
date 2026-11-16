@@ -3,6 +3,7 @@ package library
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -56,7 +57,7 @@ type Config struct {
 	InvalidatePath func(string)
 	// Blacklist, when set, records a removed release the way the FUSE unlink handler
 	// does, so the sync engines do not add it back. Called only when the caller asks.
-	Blacklist func(path, hash string)
+	Blacklist func(path, hash string) error
 	// Gaps, when set, reports the episodes the reaper removed and has not been able to
 	// replace. Read-only: what to do about a hole is a decision for the client, which
 	// can ask the user; the engine only says which ones are open.
@@ -167,6 +168,9 @@ type AddRequest struct {
 	// Files carries the requested projections for an audio type: one torrent
 	// can back many of them, and the caller names each one.
 	Files []AudioFileRequest `json:"files"`
+	// AcceptFiles vets the torrent's file list once metadata arrives; an error drops
+	// the torrent and becomes a 422. Not part of the HTTP contract.
+	AcceptFiles func(paths []string) error `json:"-"`
 }
 
 // AddedFile is one stub written to disk.
@@ -249,6 +253,9 @@ func (m *Manager) ListGaps() ([]Gap, int, error) {
 
 type RemoveResponse struct {
 	Removed []string `json:"removed"`
+	// Warnings names removals asked for good whose release could not be blacklisted:
+	// the sync may add those titles back.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // Item is one stub as reported by List.
@@ -307,8 +314,9 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	// an earlier add of the same hash may still have stubs streaming from it.
 	dropped := map[string]bool{}
 	defer func() {
+		// The engine keys torrents by hex; a base32 request spelling would match nothing.
 		for h := range dropped {
-			m.dropTorrentIfUnused(ctx, h)
+			m.dropTorrentIfUnused(ctx, canonicalHashKey(h))
 		}
 	}()
 
@@ -366,6 +374,9 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	m.uploadReleaseFile(ctx, file, req.Title)
 	addedHash, err := m.cfg.GoStorm.AddTorrent(ctx, magnet, req.Title)
 	if err != nil || addedHash == "" {
+		// An interrupted request may still have been taken, and the engine saves it;
+		// dropTorrentIfUnused spares a torrent another stub already uses.
+		dropped[requestedHash] = true
 		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
 	}
 	// The filename builders slice the hash, so a malformed answer must stop here.
@@ -394,6 +405,17 @@ func (m *Manager) Add(ctx context.Context, req AddRequest) (*AddResponse, error)
 	if err != nil || info == nil {
 		dropped[hash] = true
 		return nil, errf(http.StatusGatewayTimeout, "no metadata after %ds: %v", wait, err)
+	}
+
+	if req.AcceptFiles != nil {
+		paths := make([]string, 0, len(info.FileStats))
+		for _, f := range info.FileStats {
+			paths = append(paths, f.Path)
+		}
+		if err := req.AcceptFiles(paths); err != nil {
+			dropped[hash] = true
+			return nil, &Error{Status: http.StatusUnprocessableEntity, Message: err.Error(), Err: err}
+		}
 	}
 
 	var files []AddedFile
@@ -1083,8 +1105,11 @@ func (m *Manager) Remove(ctx context.Context, req RemoveRequest) (*RemoveRespons
 		if hash != "" {
 			hashes[hash] = true
 		}
-		if req.Blacklist && m.cfg.Blacklist != nil {
-			m.cfg.Blacklist(path, hash)
+		if req.Blacklist {
+			if w := m.blacklist(path, hash); w != "" {
+				m.cfg.Logger.Printf("[LibraryAPI] WARNING: %s", w)
+				resp.Warnings = append(resp.Warnings, w)
+			}
 		}
 		m.forgetEpisode(path)
 		resp.Removed = append(resp.Removed, path)
@@ -1119,6 +1144,51 @@ func (m *Manager) pruneEmptyDirs(path string) {
 			m.cfg.InvalidatePath(dir)
 		}
 	}
+}
+
+// blacklist records a removal for good; a non-empty result says why it could not.
+func (m *Manager) blacklist(path, hash string) string {
+	switch {
+	case m.cfg.Blacklist == nil:
+		return fmt.Sprintf("%s removed but not blacklisted: no blacklist is configured", path)
+	case hash == "":
+		return fmt.Sprintf("%s removed but not blacklisted: its stub carries no info hash", path)
+	}
+	if err := m.cfg.Blacklist(path, hash); err != nil {
+		return fmt.Sprintf("%s removed but not blacklisted: %v", path, err)
+	}
+	return ""
+}
+
+// RemoveAny routes a removal to the audio or video path, as the HTTP handler does.
+// The returned value is the concrete response of the path taken.
+func (m *Manager) RemoveAny(ctx context.Context, req RemoveRequest) (any, error) {
+	if section, canonical := SectionForType(req.Type); canonical && IsAudioSection(section) {
+		switch {
+		case req.Path != "" && req.Prefix != "":
+			return nil, errf(http.StatusBadRequest, "path and prefix are mutually exclusive")
+		case req.Path == "" && req.Prefix == "":
+			return nil, errf(http.StatusBadRequest, "path or prefix is required")
+		case req.Prefix != "":
+			resp, err := m.RemoveAudioPrefix(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		}
+	}
+	audio, err := m.RemoveAudio(ctx, req)
+	if !errors.Is(err, ErrRequestNotAudio) {
+		if err != nil {
+			return nil, err
+		}
+		return audio, nil
+	}
+	resp, err := m.Remove(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (m *Manager) forgetEpisode(path string) {

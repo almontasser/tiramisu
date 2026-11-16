@@ -61,16 +61,17 @@ type Cache struct {
 
 	activeReaders atomic.Int32
 
-	isRemove     atomic.Bool
-	isClosed     atomic.Bool
-	IsAggressive bool         // V217: Aggressive download priority
-	MasterLimit  int          // V218: Master limit from config.json
-	lastCleanNS  atomic.Int64 // throttle stamp, read before muRemove is held
-	lastEvictLog time.Time    // rate-limits the starved-eviction warning
-	muRemove     sync.Mutex
-	torrent      *torrent.Torrent
-	cleanTrigger chan struct{} // V227: Rate-limited cleanup trigger (never closed — use cleanStop)
-	cleanStop    chan struct{} // V280: Closed on Cache.Close() to stop the goroutine
+	isRemove       atomic.Bool
+	isClosed       atomic.Bool
+	IsAggressive   bool         // V217: Aggressive download priority
+	MasterLimit    int          // V218: Master limit from config.json
+	lastCleanNS    atomic.Int64 // throttle stamp, read before muRemove is held
+	lastStrandedNS atomic.Int64 // last dropStrandedPartials scan
+	lastEvictLog   time.Time    // rate-limits the starved-eviction warning
+	muRemove       sync.Mutex
+	torrent        *torrent.Torrent
+	cleanTrigger   chan struct{} // V227: Rate-limited cleanup trigger (never closed — use cleanStop)
+	cleanStop      chan struct{} // V280: Closed on Cache.Close() to stop the goroutine
 
 	// V279: Track which pieces have non-None priority set by us.
 	// clearPriority() iterates this (~25 entries) instead of all c.pieces (~512).
@@ -256,9 +257,8 @@ func (c *Cache) AdjustRA(readahead int64) {
 		c.capacity = readahead * 3
 	}
 	if c.Readers() > 0 {
-		// Split and capped the way getOffsetRange sizes the window, or the readahead outruns it.
-		perReader := perReaderReadahead(readahead, c.capacity, int(c.activeReaders.Load()),
-			int64(settings.BTsets.ReaderReadAHead))
+		// Split by the same divisor getOffsetRange uses, or the readahead outruns the window.
+		perReader := perReaderReadahead(readahead, int(c.activeReaders.Load()))
 		c.muReaders.RLock()
 		for r := range c.readers {
 			r.SetReadahead(perReader)
@@ -373,21 +373,10 @@ func (c *Cache) cleanPieces() {
 		c.muRemove.Unlock()
 	}()
 
-	remPieces, stale := c.getRemPieces()
+	remPieces := c.getRemPieces()
+	c.dropStrandedPartials(now)
 	filled := atomic.LoadInt64(&c.filled)
 	if filled > c.capacity {
-		// Stale partial pieces go first: each holds a whole piece buffer for a few chunks nobody
-		// wants, and nothing else ever frees them - one stream left 256, keeping the cache over
-		// capacity for its whole length.
-		for _, p := range stale {
-			if sz := atomic.LoadInt64(&p.Size); c.discardPartial(p) {
-				filled -= sz
-			}
-		}
-		atomic.StoreInt64(&c.filled, filled)
-		if filled <= c.capacity {
-			return
-		}
 		rems := (filled-c.capacity)/c.pieceLength + 1
 		// Only the starved case is worth reporting: nothing evictable while over
 		// capacity means the protected window is too wide for the configured cache
@@ -418,29 +407,57 @@ func (c *Cache) cleanPieces() {
 
 }
 
-// discardPartial frees an incomplete piece through the torrent, which forgets its chunks in the
-// same step. Freeing the buffer alone would fail the next hash check and ban the peers that sent
-// them (see torrent.Piece.DiscardPartial).
-func (c *Cache) discardPartial(p *Piece) bool {
-	c.muReaders.RLock()
-	torr := c.torrent
-	c.muReaders.RUnlock()
-	if torr == nil || c.isClosed.Load() {
-		return false
+// strandedPartialAge is how long an incomplete piece outside every reader window must go
+// untouched before it counts as left behind by a seek.
+const strandedPartialAge = 20 * time.Second
+
+// strandedSweepEvery spaces the stranded-partial scans.
+const strandedSweepEvery = 5 * time.Second
+
+// dropStrandedPartials frees incomplete pieces a seek left behind. Eviction only takes complete
+// pieces, and nothing requests these any more, so each would hold a whole piece of RAM until the
+// torrent closes (40 seeks: 480MB allocated in a 128MB cache). The torrent forgets the chunks
+// first, so a later request re-downloads them instead of trusting a freed buffer. Runs after
+// getRemPieces, which rebuilds pieceInRange.
+func (c *Cache) dropStrandedPartials(now time.Time) {
+	// cleanPieces runs many times a second near capacity; a piece needs 20s untouched to qualify,
+	// so a full scan every few seconds loses nothing (it cost ~7% CPU run on every cycle).
+	if last := c.lastStrandedNS.Load(); last != 0 && now.UnixNano()-last < int64(strandedSweepEvery) {
+		return
 	}
-	return torr.Piece(p.Id).DiscardPartial(p.mPiece.Release)
+	c.lastStrandedNS.Store(now.UnixNano())
+	c.muReaders.RLock()
+	pieces, tor := c.pieces, c.torrent
+	c.muReaders.RUnlock()
+	if pieces == nil || tor == nil || c.isClosed.Load() {
+		return
+	}
+	cutoff := now.Unix() - int64(strandedPartialAge/time.Second)
+	for id, p := range pieces {
+		if !strandedPartial(atomic.LoadInt64(&p.Size), p.Complete.Load(),
+			id < len(c.pieceInRange) && c.pieceInRange[id], atomic.LoadInt64(&p.Accessed), cutoff) {
+			continue
+		}
+		since := p.mPiece.writeCount()
+		if tor.ForgetPartialPiece(id) {
+			p.mPiece.releaseIfUnwritten(since)
+		}
+	}
 }
 
-// getRemPieces returns the complete pieces eviction may drop, oldest access first, and the partial
-// pieces outside every window that have had no write for stalePartialSecs.
-func (c *Cache) getRemPieces() (piecesRemove, stale []*Piece) {
+func strandedPartial(size int64, complete, inReaderWindow bool, accessed, cutoff int64) bool {
+	return size > 0 && !complete && !inReaderWindow && accessed <= cutoff
+}
+
+func (c *Cache) getRemPieces() []*Piece {
+	piecesRemove := make([]*Piece, 0)
 	fill := int64(0)
 
 	ranges := make([]Range, 0)
 	c.muReaders.RLock()
 	if c.isClosed.Load() || c.pieces == nil || c.readers == nil {
 		c.muReaders.RUnlock()
-		return nil, nil
+		return nil
 	}
 	// Capture the map under the lock: the scan below runs unlocked, and Close nils the field
 	// while holding the write lock. The captured map stays valid on its own - a concurrent
@@ -458,21 +475,18 @@ func (c *Cache) getRemPieces() (piecesRemove, stale []*Piece) {
 	// V305: Rebuild bitmap for O(1) piece-in-range checks
 	fillPieceInRange(c.pieceInRange, ranges, c.pieceCount)
 
-	now := time.Now().Unix()
 	for id, p := range pieces {
 		sz := atomic.LoadInt64(&p.Size)
-		if sz <= 0 {
-			continue
+		if sz > 0 {
+			fill += sz
 		}
-		fill += sz
 		// Bounds-checked: NewCache starts the cleaner before Init sizes the bitmap.
-		if id < len(c.pieceInRange) && c.pieceInRange[id] || c.isIdInFileBE(ranges, id) {
+		inRange := id < len(c.pieceInRange) && c.pieceInRange[id]
+		if !pieceEvictable(sz, p.Complete.Load(), inRange) {
 			continue
 		}
-		if p.Complete.Load() {
+		if !c.isIdInFileBE(ranges, id) {
 			piecesRemove = append(piecesRemove, p)
-		} else if now-atomic.LoadInt64(&p.Accessed) >= stalePartialSecs {
-			stale = append(stale, p)
 		}
 	}
 
@@ -484,7 +498,7 @@ func (c *Cache) getRemPieces() (piecesRemove, stale []*Piece) {
 	})
 
 	atomic.StoreInt64(&c.filled, fill)
-	return piecesRemove, stale
+	return piecesRemove
 }
 
 func (c *Cache) setLoadPriority(ranges []Range) {

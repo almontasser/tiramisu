@@ -147,9 +147,7 @@ func (r *Reader) SetReadahead(length int64) {
 	if r.cache == nil {
 		return
 	}
-	// V255: Removed V244 85% clamp — it reduced prefetch by ~13MB without benefit.
-	// Cache eviction is LRU-based and doesn't use readahead boundaries.
-	// Unbounded readahead growth is now prevented by maxDefaultReadahead cap in anacrolix fork.
+	// Eviction protects the readahead (getOffsetRange), up to 85% of the per-reader share.
 	if r.isUse {
 		r.Reader.SetReadahead(length)
 	}
@@ -223,9 +221,12 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 	currentOffset := r.offset
 	r.mu.Unlock()
 
-	// V243-Fix: only protectedShare of the reader's slice is protected (see its comment).
-	beginOffset := currentOffset - int64(float64(r.cache.capacity/readers)*protectedShare*float64(100-prc)/100.0)
-	endOffset := currentOffset + protectedAhead(r.cache.capacity, int(readers), prc)
+	// V243-Fix: Reader Protected Range Safety Factor (0.85)
+	// We MUST leave room (15%) for swappable chunks, otherwise cleanPieces can't remove anything
+	// when cache is full, leading to deadlock/OOM.
+	safetyFactor := 0.85
+
+	beginOffset, endOffset := protectedWindow(currentOffset, int64(float64(r.cache.capacity/readers)*safetyFactor), prc, r.Readahead())
 
 	if beginOffset < 0 {
 		beginOffset = 0

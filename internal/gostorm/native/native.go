@@ -178,7 +178,7 @@ func (c *NativeClient) Wake(ctx context.Context, magnetUrl string, fileIdx int) 
 		// safely (no streaming active). The previous 90s delayed goroutine was
 		// removed (V306) because it fired during active playback, causing cl._mu
 		// contention (PeerConns snapshot) that briefly stalled the pump.
-		torr.SaveTorrentToDB(t)
+		torr.SaveMetadataIfMissing(t)
 
 		// Optimistic active update
 		c.activeHashes.Store(hash, true)
@@ -429,7 +429,32 @@ func (r *NativeReader) Interrupt() {
 // live torrent, the same injection seam used for warmup.Fetch.
 var startStreamFn = (*NativeReader).startStream
 
+// StreamSource, when set, replaces the torrent as the byte source of every stream (pump reader,
+// FetchAhead, FetchBlock): it writes [offset, offset+length) of the file into w, length -1 meaning
+// to the end. The FUSE-layer simulator drives the real handle and pump code through it. nil in
+// production.
+var StreamSource func(ctx context.Context, hash string, fileID int, offset, length int64, w io.Writer) error
+
+// sourceStream runs StreamSource into pw in the background and closes pw when it ends.
+func sourceStream(ctx context.Context, hash string, fileID int, offset, length int64, pw *io.PipeWriter) {
+	go func() {
+		err := StreamSource(ctx, hash, fileID, offset, length, pw)
+		pw.CloseWithError(err)
+	}()
+}
+
 func (r *NativeReader) startStream(off int64) error {
+	if StreamSource != nil {
+		pr, pw := io.Pipe()
+		r.pipeReader = pr
+		r.pipeReaderAtomic.Store(pr)
+		r.pipeWriter = pw
+		r.offset = off
+		ctx, cancel := context.WithCancel(context.Background())
+		r.cancelFunc = cancel
+		sourceStream(ctx, r.hash, r.fileID, off, -1, pw)
+		return nil
+	}
 	// V255: Use PeekTorrent to avoid extending expiry timer on every Hard Seek.
 	t := torr.PeekTorrent(r.hash)
 	if t == nil || t.Torrent == nil {
@@ -521,6 +546,10 @@ var FetchReadyTimeout = 60 * time.Second
 var streamRangeFn = streamRange
 
 func streamRange(ctx context.Context, hash string, fileID int, offset, length int64, pw *io.PipeWriter) error {
+	if StreamSource != nil {
+		sourceStream(ctx, hash, fileID, offset, length, pw)
+		return nil
+	}
 	t := torr.PeekTorrent(hash)
 	if t == nil || t.Torrent == nil {
 		return fmt.Errorf("torrent not found")
@@ -678,7 +707,7 @@ func (c *NativeClient) FetchAhead(hash string, fileID int, offset int64, buf, de
 func (c *NativeClient) FetchBlock(hash string, fileID int, offset int64, p []byte) (int, error) {
 	// V255: Use PeekTorrent — same reasoning as startStream above.
 	t := torr.PeekTorrent(hash)
-	if t == nil || t.Torrent == nil {
+	if StreamSource == nil && (t == nil || t.Torrent == nil) {
 		return 0, fmt.Errorf("torrent not found")
 	}
 
@@ -697,10 +726,14 @@ func (c *NativeClient) FetchBlock(hash string, fileID int, offset int64, p []byt
 		header: make(http.Header),
 	}
 
-	go func() {
-		defer pw.Close()
-		t.Stream(fileID, req, resp)
-	}()
+	if StreamSource != nil {
+		sourceStream(ctx, hash, fileID, offset, int64(len(p)), pw)
+	} else {
+		go func() {
+			defer pw.Close()
+			t.Stream(fileID, req, resp)
+		}()
+	}
 
 	// V283-Fix: Ensure io.ReadFull is unblocked if context expires (8s timeout).
 	// Previously, if t.Stream() stalled without closing the pipe, FetchBlock would hang forever.

@@ -266,11 +266,6 @@ func (e *TVGoEngine) isRoot(path string) bool {
 
 // NewTVGoEngine creates a new Go TV sync engine.
 func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
-	var prowlarrClient *prowlarr.Client
-	if cfg.ProwlarrCfg.Enabled {
-		prowlarrClient = prowlarr.NewClient(cfg.ProwlarrCfg)
-	}
-
 	// Each job logs to its own file: tv-sync.log, anime-sync.log.
 	name := cfg.Name
 	if name == "" {
@@ -301,8 +296,8 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	e := &TVGoEngine{
 		gostorm:          NewGoStormClient(cfg.GoStormURL),
 		tmdb:             tmdb.NewClient(cfg.TMDBAPIKey),
-		torrentio:        torrentio.NewClient(cfg.TorrentioURL, "sort=qualitysize|qualityfilter=480p,720p,scr,cam"),
-		prowlarr:         prowlarrClient,
+		torrentio:        torrentio.NewClient(cfg.TorrentioURL, torrentioOptions),
+		prowlarr:         newProwlarrClient(cfg.ProwlarrCfg),
 		plexURL:          cfg.PlexURL,
 		plexToken:        cfg.PlexToken,
 		plexTVLib:        cfg.PlexTVLib,
@@ -1088,7 +1083,7 @@ func (e *TVGoEngine) getStreams(ctx context.Context, imdbID string, tmdbID int, 
 				targetSeasons = append(targetSeasons, s)
 			}
 		}
-		streams, complete, err := e.prowlarr.FetchTorrentsStatus(imdbID, "series", showName, 0, nil, targetSeasons...)
+		streams, complete, err := e.prowlarr.FetchTorrentsStatus(ctx, imdbID, "series", showName, 0, nil, targetSeasons...)
 		if err != nil {
 			e.logger.Printf("Prowlarr search failed for %s: %v", showName, err)
 			streams = nil
@@ -1502,6 +1497,9 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 		epPath := filepath.Join(seasonDir, epFilename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, vf.ID)
 
+		if e.servedElsewhere(key, epPath, streamURL) {
+			continue
+		}
 		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
 			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 				e.removeStub(ctx, existing.FilePath, existing.Hash)
@@ -1576,6 +1574,9 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 	epPath := filepath.Join(seasonDir, epFilename)
 	streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
+	if e.servedElsewhere(key, epPath, streamURL) {
+		return 0
+	}
 	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
 		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
 			e.removeStub(ctx, existing.FilePath, existing.Hash)
@@ -1890,6 +1891,27 @@ func (e *TVGoEngine) isVideoFile(path string) bool {
 
 func (e *TVGoEngine) sanitizeName(name string) string {
 	return library.SanitizeShowName(name)
+}
+
+// servedElsewhere reports a torrent file already exposed under another episode name, which is
+// what a generic show title matched to the wrong torrent produces. Moving this episode's own stub
+// (its registry entry points at the duplicate) stays allowed.
+func (e *TVGoEngine) servedElsewhere(key, epPath, streamURL string) bool {
+	var dup string
+	ok := false
+	for _, root := range e.roots() {
+		if dup, ok = library.DuplicateStub(root, epPath, streamURL); ok {
+			break
+		}
+	}
+	if !ok {
+		return false
+	}
+	if existing, ok := e.registry[key]; ok && existing.FilePath == dup {
+		return false
+	}
+	e.logger.Printf("skip %s: the same torrent file is already %s", filepath.Base(epPath), dup)
+	return true
 }
 
 // createMKV writes an episode stub. The imdb field stays empty on purpose: the

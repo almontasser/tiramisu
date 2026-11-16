@@ -75,13 +75,13 @@ type CommittedSet struct {
 }
 
 // HasAlbum reports whether the album is already committed. The artist-qualified
-// prefix is enough on its own; the bare-name fallback exists for releases added by
-// hand as a single folder, and it only counts when the identities under that folder
-// include this album's: a same-named album by another artist must not hide a
-// missing import.
+// prefix is enough on its own, with or without identities under it (add_audio files
+// none); the bare-name fallback exists for releases added by hand as a single
+// folder, and it only counts when the identities under that folder include this
+// album's: a same-named album by another artist must not hide a missing import.
 func (c CommittedSet) HasAlbum(artist, album, identity string) bool {
 	prefix := strings.Trim(sanitizeComponent(artist)+"/"+sanitizeComponent(album), "/")
-	if len(c.AlbumPrefixes[prefix]) > 0 {
+	if _, ok := c.AlbumPrefixes[prefix]; ok {
 		return true
 	}
 	bare := c.AlbumPrefixes[sanitizeComponent(album)]
@@ -89,6 +89,25 @@ func (c CommittedSet) HasAlbum(artist, album, identity string) bool {
 		return false
 	}
 	return identity == "" || bare[identity]
+}
+
+// HasAlbumNamed is HasAlbum that also matches the folder by normalized names, as the
+// library index matches Plex albums: an album filed by hand rarely spells the
+// artist and title exactly as MusicBrainz does.
+func (c CommittedSet) HasAlbumNamed(artist, album, identity string) bool {
+	if c.HasAlbum(artist, album, identity) {
+		return true
+	}
+	want := albumKey(artist, album)
+	if want == "" {
+		return false
+	}
+	for prefix := range c.AlbumPrefixes {
+		if a, t, ok := strings.Cut(prefix, "/"); ok && albumKey(a, t) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Committed reads every committed projection once.

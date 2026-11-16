@@ -202,7 +202,7 @@ func (r *Runner) trackIdentity(track ReleaseTrack, fallback string) string {
 // so the discovery runner is testable without a server.
 type torrentSearcher interface {
 	SearchWithOptions(ctx context.Context, query string, opts prowlarr.SearchOptions) ([]prowlarr.ProwlarrResult, error)
-	ResolveHash(downloadURL string) string
+	ResolveHash(ctx context.Context, downloadURL string) string
 }
 
 // selectAlbumTorrent is the search the importer and the discovery share: the lossless
@@ -254,7 +254,7 @@ func selectAlbumTorrent(ctx context.Context, indexer torrentSearcher, indexerIDs
 		}
 		for _, candidate := range SelectCandidates(results, artist, title, minSeeders, maxSizeBytes, 3) {
 			if candidate.Hash == "" {
-				hash := indexer.ResolveHash(candidate.DownloadURL)
+				hash := indexer.ResolveHash(ctx, candidate.DownloadURL)
 				if hash == "" {
 					logf("cannot resolve a hash for %q", candidate.Title)
 					continue
@@ -294,11 +294,13 @@ func (r *Runner) selectTorrent(ctx context.Context, album Album, group ReleaseGr
 	return selectAlbumTorrent(ctx, r.Indexer, r.Options.IndexerIDs, artist, title, r.Options.MinSeeders, r.Options.MaxSizeBytes, nil, r.logf)
 }
 
-// libraryWriter is what applyFiles needs from the Library API client.
-type libraryWriter interface {
+// LibraryWriter is what applyFiles needs from the Library API client.
+type LibraryWriter interface {
 	Inspect(ctx context.Context, hash, title string, torrentFile []byte) ([]SourceFile, error)
 	Add(ctx context.Context, hash, title string, torrentFile []byte, files []AddFile) (AddResult, error)
 }
+
+type libraryWriter = LibraryWriter
 
 // applyFiles inspects the torrent and files its lossless files as projections, each
 // with its own track id when the tracklist matches and the group id otherwise.
@@ -479,15 +481,28 @@ func (r *Runner) fail(summary *Summary, album Album, entry *Entry, err error) {
 }
 
 // VirtualPath builds the engine path for one source file. The release's own
-// folders are kept, and the leaf gets the mandatory _<hash8> suffix.
+// folders are kept, and the leaf gets the mandatory _<hash8> suffix. Every
+// component is made one the Library API accepts; the torrent's spelling survives
+// wherever it already is.
 func VirtualPath(artist, album, hash, sourcePath string) string {
 	parts := strings.Split(sourcePath, "/")
 	if len(parts) > 1 {
 		parts = parts[1:]
 	}
-	relative := strings.Join(parts, "/")
-	stem, extension := splitExtension(relative)
-	return fmt.Sprintf("%s/%s/%s_%s%s", sanitizeComponent(artist), sanitizeComponent(album), stem, hashSuffix(hash), extension)
+	components := []string{sanitizeComponent(artist), sanitizeComponent(album)}
+	for _, dir := range parts[:len(parts)-1] {
+		if dir != "" {
+			components = append(components, library.KeepComponent(dir, ""))
+		}
+	}
+	// Folders past the component limit are merged into the last one allowed.
+	if keep := library.MaxPathComponents - 1; len(components) > keep {
+		merged := library.KeepComponent(strings.Join(components[keep-1:], " - "), "")
+		components = append(components[:keep-1], merged)
+	}
+	stem, extension := splitExtension(parts[len(parts)-1])
+	components = append(components, library.KeepComponent(stem, "_"+hashSuffix(hash)+extension))
+	return strings.Join(components, "/")
 }
 
 func splitExtension(path string) (string, string) {
@@ -506,10 +521,8 @@ func hashSuffix(hash string) string {
 }
 
 func sanitizeComponent(name string) string {
-	name = strings.ReplaceAll(name, "/", "-")
-	name = strings.TrimSpace(name)
-	if name == "" {
+	if strings.TrimSpace(name) == "" {
 		return "Unknown"
 	}
-	return name
+	return library.SafeComponent(name)
 }
