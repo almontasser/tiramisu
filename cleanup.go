@@ -236,6 +236,8 @@ func (cm *CleanupManager) runCleanup() {
 		return true
 	})
 
+	liveHashes := liveTorrentHashes(activePaths, now, 15*time.Minute, cm.GetLastActivity)
+
 	playbackRegistry.Range(func(key, value interface{}) bool {
 		path := key.(string)
 		ps, ok := value.(*PlaybackState)
@@ -271,7 +273,7 @@ func (cm *CleanupManager) runCleanup() {
 				// V238 Audit 1.B: Ensure Priority is OFF before deleting zombie registry entry
 				// V273: PeekTorrent instead of GetTorrent — cleanup is read-only monitoring,
 				// must NOT reactivate dormant torrents (same pattern as cache.go fix).
-				if ps.Hash != "" {
+				if ps.Hash != "" && !liveHashes[ps.Hash] {
 					if t := torr.PeekTorrent(ps.Hash); t != nil && t.Torrent != nil && t.IsPriority.Load() {
 						t.IsPriority.Store(false)
 						t.SetAggressiveMode(false, 0)
@@ -392,4 +394,27 @@ func (cm *CleanupManager) Stats() CleanupStats {
 		OffsetsTotal:       offsetsTotal,
 		ActivitiesTotal:    activitiesTotal,
 	}
+}
+
+// liveTorrentHashes returns the hashes of registry entries that have an open handle or
+// showed life within window. Season-pack episodes share one hash, so pruning a stale
+// episode must not turn priority off while a sibling of the same pack is playing.
+func liveTorrentHashes(activePaths map[string]bool, now time.Time, window time.Duration, lastActivity func(string) (time.Time, bool)) map[string]bool {
+	live := make(map[string]bool)
+	playbackRegistry.Range(func(key, value interface{}) bool {
+		path, _ := key.(string)
+		ps, ok := value.(*PlaybackState)
+		if !ok || ps.Hash == "" {
+			return true
+		}
+		last := ps.LastSignOfLife()
+		if act, ok := lastActivity(path); ok && act.After(last) {
+			last = act
+		}
+		if activePaths[path] || now.Sub(last) <= window {
+			live[ps.Hash] = true
+		}
+		return true
+	})
+	return live
 }
