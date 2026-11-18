@@ -1,864 +1,800 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tiramisu — Library</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    body {
-      background: #0b1120;
-      color: #e2e8f0;
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tiramisu — Library</title>
+<link rel="stylesheet" href="/ui/theme.css">
+<script src="/ui/theme.js"></script>
+<script src="/ui/auth.js"></script>
+<style>
+.hidden { display: none !important; }
+.ok-msg { color: var(--sig-green); }
+.warn-text { color: var(--sig-yellow); }
 
-    .glass {
-      background: rgba(30, 41, 59, .55);
-      border: 1px solid rgba(148, 163, 184, .12);
-      backdrop-filter: blur(8px);
-    }
+.filters { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+.filters .grow { flex: 1 1 240px; }
+.check { display: inline-flex; align-items: center; gap: 8px; height: 34px; font-size: 12px; color: var(--ink2); cursor: pointer; }
 
-    input,
-    select,
-    textarea {
-      background: #0f172a;
-      border: 1px solid #334155;
-      border-radius: .5rem;
-      padding: .45rem .6rem;
-      color: #e2e8f0;
-      width: 100%;
-    }
+.lib-scroll { max-height: 65vh; overflow: auto; }
+.lib-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.lib-table th { position: sticky; top: 0; z-index: 1; text-align: left; padding: 10px 16px 10px 0; background: var(--well); font-size: 11px; font-weight: 500; letter-spacing: .08em; text-transform: uppercase; color: var(--ink3); white-space: nowrap; }
+.lib-table th:first-child, .lib-table td:first-child { padding-left: 24px; }
+.lib-table td { padding: 10px 16px 10px 0; border-top: 1px solid var(--hair); color: var(--ink2); vertical-align: middle; }
+.lib-table td.nm { color: var(--ink); font-weight: 500; font-size: 13px; }
+.lib-table td.mono { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.lib-table td:last-child { text-align: right; padding-right: 16px; }
+.lib-table tbody tr:hover td { background: var(--well); }
+.lib-table tr.msg-row td { color: var(--ink3); text-align: left; padding: 16px 24px; }
+.lib-table tr.msg-row:hover td { background: transparent; }
+.lib-table td.faint { color: var(--ink3); }
+.lib-table td.accent, .lib-table tr.msg-row td.accent { color: var(--accent-ink); }
+.lib-foot { display: flex; align-items: center; gap: 10px; padding: 12px 24px; border-top: 1px solid var(--hair); }
+.lib-foot .spacer { flex: 1; }
+.gaps { display: flex; flex-direction: column; gap: 4px; }
+.gap-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 
-    input[type=checkbox],
-    input[type=radio] {
-      width: auto;
-    }
+.lib-dialog { border: 1px solid var(--hair); border-radius: 8px; padding: 0; background: var(--panel); color: var(--ink); width: min(760px, calc(100vw - 32px)); box-shadow: 0 16px 48px rgba(0,0,0,.18); }
+.lib-dialog.narrow { width: min(560px, calc(100vw - 32px)); }
+.lib-dialog::backdrop { background: rgba(18, 21, 24, .5); }
+.lib-dialog .card-body { gap: 18px; max-height: 72vh; overflow-y: auto; }
+.dlg-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--hair); background: var(--well); }
+.input.area { height: auto; padding: 8px 10px; align-items: stretch; }
+.input textarea { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font: inherit; font-size: 13px; color: inherit; resize: vertical; }
+.row-fields { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+.row-fields .grow { flex: 1 1 200px; }
+.box { border: 1px solid var(--hair); border-radius: 4px; background: var(--well); }
+.inspect-head { padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.inspect-head .t { font-weight: 500; overflow-wrap: anywhere; }
+.inspect-head .meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11px; color: var(--ink2); }
+.files { max-height: 13rem; overflow-y: auto; }
+.filerow { display: grid; grid-template-columns: 22px 1fr 74px 66px; gap: 8px; align-items: center; padding: 6px 10px; font-size: 12px; border-top: 1px solid var(--hair); cursor: pointer; }
+.filerow:first-child { border-top: 0; }
+.filerow:hover { background: var(--panel); }
+.filerow .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filerow .sz { font-family: var(--mono); font-size: 11px; color: var(--ink2); text-align: right; }
+.filerow .se { font-family: var(--mono); font-size: 11px; }
+.tmdb { margin-top: 4px; max-height: 12rem; overflow-y: auto; }
+.tmdb-hit { padding: 8px 10px; cursor: pointer; border-top: 1px solid var(--hair); }
+.tmdb-hit:first-child { border-top: 0; }
+.tmdb-hit:hover { background: var(--panel); }
+.rm-path { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; color: var(--ink2); }
+.rm-opt { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.rm-opt input { margin-top: 3px; }
 
-    input:focus,
-    select:focus,
-    textarea:focus {
-      outline: none;
-      border-color: #3b82f6;
-    }
-
-    label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      color: #94a3b8;
-      display: block;
-      margin-bottom: .25rem;
-    }
-
-    .btn {
-      border-radius: .5rem;
-      padding: .45rem .9rem;
-      font-size: .8rem;
-      font-weight: 600;
-      cursor: pointer;
-      border: 1px solid transparent;
-    }
-
-    .btn-primary {
-      background: #2563eb;
-      color: #fff;
-    }
-
-    .btn:disabled {
-      opacity: .5;
-      cursor: not-allowed;
-    }
-
-    .btn-ghost {
-      background: transparent;
-      border-color: #334155;
-      color: #cbd5e1;
-    }
-
-    .btn-danger {
-      background: transparent;
-      border-color: #7f1d1d;
-      color: #fca5a5;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th {
-      text-align: left;
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      color: #94a3b8;
-      padding: .5rem;
-      border-bottom: 1px solid rgba(148, 163, 184, .15);
-      position: sticky;
-      top: 0;
-      background: #131c31;
-    }
-
-    td {
-      padding: .45rem .5rem;
-      border-bottom: 1px solid rgba(148, 163, 184, .07);
-      font-size: .8rem;
-      vertical-align: middle;
-    }
-
-    tr:hover td {
-      background: rgba(148, 163, 184, .04);
-    }
-
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-
-    .pill {
-      font-size: 10px;
-      padding: .1rem .4rem;
-      border-radius: 99px;
-      font-weight: 600;
-    }
-
-    dialog {
-      background: #131c31;
-      color: #e2e8f0;
-      border: 1px solid rgba(148, 163, 184, .18);
-      border-radius: .75rem;
-      padding: 0;
-      width: min(760px, 95vw);
-    }
-
-    dialog::backdrop {
-      background: rgba(2, 6, 23, .72);
-    }
-
-    .tmdb-hit {
-      padding: .4rem .6rem;
-      cursor: pointer;
-      border-bottom: 1px solid rgba(148, 163, 184, .08);
-    }
-
-    .tmdb-hit:hover {
-      background: rgba(59, 130, 246, .15);
-    }
-
-    .filerow {
-      display: grid;
-      grid-template-columns: 22px 1fr 74px 66px;
-      gap: .4rem;
-      align-items: center;
-      padding: .25rem .4rem;
-      font-size: .75rem;
-      border-bottom: 1px solid rgba(148, 163, 184, .06);
-    }
-
-    .filerow:hover {
-      background: rgba(148, 163, 184, .05);
-    }
-    .tab {
-      padding: .5rem .9rem;
-      font-size: .8rem;
-      font-weight: 600;
-      color: #94a3b8;
-      background: transparent;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-      cursor: pointer;
-    }
-
-    .tab:focus-visible {
-      outline: 2px solid #3b82f6;
-      outline-offset: 2px;
-    }
-
-    .tab-on {
-      color: #e2e8f0;
-      border-bottom-color: #3b82f6;
-    }
-  </style>
+@media (max-width: 900px) {
+  .lib-table th:first-child, .lib-table td:first-child { padding-left: 16px; }
+  .lib-foot, .dlg-foot { padding: 12px 16px; }
+  /* The theme turns top-bar buttons into bare icons here; keep the primary one's glyph visible. */
+  .topbar .btn.primary { color: var(--ink); }
+}
+</style>
 </head>
-
-<body class="p-4 sm:p-6">
-  <div class="max-w-7xl mx-auto space-y-4">
-
-    <div class="flex items-center justify-between flex-wrap gap-3">
-      <div>
-        <h1 class="text-xl font-bold">Library</h1>
-        <div class="text-xs text-slate-400">Every filed stub, and what the engine is doing with it</div>
-      </div>
-      <div class="flex gap-2">
-        <a href="/dashboard" class="btn btn-ghost no-underline">&larr; Dashboard</a>
-        <button class="btn btn-primary" onclick="openAdd()">+ Add torrent</button>
-      </div>
-    </div>
-
-    <div class="flex gap-1 border-b border-slate-700/60" role="tablist">
-      <button class="tab tab-on" id="tabStubs" role="tab" aria-selected="true" onclick="showTab('stubs')">Stubs</button>
-      <button class="tab" id="tabMissing" role="tab" aria-selected="false" onclick="showTab('missing')">Missing episodes</button>
-    </div>
-
-    <div id="stubsView" class="space-y-4">
-    <div class="glass rounded-xl p-3 flex flex-wrap gap-3 items-end">
-      <div style="flex:1 1 260px">
-        <label>Search (name or infohash)</label>
-        <input id="q" placeholder="e.g. Supernatural, or an infohash" oninput="debouncedReload()">
-      </div>
-      <div style="width:150px">
-        <label>Type</label>
-        <select id="kind" onchange="reload(0)">
-          <option value="all">All</option>
-          <option value="movie">Movies</option>
-          <option value="tv">TV</option>
-          <option value="anime">Anime</option>
-        </select>
-      </div>
-      <div style="width:110px">
-        <label>Per page</label>
-        <select id="limit" onchange="reload(0)">
-          <option>50</option>
-          <option selected>100</option>
-          <option>250</option>
-          <option>500</option>
-        </select>
-      </div>
-      <button class="btn btn-ghost" onclick="reload(0)">Refresh</button>
-    </div>
-
-    <div class="glass rounded-xl overflow-hidden">
-      <div class="max-h-[65vh] overflow-y-auto">
-        <table>
-          <thead>
-            <tr>
-              <th style="width:38%">Name</th>
-              <th>Type</th>
-              <th>S/E</th>
-              <th>Size</th>
-              <th>Infohash</th>
-              <th>Engine</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="rows">
-            <tr>
-              <td colspan="7" class="text-slate-500 p-4">Loading…</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="flex items-center justify-between p-3 text-xs text-slate-400 border-t border-slate-700/40">
-        <span id="count">—</span>
-        <span class="flex gap-2">
-          <button class="btn btn-ghost" id="prev" onclick="page(-1)">Prev</button>
-          <button class="btn btn-ghost" id="next" onclick="page(1)">Next</button>
-        </span>
-      </div>
-    </div>
-    </div>
-
-    <!-- Every series compared with the episodes TMDB says have aired. -->
-    <div id="missingView" class="space-y-4 hidden">
-      <div class="glass rounded-xl p-3 flex flex-wrap gap-3 items-end">
-        <div style="flex:1 1 240px">
-          <label for="mq">Search show</label>
-          <input id="mq" placeholder="e.g. Supernatural" oninput="renderMissing()">
+<body>
+<div class="app">
+  <!-- ============ RAIL ============ -->
+  <aside class="rail" aria-label="Navigation">
+    <a class="brand" href="/dashboard">
+      <span class="grille" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+      <span><span class="word">tiramisu</span><br><span class="sub">unified engine</span></span>
+    </a>
+    <nav class="nav">
+      <span class="label">Monitor</span>
+      <a href="/dashboard"><span class="num">◉</span>Dashboard</a>
+      <a href="/library" class="active" aria-current="page"><span class="num">▤</span>Library</a>
+    </nav>
+    <nav class="nav">
+      <span class="label">Settings</span>
+      <a href="/control#streaming"><span class="num">01</span>Streaming &amp; FUSE</a>
+      <a href="/control#network"><span class="num">02</span>Network &amp; VPN</a>
+      <a href="/control#sources"><span class="num">03</span>Sources &amp; Media</a>
+      <a href="/control#engine"><span class="num">04</span>Engine</a>
+      <a href="/control#release"><span class="num">05</span>Release Selection</a>
+      <a href="/control#scheduler"><span class="num">06</span>Scheduler</a>
+      <a href="/control#access"><span class="num">07</span>Access</a>
+    </nav>
+    <nav class="nav">
+      <span class="label">Reference</span>
+      <a href="/api-docs"><span class="num">{}</span>API</a>
+    </nav>
+    <div class="rail-foot">
+      <div class="row"><span class="lamp off" id="rail-lamp"></span><span class="small" style="font-weight:500" id="rail-state">Engine</span></div>
+      <span class="mono faint small" id="rail-version">—</span>
+      <a class="row" id="rail-update" hidden href="https://github.com/MrRobotoGit/tiramisu/releases/latest" target="_blank" rel="noopener"><span class="chip-tag">Update</span><span class="txt small"></span></a>
+      <hr>
+      <div class="row">
+        <div class="seg sm" role="group" aria-label="Theme">
+          <button type="button" data-theme-choice="light" onclick="TiramisuUI.setTheme('light')">Light</button>
+          <button type="button" data-theme-choice="dark" onclick="TiramisuUI.setTheme('dark')">Dark</button>
+          <button type="button" data-theme-choice="auto" onclick="TiramisuUI.setTheme('auto')">Auto</button>
         </div>
-        <div style="width:140px">
-          <label for="mkind">Type</label>
-          <select id="mkind" onchange="loadMissing(false)">
-            <option value="all">All</option>
-            <option value="tv">TV</option>
-            <option value="anime">Anime</option>
-          </select>
-        </div>
-        <div style="width:170px">
-          <label for="mcat">Gap kind</label>
-          <select id="mcat" onchange="renderMissing()">
-            <option value="">Any</option>
-            <option value="only_e01">Only E01 filed</option>
-            <option value="whole">Whole season</option>
-            <option value="partial">Partial season</option>
-          </select>
-        </div>
-        <label class="flex items-center gap-2 text-sm text-slate-300" style="text-transform:none;letter-spacing:normal;margin:0 0 .45rem">
-          <input type="checkbox" id="mmis" onchange="renderMissing()"> Include numbering mismatches
-        </label>
-        <button class="btn btn-ghost" onclick="loadMissing(true)">Recheck TMDB</button>
       </div>
-      <div id="msummary" class="text-xs text-slate-400">—</div>
-      <div class="glass rounded-xl overflow-hidden">
-        <div class="max-h-[65vh] overflow-y-auto">
-          <table>
-            <thead>
-              <tr>
-                <th style="width:30%">Show</th>
-                <th>Type</th>
-                <th>Aired</th>
-                <th>Filed</th>
-                <th>Missing</th>
-                <th>Gaps</th>
-              </tr>
-            </thead>
-            <tbody id="mrows">
-              <tr>
-                <td colspan="6" class="text-slate-500 p-4">Open this tab to build the report.</td>
-              </tr>
-            </tbody>
-          </table>
+      <a href="https://github.com/sponsors/MrRobotoGit" target="_blank" rel="noopener">♥&nbsp; Support the project</a>
+      <a href="https://github.com/MrRobotoGit/tiramisu" target="_blank" rel="noopener">★&nbsp; Star on GitHub <span class="chip-tag" id="rail-stars" hidden></span></a>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <div class="main">
+    <header class="topbar">
+      <button type="button" class="btn sm menu-btn" onclick="TiramisuUI.toggleRail(true)" aria-label="Open navigation">≡</button>
+      <span class="crumb hide-sm">Monitor &nbsp;/&nbsp; Library</span>
+      <span class="spacer"></span>
+      <a class="chip-tag fill" id="top-update" hidden href="https://github.com/MrRobotoGit/tiramisu/releases/latest" target="_blank" rel="noopener"></a>
+      <button type="button" class="btn primary sm" onclick="openAdd()" aria-label="Add torrent"><span class="ico">+</span><span class="hide-sm">Add torrent</span></button>
+    </header>
+
+    <div class="content">
+      <div class="page-head">
+        <div class="text">
+          <h1 class="h1">Library</h1>
+          <p>Every filed stub, and what the engine is doing with it.</p>
+        </div>
+        <span class="spacer"></span>
+        <div class="seg" role="tablist" aria-label="View">
+          <button type="button" class="active" id="tabStubs" role="tab" aria-selected="true" onclick="showTab('stubs')">Stubs</button>
+          <button type="button" id="tabMissing" role="tab" aria-selected="false" onclick="showTab('missing')">Missing episodes</button>
+        </div>
+      </div>
+
+      <!-- ------------------------------------------------------ stubs ----- -->
+      <div id="stubsView" class="card">
+        <div class="card-head"><span class="label ink">Stubs</span><span class="spacer"></span><span class="small faint" id="count">—</span></div>
+        <div class="card-body flush">
+          <div class="filters" style="padding:16px 24px">
+            <div class="field grow">
+              <label for="q">Search (name or infohash)</label>
+              <div class="input"><input id="q" placeholder="e.g. Supernatural, or an infohash" oninput="debouncedReload()"></div>
+            </div>
+            <div class="field" style="width:150px">
+              <label for="kind">Type</label>
+              <div class="input select"><select id="kind" onchange="reload(0)">
+                <option value="all">All</option>
+                <option value="movie">Movies</option>
+                <option value="tv">TV</option>
+                <option value="anime">Anime</option>
+              </select></div>
+            </div>
+            <div class="field" style="width:110px">
+              <label for="limit">Per page</label>
+              <div class="input select"><select id="limit" onchange="reload(0)">
+                <option>50</option>
+                <option selected>100</option>
+                <option>250</option>
+                <option>500</option>
+              </select></div>
+            </div>
+            <button type="button" class="btn" onclick="reload(0)">Refresh</button>
+          </div>
+          <div class="lib-scroll">
+            <table class="lib-table">
+              <thead>
+                <tr>
+                  <th style="width:38%">Name</th>
+                  <th>Type</th>
+                  <th>S/E</th>
+                  <th>Size</th>
+                  <th>Infohash</th>
+                  <th>Engine</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="rows">
+                <tr class="msg-row"><td colspan="7">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="lib-foot">
+            <span class="spacer"></span>
+            <button type="button" class="btn sm" id="prev" onclick="page(-1)">Prev</button>
+            <button type="button" class="btn sm" id="next" onclick="page(1)">Next</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Every series compared with the episodes TMDB says have aired. -->
+      <div id="missingView" class="card hidden">
+        <div class="card-head"><span class="label ink">Missing episodes</span><span class="spacer"></span><button type="button" class="btn sm" onclick="loadMissing(true)">Recheck TMDB</button></div>
+        <div class="card-body flush">
+          <div class="filters" style="padding:16px 24px">
+            <div class="field grow">
+              <label for="mq">Search show</label>
+              <div class="input"><input id="mq" placeholder="e.g. Supernatural" oninput="renderMissing()"></div>
+            </div>
+            <div class="field" style="width:140px">
+              <label for="mkind">Type</label>
+              <div class="input select"><select id="mkind" onchange="loadMissing(false)">
+                <option value="all">All</option>
+                <option value="tv">TV</option>
+                <option value="anime">Anime</option>
+              </select></div>
+            </div>
+            <div class="field" style="width:180px">
+              <label for="mcat">Gap kind</label>
+              <div class="input select"><select id="mcat" onchange="renderMissing()">
+                <option value="">Any</option>
+                <option value="only_e01">Only E01 filed</option>
+                <option value="whole">Whole season</option>
+                <option value="partial">Partial season</option>
+              </select></div>
+            </div>
+            <label class="check"><input type="checkbox" id="mmis" onchange="renderMissing()"> Include numbering mismatches</label>
+          </div>
+          <div class="small faint" id="msummary" style="padding:0 24px 12px">—</div>
+          <div class="lib-scroll">
+            <table class="lib-table">
+              <thead>
+                <tr>
+                  <th style="width:30%">Show</th>
+                  <th>Type</th>
+                  <th>Aired</th>
+                  <th>Filed</th>
+                  <th>Missing</th>
+                  <th>Gaps</th>
+                </tr>
+              </thead>
+              <tbody id="mrows">
+                <tr class="msg-row"><td colspan="6">Open this tab to build the report.</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
   </div>
+</div>
 
-  <!-- ---------------------------------------------------------- add ----- -->
-  <dialog id="addDlg">
-    <form method="dialog" onsubmit="return false">
-      <div class="px-4 py-3 border-b border-slate-700/60 flex justify-between items-center">
-        <strong class="text-sm">Add a torrent</strong>
-        <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Close</button>
+<!-- ---------------------------------------------------------- add ----- -->
+<dialog id="addDlg" class="lib-dialog">
+  <form method="dialog" onsubmit="return false">
+    <div class="card-head"><span class="label ink">Add a torrent</span><span class="spacer"></span><button type="button" class="btn ghost sm" onclick="el('addDlg').close()">Close</button></div>
+
+    <div class="card-body">
+      <div class="field">
+        <label for="a_magnet">Magnet or infohash</label>
+        <div class="row-fields" style="align-items:stretch">
+          <div class="input area grow"><textarea id="a_magnet" rows="2" placeholder="magnet:?xt=urn:btih:… or a 40-char infohash"></textarea></div>
+          <button type="button" class="btn primary" id="inspectBtn" onclick="inspect()">Inspect</button>
+        </div>
+        <div class="hint">
+          Inspect reads the torrent's file list and works out whether it is a film, one
+          episode, or a season pack, so the fields below are filled from what is
+          actually inside rather than from the name.
+        </div>
       </div>
 
-      <div class="p-4 space-y-3 max-h-[72vh] overflow-y-auto">
-        <div>
-          <label>Magnet or infohash</label>
-          <div class="flex gap-2">
-            <textarea id="a_magnet" rows="2" placeholder="magnet:?xt=urn:btih:… or a 40-char infohash"></textarea>
-            <button class="btn btn-primary whitespace-nowrap" id="inspectBtn" onclick="inspect()">Inspect</button>
+      <div id="inspectMsg" class="small"></div>
+
+      <div id="inspectPanel" class="hidden" style="display:flex;flex-direction:column;gap:12px">
+        <div class="box inspect-head">
+          <div class="t" id="i_title">—</div>
+          <div class="meta">
+            <span id="i_size"></span>
+            <span id="i_res" class="chip-tag sig-blue hidden"></span>
+            <span id="i_kind" class="chip-tag soft"></span>
           </div>
-          <div class="text-[11px] text-slate-500 mt-1">
-            Inspect reads the torrent's file list and works out whether it is a film, one
-            episode, or a season pack — so the fields below are filled from what is
-            actually inside rather than from the name.
-          </div>
+          <div class="small warn-text" id="i_note"></div>
         </div>
 
-        <div id="inspectMsg" class="text-xs"></div>
-
-        <div id="inspectPanel" class="hidden space-y-2">
-          <div class="glass rounded-lg p-3 space-y-1">
-            <div class="text-sm font-semibold" id="i_title">—</div>
-            <div class="text-xs text-slate-400 flex flex-wrap gap-2 items-center">
-              <span id="i_size"></span>
-              <span id="i_res" class="pill bg-blue-500/15 text-blue-300 hidden"></span>
-              <span id="i_kind" class="pill bg-purple-500/15 text-purple-300"></span>
-            </div>
-            <div class="text-xs text-amber-300/90" id="i_note"></div>
-          </div>
-
-          <div>
-            <label>Files <span class="normal-case text-slate-500" id="i_filecount"></span></label>
-            <div class="glass rounded-lg max-h-52 overflow-y-auto" id="i_files"></div>
-            <div class="text-[11px] text-slate-500 mt-1">
-              Pick which file the stub points at. <em>Auto</em> uses the largest video file,
-              which is what you want unless the torrent bundles more than one feature.
-              File choice is ignored when filing a pack — every episode gets its own stub.
-            </div>
+        <div class="field">
+          <label>Files <span class="faint" id="i_filecount"></span></label>
+          <div class="box files" id="i_files"></div>
+          <div class="hint">
+            Pick which file the stub points at. <em>Auto</em> uses the largest video file,
+            which is what you want unless the torrent bundles more than one feature.
+            File choice is ignored when filing a pack: every episode gets its own stub.
           </div>
         </div>
-
-        <div class="flex gap-3">
-          <div style="width:130px">
-            <label>Type</label>
-            <select id="a_type" onchange="onTypeChange()">
-              <option value="movie">Movie</option>
-              <option value="tv">TV</option>
-              <option value="anime">Anime</option>
-            </select>
-          </div>
-          <div style="flex:1">
-            <label>Title (becomes the filename)</label>
-            <input id="a_title" placeholder="Start typing to search TMDB…"
-              oninput="debouncedTmdb(); checkTitle()" autocomplete="off">
-            <div id="titleWarn" class="hidden text-[11px] text-amber-300 mt-1">
-              This still looks like a release name. It becomes the folder name, so leave only
-              the title — a season or quality tag here creates a second, separate show.
-            </div>
-            <div id="tmdbBox" class="glass rounded-lg mt-1 hidden max-h-48 overflow-y-auto"></div>
-          </div>
-          <div style="width:90px">
-            <label>Year</label>
-            <input id="a_year" type="number" placeholder="2024">
-          </div>
-        </div>
-
-        <div class="flex gap-3 items-end">
-          <div style="flex:1">
-            <label>IMDB id (optional)</label>
-            <input id="a_imdb" placeholder="tt1234567">
-          </div>
-          <div style="width:90px" class="tv-only hidden">
-            <label>Season</label>
-            <input id="a_season" type="number" placeholder="pack: auto">
-          </div>
-          <div style="width:120px" class="tv-only hidden">
-            <label>Episode</label>
-            <input id="a_episode" type="number" placeholder="blank = pack">
-          </div>
-          <div style="width:120px">
-            <label>File index</label>
-            <input id="a_fileindex" type="number" placeholder="0 = auto">
-          </div>
-        </div>
-
-        <div class="text-[11px] text-slate-400 leading-relaxed">
-          The stub is written immediately; Jellyfin shows it after its next library scan.
-        </div>
-
-        <div id="addMsg" class="text-xs"></div>
       </div>
 
-      <div class="px-4 py-3 border-t border-slate-700/60 flex justify-end gap-2">
-        <button class="btn btn-ghost" onclick="document.getElementById('addDlg').close()">Cancel</button>
-        <button class="btn btn-primary" id="addBtn" onclick="submitAdd()">Add to library</button>
+      <div class="row-fields">
+        <div class="field" style="width:130px">
+          <label for="a_type">Type</label>
+          <div class="input select"><select id="a_type" onchange="onTypeChange()">
+            <option value="movie">Movie</option>
+            <option value="tv">TV</option>
+            <option value="anime">Anime</option>
+          </select></div>
+        </div>
+        <div class="field grow">
+          <label for="a_title">Title (becomes the filename)</label>
+          <div class="input"><input id="a_title" placeholder="Start typing to search TMDB…" oninput="debouncedTmdb(); checkTitle()" autocomplete="off"></div>
+        </div>
+        <div class="field" style="width:90px">
+          <label for="a_year">Year</label>
+          <div class="input"><input id="a_year" type="number" placeholder="2024"></div>
+        </div>
       </div>
-    </form>
-  </dialog>
+      <div id="titleWarn" class="hidden small warn-text" style="margin-top:-10px">
+        This still looks like a release name. It becomes the folder name, so leave only
+        the title: a season or quality tag here creates a second, separate show.
+      </div>
+      <div id="tmdbBox" class="box tmdb hidden" style="margin-top:-10px"></div>
 
-  <!-- ------------------------------------------------------- remove ----- -->
-  <dialog id="rmDlg">
-    <form method="dialog" onsubmit="return false">
-      <div class="px-4 py-3 border-b border-slate-700/60"><strong class="text-sm">Remove from library</strong></div>
-      <div class="p-4 space-y-3">
-        <div class="text-sm text-slate-300 mono break-all" id="rm_path"></div>
-        <label class="flex items-start gap-2 normal-case tracking-normal text-sm text-slate-300"
-          style="text-transform:none;letter-spacing:normal">
-          <input type="checkbox" id="rm_blacklist" class="mt-1">
-          <span>
-            Don't re-add
-            <span class="block text-[11px] text-slate-500">
-              Without this the sync engines are free to add the title back on their next
-              run. Tick it to remove for good; leave it clear if you are removing to
-              replace the release with a better one.
-            </span>
+      <div class="row-fields">
+        <div class="field grow">
+          <label for="a_imdb">IMDB id (optional)</label>
+          <div class="input"><input id="a_imdb" placeholder="tt1234567"></div>
+        </div>
+        <div class="field tv-only hidden" style="width:120px">
+          <label for="a_season">Season</label>
+          <div class="input"><input id="a_season" type="number" placeholder="pack: auto"></div>
+        </div>
+        <div class="field tv-only hidden" style="width:120px">
+          <label for="a_episode">Episode</label>
+          <div class="input"><input id="a_episode" type="number" placeholder="blank = pack"></div>
+        </div>
+        <div class="field" style="width:120px">
+          <label for="a_fileindex">File index</label>
+          <div class="input"><input id="a_fileindex" type="number" placeholder="0 = auto"></div>
+        </div>
+      </div>
+
+      <div class="small faint">The stub is written immediately; Jellyfin shows it after its next library scan.</div>
+
+      <div id="addMsg" class="small"></div>
+    </div>
+
+    <div class="dlg-foot">
+      <button type="button" class="btn ghost" onclick="el('addDlg').close()">Cancel</button>
+      <button type="button" class="btn primary" id="addBtn" onclick="submitAdd()">Add to library</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ------------------------------------------------------- remove ----- -->
+<dialog id="rmDlg" class="lib-dialog narrow">
+  <form method="dialog" onsubmit="return false">
+    <div class="card-head"><span class="label ink">Remove from library</span></div>
+    <div class="card-body">
+      <div class="rm-path" id="rm_path"></div>
+      <label class="rm-opt">
+        <input type="checkbox" id="rm_blacklist">
+        <span>
+          Don't re-add
+          <span class="hint" style="display:block;margin-top:2px">
+            Without this the sync engines are free to add the title back on their next
+            run. Tick it to remove for good; leave it clear if you are removing to
+            replace the release with a better one.
           </span>
-        </label>
-        <div id="rmMsg" class="text-xs"></div>
-      </div>
-      <div class="px-4 py-3 border-t border-slate-700/60 flex justify-end gap-2">
-        <button class="btn btn-ghost" onclick="document.getElementById('rmDlg').close()">Cancel</button>
-        <button class="btn btn-danger" id="rmBtn" onclick="confirmRemove()">Remove</button>
-      </div>
-    </form>
-  </dialog>
+        </span>
+      </label>
+      <div id="rmMsg" class="small"></div>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn ghost" onclick="el('rmDlg').close()">Cancel</button>
+      <button type="button" class="btn danger" id="rmBtn" onclick="confirmRemove()">Remove</button>
+    </div>
+  </form>
+</dialog>
 
-  <script>
-    let offset = 0, total = 0, activeHashes = new Set(), inspected = null, rmTarget = null;
+<script>
+  let offset = 0, total = 0, activeHashes = new Set(), inspected = null, rmTarget = null;
 
-    const el = id => document.getElementById(id);
-    const fmtSize = b => {
-      if (!b || b < 1024) return (b || 0) + ' B';
-      const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, v = b;
-      while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
-      return v.toFixed(1) + ' ' + u[i];
-    };
-    const esc = s => (s || '').replace(/[&<>"']/g, c =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const el = id => document.getElementById(id);
+  const fmtSize = b => {
+    if (!b || b < 1024) return (b || 0) + ' B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
+    return v.toFixed(1) + ' ' + u[i];
+  };
+  const esc = s => (s || '').replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const msgRow = (cols, text, cls) => '<tr class="msg-row"><td colspan="' + cols + '"' + (cls ? ' class="' + cls + '"' : '') + '>' + text + '</td></tr>';
+  const errSpan = text => '<span class="accent">' + text + '</span>';
 
-    // A proxy such as Cloudflare answers a 502 or 504 with its own HTML page, which
-    // hides Tiramisu's message. Say what those statuses mean here instead.
-    function failure(status, txt) {
-      if (!/^\s*</.test(txt)) return txt.slice(0, 300);
-      if (status === 504 || status === 524) return 'No file list arrived from the swarm in time. The engine keeps ' +
-        'looking for peers, so try again in a minute; if it still fails, the release has no reachable seeders.';
-      if (status === 502 || status === 521 || status === 522) return 'Tiramisu did not answer. It may be restarting; try again shortly.';
-      return 'HTTP ' + status + ' from the proxy in front of Tiramisu.';
+  // A proxy such as Cloudflare answers a 502 or 504 with its own HTML page, which
+  // hides Tiramisu's message. Say what those statuses mean here instead.
+  function failure(status, txt) {
+    if (!/^\s*</.test(txt)) return txt.slice(0, 300);
+    if (status === 504 || status === 524) return 'No file list arrived from the swarm in time. The engine keeps ' +
+      'looking for peers, so try again in a minute; if it still fails, the release has no reachable seeders.';
+    if (status === 502 || status === 521 || status === 522) return 'Tiramisu did not answer. It may be restarting; try again shortly.';
+    return 'HTTP ' + status + ' from the proxy in front of Tiramisu.';
+  }
+
+  function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
+  const debouncedReload = debounce(() => reload(0), 300);
+
+  // Name shown to a person: the stub filename minus directory and hash suffix.
+  function pretty(fusePath) {
+    const base = (fusePath || '').split('/').pop().replace(/\.mkv$/i, '');
+    return base.replace(/_[0-9a-f]{8}$/, '').replace(/_/g, ' ');
+  }
+  function kindOf(fusePath) {
+    const top = (fusePath || '').split('/')[0];
+    return top === 'tv' || top === 'anime' ? top : 'movie';
+  }
+
+  async function loadActive() {
+    try {
+      const d = await (await fetch('/api/torrents')).json();
+      activeHashes = new Set((d || []).map(t => (t.hash || '').toLowerCase()));
+    } catch (e) { activeHashes = new Set(); }
+  }
+
+  async function reload(newOffset) {
+    if (newOffset !== undefined) offset = newOffset;
+    const limit = +el('limit').value;
+    const p = new URLSearchParams({
+      type: el('kind').value, search: el('q').value.trim(), limit, offset
+    });
+    el('rows').innerHTML = msgRow(7, 'Loading…');
+    await loadActive();
+    let d;
+    try { d = await (await fetch('/api/library/list?' + p)).json(); }
+    catch (e) {
+      el('rows').innerHTML = msgRow(7, esc(String(e)), 'accent');
+      return;
     }
+    const items = d.items || [];
+    total = d.total || 0;
+    el('rows').innerHTML = items.length ? items.map(it => {
+      const live = activeHashes.has((it.hash || '').toLowerCase());
+      const se = it.season ? 'S' + String(it.season).padStart(2, '0') +
+        (it.episode ? 'E' + String(it.episode).padStart(2, '0') : ' pack') : '—';
+      return '<tr>' +
+        '<td class="nm" title="' + esc(it.fuse_path) + '">' + esc(pretty(it.fuse_path)) + '</td>' +
+        '<td>' + kindOf(it.fuse_path) + '</td>' +
+        '<td class="mono">' + se + '</td>' +
+        '<td class="mono">' + fmtSize(it.size) + '</td>' +
+        '<td class="mono faint" title="' + esc(it.hash) + '">' + esc((it.hash || '').slice(0, 12)) + '</td>' +
+        '<td>' + (live ? '<span class="chip-tag sig-green">active</span>' : '<span class="chip-tag soft">idle</span>') + '</td>' +
+        '<td><button type="button" class="btn sm danger" onclick="openRemove(\'' +
+        esc(it.fuse_path) + '\')">Remove</button></td></tr>';
+    }).join('') : msgRow(7, 'Nothing matches.');
 
-    function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms) } }
-    const debouncedReload = debounce(() => reload(0), 300);
+    el('count').textContent = (items.length ? (offset + 1) + '–' + (offset + items.length) : '0') + ' of ' + total;
+    el('prev').disabled = offset <= 0;
+    el('next').disabled = offset + items.length >= total;
+  }
 
-    // Name shown to a person: the stub filename minus directory and hash suffix.
-    function pretty(fusePath) {
-      const base = (fusePath || '').split('/').pop().replace(/\.mkv$/i, '');
-      return base.replace(/_[0-9a-f]{8}$/, '').replace(/_/g, ' ');
-    }
-    function kindOf(fusePath) {
-      const top = (fusePath || '').split('/')[0];
-      return top === 'tv' || top === 'anime' ? top : 'movie';
-    }
+  function page(dir) {
+    const next = offset + dir * (+el('limit').value);
+    if (next < 0 || next >= total) return;
+    reload(next);
+  }
 
-    async function loadActive() {
-      try {
-        const d = await (await fetch('/api/torrents')).json();
-        activeHashes = new Set((d || []).map(t => (t.hash || '').toLowerCase()));
-      } catch (e) { activeHashes = new Set(); }
-    }
+  /* ---------------------------- remove ---------------------------- */
 
-    async function reload(newOffset) {
-      if (newOffset !== undefined) offset = newOffset;
-      const limit = +el('limit').value;
-      const p = new URLSearchParams({
-        type: el('kind').value, search: el('q').value.trim(), limit, offset
+  function openRemove(fusePath) {
+    rmTarget = fusePath;
+    el('rm_path').textContent = fusePath;
+    el('rm_blacklist').checked = false;
+    el('rmMsg').textContent = '';
+    el('rmDlg').showModal();
+  }
+
+  async function confirmRemove() {
+    el('rmBtn').disabled = true;
+    try {
+      const r = await fetch('/api/library/remove', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: rmTarget, blacklist: el('rm_blacklist').checked })
       });
-      el('rows').innerHTML = '<tr><td colspan="7" class="text-slate-500 p-4">Loading…</td></tr>';
-      await loadActive();
-      let d;
-      try { d = await (await fetch('/api/library/list?' + p)).json(); }
-      catch (e) {
-        el('rows').innerHTML = '<tr><td colspan="7" class="text-red-400 p-4">' + esc(String(e)) + '</td></tr>';
+      if (!r.ok) {
+        el('rmMsg').innerHTML = errSpan('Failed (' + r.status + '): ' + esc(failure(r.status, await r.text())));
         return;
       }
-      const items = d.items || [];
-      total = d.total || 0;
-      el('rows').innerHTML = items.length ? items.map(it => {
-        const live = activeHashes.has((it.hash || '').toLowerCase());
-        const se = it.season ? 'S' + String(it.season).padStart(2, '0') +
-          (it.episode ? 'E' + String(it.episode).padStart(2, '0') : ' pack') : '—';
-        return '<tr>' +
-          '<td title="' + esc(it.fuse_path) + '">' + esc(pretty(it.fuse_path)) + '</td>' +
-          '<td class="text-slate-400">' + kindOf(it.fuse_path) + '</td>' +
-          '<td class="text-slate-400 mono">' + se + '</td>' +
-          '<td class="mono text-slate-300">' + fmtSize(it.size) + '</td>' +
-          '<td class="mono text-[11px] text-slate-500" title="' + esc(it.hash) + '">' +
-          esc((it.hash || '').slice(0, 12)) + '</td>' +
-          '<td>' + (live ? '<span class="pill bg-green-500/15 text-green-400">active</span>'
-            : '<span class="pill bg-slate-500/10 text-slate-500">idle</span>') + '</td>' +
-          '<td class="text-right"><button class="btn btn-danger" onclick="openRemove(\'' +
-          esc(it.fuse_path) + '\')">Remove</button></td></tr>';
-      }).join('') : '<tr><td colspan="7" class="text-slate-500 p-4">Nothing matches.</td></tr>';
+      el('rmDlg').close();
+      reload();
+    } catch (e) {
+      el('rmMsg').innerHTML = errSpan(esc(String(e)));
+    } finally { el('rmBtn').disabled = false; }
+  }
 
-      el('count').textContent = (items.length ? (offset + 1) + '–' + (offset + items.length) : '0') + ' of ' + total;
-      el('prev').disabled = offset <= 0;
-      el('next').disabled = offset + items.length >= total;
-    }
+  /* ------------------------------ add ----------------------------- */
 
-    function page(dir) {
-      const next = offset + dir * (+el('limit').value);
-      if (next < 0 || next >= total) return;
-      reload(next);
-    }
+  function openAdd() {
+    el('addMsg').textContent = '';
+    el('inspectMsg').textContent = '';
+    el('inspectPanel').classList.add('hidden');
+    inspected = null;
+    el('addDlg').showModal();
+    onTypeChange();
+  }
 
-    /* ---------------------------- remove ---------------------------- */
+  function onTypeChange() {
+    const isTV = el('a_type').value !== 'movie';
+    document.querySelectorAll('.tv-only').forEach(n => n.classList.toggle('hidden', !isTV));
+  }
 
-    function openRemove(fusePath) {
-      rmTarget = fusePath;
-      el('rm_path').textContent = fusePath;
-      el('rm_blacklist').checked = false;
-      el('rmMsg').textContent = '';
-      el('rmDlg').showModal();
-    }
+  async function inspect() {
+    const magnet = el('a_magnet').value.trim();
+    const msg = el('inspectMsg');
+    if (!magnet) { msg.innerHTML = errSpan('Paste a magnet or infohash first.'); return; }
+    const body = /^[0-9a-fA-F]{40}$/.test(magnet)
+      ? { hash: magnet.toLowerCase() } : { magnet };
+    // The longest wait under Cloudflare's 100-second cut-off; some releases take
+    // over a minute to send their file list.
+    body.metadata_wait = 90;
 
-    async function confirmRemove() {
-      el('rmBtn').disabled = true;
-      try {
-        const r = await fetch('/api/library/remove', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: rmTarget, blacklist: el('rm_blacklist').checked })
-        });
-        if (!r.ok) {
-          el('rmMsg').innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' +
-            esc(failure(r.status, await r.text())) + '</span>';
-          return;
-        }
-        el('rmDlg').close();
-        reload();
-      } catch (e) {
-        el('rmMsg').innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
-      } finally { el('rmBtn').disabled = false; }
-    }
-
-    /* ------------------------------ add ----------------------------- */
-
-    function openAdd() {
-      el('addMsg').textContent = '';
-      el('inspectMsg').textContent = '';
-      el('inspectPanel').classList.add('hidden');
-      inspected = null;
-      el('addDlg').showModal();
-      onTypeChange();
-    }
-
-    function onTypeChange() {
-      const isTV = el('a_type').value !== 'movie';
-      document.querySelectorAll('.tv-only').forEach(n => n.classList.toggle('hidden', !isTV));
-    }
-
-    async function inspect() {
-      const magnet = el('a_magnet').value.trim();
-      const msg = el('inspectMsg');
-      if (!magnet) { msg.innerHTML = '<span class="text-red-400">Paste a magnet or infohash first.</span>'; return; }
-      const body = /^[0-9a-fA-F]{40}$/.test(magnet)
-        ? { hash: magnet.toLowerCase() } : { magnet };
-      // The longest wait under Cloudflare's 100-second cut-off; some releases take
-      // over a minute to send their file list.
-      body.metadata_wait = 90;
-
-      el('inspectBtn').disabled = true;
-      msg.innerHTML = '<span class="text-slate-400">Fetching the file list from the swarm — up to 90s…</span>';
-      try {
-        const r = await fetch('/api/library/inspect', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const txt = await r.text();
-        if (!r.ok) {
-          msg.innerHTML = '<span class="text-red-400">' + esc(failure(r.status, txt)) + '</span>';
-          return;
-        }
-        inspected = JSON.parse(txt);
-        msg.textContent = '';
-        renderInspect(inspected);
-      } catch (e) {
-        msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
-      } finally { el('inspectBtn').disabled = false; }
-    }
-
-    function renderInspect(d) {
-      el('i_title').textContent = d.title || '(unnamed torrent)';
-      el('i_size').textContent = fmtSize(d.size) + ' · ' + (d.files || []).length + ' files';
-      const res = el('i_res');
-      res.classList.toggle('hidden', !d.resolution);
-      res.textContent = d.resolution || '';
-      el('i_kind').textContent = d.pack ? (d.kind + ' pack') : d.kind;
-      el('i_note').textContent = d.note || '';
-      el('i_filecount').textContent = '(' + d.video_count + ' video)';
-
-      // Auto row first, then every file; non-video rows stay visible because a
-      // mislabelled extension is exactly when picking by hand matters.
-      const rows = ['<label class="filerow"><input type="radio" name="fidx" value="0" ' +
-        (d.file_index === 0 ? 'checked' : '') + '><span class="text-slate-300">Auto — largest video file</span>' +
-        '<span></span><span></span></label>'];
-      for (const f of d.files || []) {
-        const se = f.episode ? 'S' + String(f.season).padStart(2, '0') + 'E' + String(f.episode).padStart(2, '0') : '';
-        rows.push('<label class="filerow" title="' + esc(f.source_path) + '">' +
-          '<input type="radio" name="fidx" value="' + f.file_index + '" ' + (d.file_index === f.file_index ? 'checked' : '') + '>' +
-          '<span class="' + (f.video ? 'text-slate-200' : 'text-slate-500') + ' truncate">' + esc(f.name) + '</span>' +
-          '<span class="mono text-slate-400 text-right">' + fmtSize(f.size) + '</span>' +
-          '<span class="mono text-[11px] ' + (se ? 'text-amber-300' : 'text-slate-600') + '">' + (se || (f.video ? 'video' : '—')) + '</span>' +
-          '</label>');
+    el('inspectBtn').disabled = true;
+    msg.innerHTML = '<span class="faint">Fetching the file list from the swarm, up to 90 s…</span>';
+    try {
+      const r = await fetch('/api/library/inspect', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const txt = await r.text();
+      if (!r.ok) {
+        msg.innerHTML = errSpan(esc(failure(r.status, txt)));
+        return;
       }
-      el('i_files').innerHTML = rows.join('');
-      el('i_files').onchange = () => {
-        const v = document.querySelector('input[name=fidx]:checked');
-        if (v) el('a_fileindex').value = v.value;
-      };
-      el('inspectPanel').classList.remove('hidden');
+      inspected = JSON.parse(txt);
+      msg.textContent = '';
+      renderInspect(inspected);
+    } catch (e) {
+      msg.innerHTML = errSpan(esc(String(e)));
+    } finally { el('inspectBtn').disabled = false; }
+  }
 
-      // Prefill from the contents. Anime stays anime if the user already chose
-      // it: the engine cannot tell anime from ordinary TV, only the user can.
-      if (d.kind === 'tv' && el('a_type').value === 'movie') el('a_type').value = 'tv';
-      if (d.kind === 'movie' && el('a_type').value !== 'movie') el('a_type').value = 'movie';
-      onTypeChange();
-      el('a_season').value = d.season || '';
-      el('a_episode').value = d.pack ? '' : (d.episode || '');
-      el('a_fileindex').value = d.file_index || 0;
-      if (!el('a_title').value.trim() && d.title) {
-        // A release name is not a title, but it is a far better starting point
-        // for the TMDB search than an empty box.
-        el('a_title').value = cleanTitle(d.title);
-        if (!el('a_year').value) el('a_year').value = yearOf(d.title);
-        debouncedTmdb();
-      }
+  function renderInspect(d) {
+    el('i_title').textContent = d.title || '(unnamed torrent)';
+    el('i_size').textContent = fmtSize(d.size) + ' · ' + (d.files || []).length + ' files';
+    const res = el('i_res');
+    res.classList.toggle('hidden', !d.resolution);
+    res.textContent = d.resolution || '';
+    el('i_kind').textContent = d.pack ? (d.kind + ' pack') : d.kind;
+    el('i_note').textContent = d.note || '';
+    el('i_filecount').textContent = '(' + d.video_count + ' video)';
+
+    // Auto row first, then every file; non-video rows stay visible because a
+    // mislabelled extension is exactly when picking by hand matters.
+    const rows = ['<label class="filerow"><input type="radio" name="fidx" value="0" ' +
+      (d.file_index === 0 ? 'checked' : '') + '><span class="name">Auto: largest video file</span>' +
+      '<span></span><span></span></label>'];
+    for (const f of d.files || []) {
+      const se = f.episode ? 'S' + String(f.season).padStart(2, '0') + 'E' + String(f.episode).padStart(2, '0') : '';
+      rows.push('<label class="filerow" title="' + esc(f.source_path) + '">' +
+        '<input type="radio" name="fidx" value="' + f.file_index + '" ' + (d.file_index === f.file_index ? 'checked' : '') + '>' +
+        '<span class="name' + (f.video ? '' : ' faint') + '">' + esc(f.name) + '</span>' +
+        '<span class="sz">' + fmtSize(f.size) + '</span>' +
+        '<span class="se ' + (se ? 'warn-text' : 'faint') + '">' + (se || (f.video ? 'video' : '—')) + '</span>' +
+        '</label>');
+    }
+    el('i_files').innerHTML = rows.join('');
+    el('i_files').onchange = () => {
+      const v = document.querySelector('input[name=fidx]:checked');
+      if (v) el('a_fileindex').value = v.value;
+    };
+    el('inspectPanel').classList.remove('hidden');
+
+    // Prefill from the contents. Anime stays anime if the user already chose
+    // it: the engine cannot tell anime from ordinary TV, only the user can.
+    if (d.kind === 'tv' && el('a_type').value === 'movie') el('a_type').value = 'tv';
+    if (d.kind === 'movie' && el('a_type').value !== 'movie') el('a_type').value = 'movie';
+    onTypeChange();
+    el('a_season').value = d.season || '';
+    el('a_episode').value = d.pack ? '' : (d.episode || '');
+    el('a_fileindex').value = d.file_index || 0;
+    if (!el('a_title').value.trim() && d.title) {
+      // A release name is not a title, but it is a far better starting point
+      // for the TMDB search than an empty box.
+      el('a_title').value = cleanTitle(d.title);
+      if (!el('a_year').value) el('a_year').value = yearOf(d.title);
+      debouncedTmdb();
+    }
+    checkTitle();
+  }
+
+  /* Turning a release name into a title.
+   *
+   * This matters more than it looks: the title becomes the show folder, so
+   * "Ted Lasso (2020) Season 2" files seasons 2 and 3 into a folder of that
+   * name and the media server then treats it as a separate series from
+   * "Ted Lasso". Strip everything that is release metadata rather than name.
+   */
+  function stripJunk(name) {
+    let s = (name || '').replace(/[._]/g, ' ');
+    s = s.replace(/\b(1080p|2160p|720p|480p|4k|uhd|web[- ]?dl|webrip|bluray|bdrip|hdtv|x26[45]|h\.?26[45]|hevc|avc|ddp?\s?5\.?1|aac|ac3|atmos|hdr10?\+?|dv|remux|repack|proper|internal|complete|multi|dual)\b.*/i, '');
+    s = s.replace(/\b(s\d{1,2}(\s?e\d{1,3})?|seasons?\s*\d{1,2}|series\s*\d{1,2})\b.*/i, '');
+    return s;
+  }
+
+  function cleanTitle(name) {
+    let s = stripJunk(name);
+    s = s.replace(/[\(\[]\s*(19|20)\d{2}\s*[\)\]]/g, ' ');
+    s = s.replace(/[\[\(][^\])]*$/, '');
+    s = s.replace(/[\s\-_.\[\(\)\]]+$/, '').replace(/\s{2,}/g, ' ').trim();
+    // A trailing year is the release year, not part of the name: release
+    // names put it straight after the title. Keep it when it IS the title,
+    // so "1917" survives and "Blade Runner 2049 2017" loses only the 2017.
+    const trimmed = s.replace(/\s+\b(19|20)\d{2}\b$/, '').trim();
+    return trimmed || s;
+  }
+
+  function yearOf(name) {
+    const m = stripJunk(name).match(/\b(19|20)\d{2}\b/g);
+    return m ? m[m.length - 1] : '';
+  }
+
+  // Last line of defence: say so plainly when the title still looks like a
+  // release name, because the damage (a duplicate show folder) only shows up
+  // later in the media server.
+  function checkTitle() {
+    const t = el('a_title').value;
+    const bad = /\b(seasons?\s*\d|series\s*\d|s\d{2}(e\d{2})?|\d{3,4}p|web[- ]?dl|bluray|x26[45]|hevc)\b/i.test(t);
+    el('titleWarn').classList.toggle('hidden', !bad);
+  }
+
+  // TMDB lookup goes through the server, which holds the key.
+  const debouncedTmdb = debounce(async () => {
+    const q = el('a_title').value.trim();
+    const box = el('tmdbBox');
+    if (q.length < 3) { box.classList.add('hidden'); return; }
+    const kind = el('a_type').value === 'movie' ? 'movie' : 'tv';
+    let hits = [];
+    try {
+      const r = await fetch('/api/tmdb/search?type=' + kind + '&query=' + encodeURIComponent(q));
+      if (r.ok) hits = (await r.json()) || [];
+    } catch (e) { /* leave as free text */ }
+    if (!hits.length) { box.classList.add('hidden'); return; }
+    box.innerHTML = hits.slice(0, 8).map((h, i) =>
+      '<div class="tmdb-hit" data-i="' + i + '"><span>' + esc(h.title) + '</span> ' +
+      '<span class="small faint">' + esc(h.year || '') + '</span></div>').join('');
+    box.onclick = ev => {
+      const row = ev.target.closest('.tmdb-hit');
+      if (!row) return;
+      const h = hits[+row.dataset.i];
+      el('a_title').value = h.title || '';
+      if (h.year) el('a_year').value = h.year;
+      box.classList.add('hidden');
       checkTitle();
+    };
+    box.classList.remove('hidden');
+  }, 350);
+
+  async function submitAdd() {
+    const msg = el('addMsg');
+    const magnet = el('a_magnet').value.trim();
+    const title = el('a_title').value.trim();
+    if (!magnet) { msg.innerHTML = errSpan('Paste a magnet or infohash.'); return; }
+    if (!title) { msg.innerHTML = errSpan('Title is required: it becomes the filename.'); return; }
+
+    const body = {
+      type: el('a_type').value, title,
+      year: +el('a_year').value || 0,
+      imdb: el('a_imdb').value.trim(),
+      file_index: +el('a_fileindex').value || 0,
+      metadata_wait: 90
+    };
+    if (/^[0-9a-fA-F]{40}$/.test(magnet)) body.hash = magnet.toLowerCase();
+    else body.magnet = magnet;
+    if (el('a_type').value !== 'movie') {
+      body.season = +el('a_season').value || 0;
+      body.episode = +el('a_episode').value || 0;
+      // The series folder takes its year from first_air_date, not from year.
+      // Without it the stub lands in a folder with no year, next to the one
+      // Seerr and the sync engines file the same show into.
+      if (+el('a_year').value) body.first_air_date = String(+el('a_year').value);
     }
 
-    /* Turning a release name into a title.
-     *
-     * This matters more than it looks: the title becomes the show folder, so
-     * "Ted Lasso (2020) Season 2" files seasons 2 and 3 into a folder of that
-     * name and the media server then treats it as a separate series from
-     * "Ted Lasso". Strip everything that is release metadata rather than name.
-     */
-    function stripJunk(name) {
-      let s = (name || '').replace(/[._]/g, ' ');
-      s = s.replace(/\b(1080p|2160p|720p|480p|4k|uhd|web[- ]?dl|webrip|bluray|bdrip|hdtv|x26[45]|h\.?26[45]|hevc|avc|ddp?\s?5\.?1|aac|ac3|atmos|hdr10?\+?|dv|remux|repack|proper|internal|complete|multi|dual)\b.*/i, '');
-      s = s.replace(/\b(s\d{1,2}(\s?e\d{1,3})?|seasons?\s*\d{1,2}|series\s*\d{1,2})\b.*/i, '');
-      return s;
-    }
-
-    function cleanTitle(name) {
-      let s = stripJunk(name);
-      s = s.replace(/[\(\[]\s*(19|20)\d{2}\s*[\)\]]/g, ' ');
-      s = s.replace(/[\[\(][^\])]*$/, '');
-      s = s.replace(/[\s\-_.\[\(\)\]]+$/, '').replace(/\s{2,}/g, ' ').trim();
-      // A trailing year is the release year, not part of the name — release
-      // names put it straight after the title. Keep it when it IS the title,
-      // so "1917" survives and "Blade Runner 2049 2017" loses only the 2017.
-      const trimmed = s.replace(/\s+\b(19|20)\d{2}\b$/, '').trim();
-      return trimmed || s;
-    }
-
-    function yearOf(name) {
-      const m = stripJunk(name).match(/\b(19|20)\d{2}\b/g);
-      return m ? m[m.length - 1] : '';
-    }
-
-    // Last line of defence: say so plainly when the title still looks like a
-    // release name, because the damage (a duplicate show folder) only shows up
-    // later in the media server.
-    function checkTitle() {
-      const t = el('a_title').value;
-      const bad = /\b(seasons?\s*\d|series\s*\d|s\d{2}(e\d{2})?|\d{3,4}p|web[- ]?dl|bluray|x26[45]|hevc)\b/i.test(t);
-      el('titleWarn').classList.toggle('hidden', !bad);
-    }
-
-    // TMDB lookup goes through the server, which holds the key.
-    const debouncedTmdb = debounce(async () => {
-      const q = el('a_title').value.trim();
-      const box = el('tmdbBox');
-      if (q.length < 3) { box.classList.add('hidden'); return; }
-      const kind = el('a_type').value === 'movie' ? 'movie' : 'tv';
-      let hits = [];
-      try {
-        const r = await fetch('/api/tmdb/search?type=' + kind + '&query=' + encodeURIComponent(q));
-        if (r.ok) hits = (await r.json()) || [];
-      } catch (e) { /* leave as free text */ }
-      if (!hits.length) { box.classList.add('hidden'); return; }
-      box.innerHTML = hits.slice(0, 8).map((h, i) =>
-        '<div class="tmdb-hit" data-i="' + i + '"><span>' + esc(h.title) + '</span> ' +
-        '<span class="text-slate-500 text-xs">' + esc(h.year || '') + '</span></div>').join('');
-      box.onclick = ev => {
-        const row = ev.target.closest('.tmdb-hit');
-        if (!row) return;
-        const h = hits[+row.dataset.i];
-        el('a_title').value = h.title || '';
-        if (h.year) el('a_year').value = h.year;
-        box.classList.add('hidden');
-        checkTitle();
-      };
-      box.classList.remove('hidden');
-    }, 350);
-
-    async function submitAdd() {
-      const msg = el('addMsg');
-      const magnet = el('a_magnet').value.trim();
-      const title = el('a_title').value.trim();
-      if (!magnet) { msg.innerHTML = '<span class="text-red-400">Paste a magnet or infohash.</span>'; return; }
-      if (!title) { msg.innerHTML = '<span class="text-red-400">Title is required — it becomes the filename.</span>'; return; }
-
-      const body = {
-        type: el('a_type').value, title,
-        year: +el('a_year').value || 0,
-        imdb: el('a_imdb').value.trim(),
-        file_index: +el('a_fileindex').value || 0,
-        metadata_wait: 90
-      };
-      if (/^[0-9a-fA-F]{40}$/.test(magnet)) body.hash = magnet.toLowerCase();
-      else body.magnet = magnet;
-      if (el('a_type').value !== 'movie') {
-        body.season = +el('a_season').value || 0;
-        body.episode = +el('a_episode').value || 0;
-        // The series folder takes its year from first_air_date, not from year.
-        // Without it the stub lands in a folder with no year, next to the one
-        // Seerr and the sync engines file the same show into.
-        if (+el('a_year').value) body.first_air_date = String(+el('a_year').value);
-      }
-
-      el('addBtn').disabled = true;
-      msg.innerHTML = '<span class="text-slate-400">Adding…</span>';
-      try {
-        const r = await fetch('/api/library/add', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const txt = await r.text();
-        if (!r.ok) {
-          msg.innerHTML = '<span class="text-red-400">Failed (' + r.status + '): ' + esc(failure(r.status, txt)) + '</span>';
-          return;
-        }
-        let n = 0;
-        try { n = (JSON.parse(txt).files || []).length; } catch (e) { }
-        msg.innerHTML = '<span class="text-green-400">Added' + (n ? ' — ' + n + ' stub' + (n > 1 ? 's' : '') : '') +
-          '. Jellyfin will show it after its next library scan.</span>';
-        el('a_magnet').value = '';
-        reload(0);
-      } catch (e) {
-        msg.innerHTML = '<span class="text-red-400">' + esc(String(e)) + '</span>';
-      } finally { el('addBtn').disabled = false; }
-    }
-
-    /* ---------------------------- missing --------------------------- */
-
-    let missing = null;
-
-    function showTab(name) {
-      const m = name === 'missing';
-      el('stubsView').classList.toggle('hidden', m);
-      el('missingView').classList.toggle('hidden', !m);
-      el('tabStubs').classList.toggle('tab-on', !m);
-      el('tabMissing').classList.toggle('tab-on', m);
-      el('tabStubs').setAttribute('aria-selected', String(!m));
-      el('tabMissing').setAttribute('aria-selected', String(m));
-      if (m && !missing) loadMissing(false);
-    }
-
-    // The first report makes two TMDB requests per show, so it takes a while.
-    // Later reports come from Tiramisu's cache until Recheck TMDB clears it.
-    async function loadMissing(refresh) {
-      el('mrows').innerHTML = '<tr><td colspan="6" class="text-slate-500 p-4">Comparing every show with TMDB…</td></tr>';
-      try {
-        const r = await fetch('/api/library/missing?type=' + el('mkind').value + (refresh ? '&refresh=1' : ''));
-        const txt = await r.text();
-        if (!r.ok) throw new Error(failure(r.status, txt));
-        missing = JSON.parse(txt);
-      } catch (e) {
-        el('mrows').innerHTML = '<tr><td colspan="6" class="text-red-400 p-4">' + esc(String(e.message || e)) + '</td></tr>';
+    el('addBtn').disabled = true;
+    msg.innerHTML = '<span class="faint">Adding…</span>';
+    try {
+      const r = await fetch('/api/library/add', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const txt = await r.text();
+      if (!r.ok) {
+        msg.innerHTML = errSpan('Failed (' + r.status + '): ' + esc(failure(r.status, txt)));
         return;
       }
-      renderMissing();
+      let n = 0;
+      try { n = (JSON.parse(txt).files || []).length; } catch (e) { }
+      msg.innerHTML = '<span class="ok-msg">Added' + (n ? ', ' + n + ' stub' + (n > 1 ? 's' : '') : '') +
+        '. Jellyfin will show it after its next library scan.</span>';
+      el('a_magnet').value = '';
+      reload(0);
+    } catch (e) {
+      msg.innerHTML = errSpan(esc(String(e)));
+    } finally { el('addBtn').disabled = false; }
+  }
+
+  /* ---------------------------- missing --------------------------- */
+
+  let missing = null;
+
+  function showTab(name) {
+    const m = name === 'missing';
+    el('stubsView').classList.toggle('hidden', m);
+    el('missingView').classList.toggle('hidden', !m);
+    el('tabStubs').classList.toggle('active', !m);
+    el('tabMissing').classList.toggle('active', m);
+    el('tabStubs').setAttribute('aria-selected', String(!m));
+    el('tabMissing').setAttribute('aria-selected', String(m));
+    if (m && !missing) loadMissing(false);
+  }
+
+  // The first report makes two TMDB requests per show, so it takes a while.
+  // Later reports come from Tiramisu's cache until Recheck TMDB clears it.
+  async function loadMissing(refresh) {
+    el('mrows').innerHTML = msgRow(6, 'Comparing every show with TMDB…');
+    try {
+      const r = await fetch('/api/library/missing?type=' + el('mkind').value + (refresh ? '&refresh=1' : ''));
+      const txt = await r.text();
+      if (!r.ok) throw new Error(failure(r.status, txt));
+      missing = JSON.parse(txt);
+    } catch (e) {
+      el('mrows').innerHTML = msgRow(6, esc(String(e.message || e)), 'accent');
+      return;
     }
+    renderMissing();
+  }
 
-    const GAP = {
-      whole: ['Whole season', 'bg-red-500/15 text-red-300'],
-      only_e01: ['Only E01', 'bg-amber-500/15 text-amber-300'],
-      partial: ['Partial', 'bg-sky-500/15 text-sky-300']
-    };
+  const GAP = {
+    whole: ['Whole season', 'accent'],
+    only_e01: ['Only E01', 'sig-yellow'],
+    partial: ['Partial', 'sig-blue']
+  };
 
-    function epRanges(list) {
-      const code = n => 'E' + String(n).padStart(2, '0');
-      const out = [];
-      let a = list[0], b = list[0];
-      for (const e of list.slice(1).concat([null])) {
-        if (e !== null && e === b + 1) { b = e; continue; }
-        out.push(a === b ? code(a) : code(a) + '–' + String(b).padStart(2, '0'));
-        if (e !== null) { a = b = e; }
-      }
-      return out.join(', ');
+  function epRanges(list) {
+    const code = n => 'E' + String(n).padStart(2, '0');
+    const out = [];
+    let a = list[0], b = list[0];
+    for (const e of list.slice(1).concat([null])) {
+      if (e !== null && e === b + 1) { b = e; continue; }
+      out.push(a === b ? code(a) : code(a) + '–' + String(b).padStart(2, '0'));
+      if (e !== null) { a = b = e; }
     }
+    return out.join(', ');
+  }
 
-    function renderMissing() {
-      if (!missing) return;
-      const q = el('mq').value.trim().toLowerCase();
-      const cat = el('mcat').value;
-      const withMismatch = el('mmis').checked;
-      const norm = v => (v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const rows = missing.shows.filter(s => {
-        if (!s.missing && !s.error) return false;
-        if (s.mismatch && !withMismatch) return false;
-        if (q && !(s.folder + ' ' + (s.tmdb_name || '')).toLowerCase().includes(q)) return false;
-        if (cat && !(s.seasons || []).some(x => x.category === cat)) return false;
-        return true;
-      });
-      const t = missing.totals, bc = t.by_category || {};
-      el('msummary').textContent = t.shows + ' shows · ' + t.aired + ' episodes aired · ' + t.filed + ' filed · ' +
-        t.missing + ' missing (whole seasons ' + (bc.whole || 0) + ', only E01 ' + (bc.only_e01 || 0) +
-        ', partial ' + (bc.partial || 0) + ') · ' + t.mismatch + ' shows numbered differently from TMDB · checked ' +
-        new Date(missing.generated).toLocaleString();
-      el('mrows').innerHTML = rows.length ? rows.map(s => {
-        const renamed = s.tmdb_name && norm(s.tmdb_name) !== norm(s.title);
-        const gaps = s.error ? '<span class="text-red-400">' + esc(s.error) + '</span>' :
-          (s.seasons || []).filter(x => !cat || x.category === cat).map(x =>
-            '<div class="flex gap-2 items-baseline"><span class="mono text-slate-400">S' + String(x.season).padStart(2, '0') + '</span>' +
-            '<span class="pill ' + GAP[x.category][1] + '">' + GAP[x.category][0] + '</span>' +
-            '<span class="mono text-[11px] text-slate-400">' + (x.category === 'whole' ? 'all ' + x.expected : epRanges(x.missing)) +
-            '</span></div>').join('');
-        return '<tr>' +
-          '<td><div>' + esc(s.folder.replace(/_/g, ' ')) + '</div>' +
-          (renamed ? '<div class="text-[11px] text-slate-500">TMDB: ' + esc(s.tmdb_name) + '</div>' : '') +
-          (s.mismatch ? '<div class="text-[11px] text-amber-300">Numbered differently from TMDB, so these gaps may be wrong</div>' : '') +
-          '</td>' +
-          '<td class="text-slate-400">' + s.tree + '</td>' +
-          '<td class="mono">' + s.aired + '</td>' +
-          '<td class="mono">' + s.filed + '</td>' +
-          '<td class="mono ' + (s.missing ? 'text-red-300' : '') + '">' + s.missing + '</td>' +
-          '<td class="space-y-1">' + gaps + '</td></tr>';
-      }).join('') : '<tr><td colspan="6" class="text-slate-500 p-4">No gaps match these filters.</td></tr>';
-    }
+  function renderMissing() {
+    if (!missing) return;
+    const q = el('mq').value.trim().toLowerCase();
+    const cat = el('mcat').value;
+    const withMismatch = el('mmis').checked;
+    const norm = v => (v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const rows = missing.shows.filter(s => {
+      if (!s.missing && !s.error) return false;
+      if (s.mismatch && !withMismatch) return false;
+      if (q && !(s.folder + ' ' + (s.tmdb_name || '')).toLowerCase().includes(q)) return false;
+      if (cat && !(s.seasons || []).some(x => x.category === cat)) return false;
+      return true;
+    });
+    const t = missing.totals, bc = t.by_category || {};
+    el('msummary').textContent = t.shows + ' shows · ' + t.aired + ' episodes aired · ' + t.filed + ' filed · ' +
+      t.missing + ' missing (whole seasons ' + (bc.whole || 0) + ', only E01 ' + (bc.only_e01 || 0) +
+      ', partial ' + (bc.partial || 0) + ') · ' + t.mismatch + ' shows numbered differently from TMDB · checked ' +
+      new Date(missing.generated).toLocaleString();
+    el('mrows').innerHTML = rows.length ? rows.map(s => {
+      const renamed = s.tmdb_name && norm(s.tmdb_name) !== norm(s.title);
+      const gaps = s.error ? errSpan(esc(s.error)) :
+        '<div class="gaps">' + (s.seasons || []).filter(x => !cat || x.category === cat).map(x =>
+          '<div class="gap-line"><span class="mono">S' + String(x.season).padStart(2, '0') + '</span>' +
+          '<span class="chip-tag ' + GAP[x.category][1] + '">' + GAP[x.category][0] + '</span>' +
+          '<span class="mono small">' + (x.category === 'whole' ? 'all ' + x.expected : epRanges(x.missing)) +
+          '</span></div>').join('') + '</div>';
+      return '<tr>' +
+        '<td class="nm"><div>' + esc(s.folder.replace(/_/g, ' ')) + '</div>' +
+        (renamed ? '<div class="small faint" style="font-weight:400">TMDB: ' + esc(s.tmdb_name) + '</div>' : '') +
+        (s.mismatch ? '<div class="small warn-text" style="font-weight:400">Numbered differently from TMDB, so these gaps may be wrong</div>' : '') +
+        '</td>' +
+        '<td>' + s.tree + '</td>' +
+        '<td class="mono">' + s.aired + '</td>' +
+        '<td class="mono">' + s.filed + '</td>' +
+        '<td class="mono' + (s.missing ? ' accent' : '') + '">' + s.missing + '</td>' +
+        '<td style="text-align:left">' + gaps + '</td></tr>';
+    }).join('') : msgRow(6, 'No gaps match these filters.');
+  }
 
-    reload(0);
-  </script>
+  // Rail footer: engine lamp, version and update hint, as on the other pages.
+  async function railStatus() {
+    try {
+      const h = await (await fetch('/api/health')).json();
+      const ok = h.gostorm && h.gostorm.ok;
+      el('rail-lamp').className = 'lamp ' + (ok ? 'run' : 'err pulse');
+      el('rail-state').textContent = ok ? 'Engine online' : 'Engine unreachable';
+    } catch (e) { }
+  }
+
+  railStatus();
+  setInterval(railStatus, 30000);
+  TiramisuUI.checkUpdate();
+  reload(0);
+</script>
 </body>
-
 </html>
