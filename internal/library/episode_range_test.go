@@ -14,6 +14,8 @@ func TestParseEpisodeRange(t *testing.T) {
 		"Show.S01E09-E20.mkv":                 {1, 9, 9},
 		"Show - S01E01 - 2 Broke Girls.mkv":   {1, 1, 1},
 		"No numbers here.mkv":                 {0, 0, 0},
+		"show.s04.e01.1080p.mkv":              {4, 1, 1},
+		"show.s01.e01-e02.mkv":                {1, 1, 2},
 		"Show.Name.1x05.HDTV.mkv":             {1, 5, 5},
 		"Show - 3x07 - Title (1920x1080).mkv": {3, 7, 7},
 		// Batch files named by absolute number, with a resolution and no SxxExx,

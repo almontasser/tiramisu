@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,10 +32,13 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"tiramisu/internal/apidocs"
+	"tiramisu/internal/auth"
 	"tiramisu/internal/cache"
 	"tiramisu/internal/catalog"
 	"tiramisu/internal/catalog/mediaserver"
 	"tiramisu/internal/config"
+	"tiramisu/internal/geoip"
 	server "tiramisu/internal/gostorm"
 	"tiramisu/internal/gostorm/native"
 	"tiramisu/internal/gostorm/settings"
@@ -47,10 +51,12 @@ import (
 	"tiramisu/internal/lockmgr"
 	"tiramisu/internal/mcp"
 	"tiramisu/internal/metadb"
+	"tiramisu/internal/monitor/clients"
 	"tiramisu/internal/monitor/collector"
 	"tiramisu/internal/monitor/dashboard"
 	"tiramisu/internal/natpmp"
 	"tiramisu/internal/opentracker"
+	"tiramisu/internal/piecemap"
 	"tiramisu/internal/preload"
 	"tiramisu/internal/prowlarr"
 	"tiramisu/internal/ratelimit"
@@ -63,6 +69,7 @@ import (
 	"tiramisu/internal/updater"
 	"tiramisu/internal/vfs"
 	"tiramisu/internal/warmup"
+	"tiramisu/internal/webui"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
@@ -1268,6 +1275,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	}
 
 	hashStr, urlFileIdx := vfs.ExtractHashAndIndex(n.vMeta.URL)
+	clients.NoteFUSEOpen(ctx, hashStr, n.vMeta.Path)
 
 	// hasFullWarmup: Open returns instantly only if both head and tail warmup files are ready.
 	// headReady: Allows async Wake and direct ID injection for instant start.
@@ -1499,6 +1507,7 @@ type MkvHandle struct {
 	hasWarmup       bool          // true if both head+tail warmup available at Open time
 	usesWarmup      bool          // false for audio projections: they skip SSD warmup entirely
 	state           atomic.Uint32 // handleState: stateWarmup | stateStreaming
+	coldBoostTried  atomic.Bool
 	pumpOnce        sync.Once
 	isPrimaryHandle atomic.Bool  // pump creator, primary reconnects (refCount 0→1), proven readers
 	seqAdvances     atomic.Int32 // consecutive sequential streaming reads, feeds the promotion below
@@ -1859,9 +1868,11 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 			logger.Printf("[Pump] Warning: hash empty for %s, warmup disabled", filepath.Base(h.path))
 		}
 	}
+	// reachedEOF separates the normal end (the whole file is fetched) from an early exit:
+	// V306 used to warn on both, and 263 of 332 historical warnings were plain EOF.
+	reachedEOF := false
 	defer func() {
-		// V306: Check if pump exited during confirmed healthy playback — this is
-		// unexpected and usually indicates an I/O error or cancellation. Log for diagnosis.
+		// V306: an early exit during confirmed playback is unexpected; reaching EOF is not.
 		pumpExitedHealthy := false
 		if val, ok := playbackRegistry.Load(h.path); ok {
 			if ps, ok := val.(*PlaybackState); ok && ps.GetStatus() {
@@ -1880,7 +1891,9 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 			raCache.pieceLens.Delete(h.path)
 		}
 
-		if pumpExitedHealthy {
+		if pumpExitedHealthy && reachedEOF {
+			logger.Printf("[V306] Pump reached end of file during playback for %s: download complete", filepath.Base(h.path))
+		} else if pumpExitedHealthy {
 			logger.Printf("[V306] WARNING: pump goroutine exited during healthy playback for %s — priority preserved via IsHealthy", filepath.Base(h.path))
 		}
 
@@ -2081,6 +2094,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 				sharedState.interruptPending.Store(false)
 				continue
 			}
+			reachedEOF = true
 			return // genuine EOF
 		}
 
@@ -2232,8 +2246,94 @@ func pathPlaybackActive(path string) bool {
 	return ok && (ps.GetStatus() || ps.IsInferredPlayback())
 }
 
+// pieceMapFor describes the pieces around the furthest primary player of hash; nil when none is playing.
+func pieceMapFor(hash string) *piecemap.Map {
+	if hash == "" {
+		return nil
+	}
+	var h *MkvHandle
+	var off int64
+	activeHandles.Range(func(key, _ interface{}) bool {
+		c := key.(*MkvHandle)
+		if c.hash != hash || !c.isPrimaryHandle.Load() {
+			return true
+		}
+		if o := atomic.LoadInt64(&c.lastOff); o > off && !shouldServeTailFromSSD(o, c.size, warmup.TailWarmupSize) {
+			h, off = c, o
+		}
+		return true
+	})
+	// Music and audiobook files are a few MB: the map says nothing there, so none is served.
+	if h == nil || isAudioSectionPath(h.path) {
+		return nil
+	}
+	tr := torr.PeekTorrent(hash)
+	if tr == nil || tr.Torrent == nil || tr.Torrent.Info() == nil {
+		return nil
+	}
+	var file *torrent.File
+	files := tr.Torrent.Files()
+	if i := h.fileID - 1; i >= 0 && i < len(files) && files[i].Length() == h.size {
+		file = files[i]
+	} else {
+		for _, f := range files {
+			if f.Length() == h.size {
+				file = f
+				break
+			}
+		}
+	}
+	if file == nil {
+		return nil
+	}
+	src := piecemap.Source{
+		Hash: hash, PieceLen: int64(tr.Torrent.Info().PieceLength), FileOffset: file.Offset(), FileSize: h.size, PlayerOff: off,
+		// What the engine keeps ahead of a player: the FUSE read-ahead budget plus the piece cache.
+		SpanBytes: int64(gc().ReadAheadBudget),
+		Window: func(first, n int) []piecemap.Piece {
+			ws := tr.Torrent.PieceWindow(first, n)
+			out := make([]piecemap.Piece, len(ws))
+			for i, p := range ws {
+				out[i] = piecemap.Piece{Complete: p.Complete, Length: p.Length, Missing: p.Missing, Deadline: p.Deadline}
+			}
+			return out
+		},
+		Covered: func(o, e int64) bool { return raCache.Holds(h.path, o, e) },
+	}
+	// The SSD warmup serves the head (and the tail) itself and the pump skips that zone, so those
+	// pieces are never fetched from the torrent: they still count as ready.
+	if dw := warmup.DiskWarmup; dw != nil && h.usesWarmup {
+		head := dw.GetAvailableRange(hash, h.fileID)
+		var tailFrom int64 = -1
+		if dw.TailReady(hash, h.fileID) {
+			tailFrom = h.size - warmup.TailWarmupSize
+		}
+		ram := src.Covered
+		src.Covered = func(o, e int64) bool {
+			return e <= head || (tailFrom >= 0 && o >= tailFrom) || ram(o, e)
+		}
+	}
+	if settings.BTsets != nil {
+		src.SpanBytes += settings.BTsets.CacheSize
+	}
+	return piecemap.Build(src)
+}
+
 // headerProbeZone is the start of the file that players and Samba re-read for container headers.
 const headerProbeZone = 2 * 1024 * 1024
+
+// boostColdStart raises the torrent's connection limit at the first player read past the header,
+// the same signal probePumpParked uses; header and Cues probes from scans never reach it.
+func (h *MkvHandle) boostColdStart(off int64) {
+	if h.hash == "" || off < headerProbeZone || off >= h.size-tailProbeZoneSize(h.size) || h.coldBoostTried.Swap(true) {
+		return
+	}
+	go func() {
+		if tr := torr.PeekTorrent(h.hash); tr != nil {
+			tr.BoostColdStart()
+		}
+	}()
+}
 
 // headerChainLimit bounds how far a header read may continue sequentially and still count as one:
 // the SSD warmup head (64MB by default). Plex's head reads ran past 16MB on every resume; inside
@@ -2897,6 +2997,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	h.storeReadOff(headerRead, off)
 
 	h.promoteIfStreaming(prevOff, off, len(dest))
+	h.boostColdStart(off)
 
 	// Transition WARMUP→STREAMING on resume (first read >= warmup.FileSize), seek (jump > budget),
 	// or plain sequential progression past the warmup zone (no seek ever happens during linear
@@ -3973,6 +4074,22 @@ func (c *ReadAheadCache) SwitchContext(newPath string) {
 	}
 }
 
+// Holds reports whether [off, end) is cached, walking any number of chunks. Read-only: unlike
+// Covered it leaves lastAccess alone, so the dashboard can ask without affecting eviction.
+func (c *ReadAheadCache) Holds(p string, off, end int64) bool {
+	s := c.getShard(p)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for pos := off; pos < end; {
+		b, ok := s.buffers[c.chunkKey(p, pos)]
+		if !ok || pos < b.start || pos > b.end {
+			return false
+		}
+		pos = b.end + 1
+	}
+	return true
+}
+
 // Covered reports whether the cache fully covers [off, end] without copying any bytes —
 // use this for presence/coverage checks on the hot path; call Get separately only once the
 // actual data is needed, to avoid an up-to-16MB defensive copy on every check.
@@ -4920,6 +5037,7 @@ func main() {
 
 	var dbPath string
 	flag.StringVar(&dbPath, "path", "", "path to database and config")
+	resetAuth := flag.Bool("reset-auth", false, "clear the :9080 user, sessions and tokens and turn sign-in off")
 	flag.Parse()
 
 	// Default --path to the directory containing the binary (portable install)
@@ -4960,6 +5078,10 @@ func main() {
 	}
 
 	globalConfig.Store(&cfg)
+	if *resetAuth {
+		// Before anything starts: a second engine next to the running service would mount FUSE twice.
+		os.Exit(auth.RunResetFlag(gc().StateDBPath, GetStateDir()))
+	}
 	prowlarrClient = prowlarr.NewClient(gc().Prowlarr)
 	telemetry.SendHeartbeat(*gc(), AppVersion)
 	logger.Printf("[DEBUG] BlockListURL loaded: '%s'", gc().BlockListURL)
@@ -5041,6 +5163,15 @@ func main() {
 		logger.Printf("[BlockList] %v — loading the list unfiltered", err)
 	}
 	torrutils.SetBlockListEnabled(gc().BlockListEnabled)
+
+	// :8090 is for the engine itself: loopback unless config opens it.
+	if settings.Args == nil {
+		settings.Args = &settings.ExecArgs{}
+	}
+	settings.Args.IP = gc().ApplyGoStormBind(logger.Printf)
+	if gc().PeerGeoIPEnabled {
+		torr.PeerInfo = geoip.Start(context.Background(), GetStateDir(), logger.Printf).PeerInfo
+	}
 
 	go func() {
 		logger.Println("Starting Embedded GoStorm Engine...")
@@ -5247,6 +5378,10 @@ func main() {
 		}
 	}()
 
+	// Sign-in on :9080 (opt-in). The state lives in tiramisu.db, never in config.json.
+	authSvc, authTrusted := auth.Start(http.DefaultServeMux, stateDB, GetStateDir(), gc().AuthTrustedProxies, logger.Printf)
+	apidocs.Register(http.DefaultServeMux, authSvc.Enabled)
+
 	http.HandleFunc("/plex/webhook", handlePlexWebhook)
 
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -5259,9 +5394,12 @@ func main() {
 		raTotal, raActive, raEntries := raCache.Stats()
 		raStale := raTotal - raActive
 		raBudget := gc().ReadAheadBudget
-		raPercent := float64(raTotal) / float64(raBudget) * 100
-		raActivePercent := float64(raActive) / float64(raBudget) * 100
-		raStalePercent := float64(raStale) / float64(raBudget) * 100
+		var raPercent, raActivePercent, raStalePercent float64 // 0, not NaN, with no budget
+		if raBudget > 0 {
+			raPercent = float64(raTotal) / float64(raBudget) * 100
+			raActivePercent = float64(raActive) / float64(raBudget) * 100
+			raStalePercent = float64(raStale) / float64(raBudget) * 100
+		}
 
 		natPort := atomic.LoadInt64(&natpmp.CurrentNatPort)
 
@@ -5291,13 +5429,16 @@ func main() {
 		// Gradient2 closed-loop state: the dry run reads backing_off/limit_max to see the loop
 		// react to queueing before its 32-request ceiling is raised.
 		g2Stats := torr.CollectGradient2Stats()
+		shieldOn, shieldLastCorr, shieldNeed := torrstor.ShieldStatus()
 
 		shortStream, shortFetch := native.ShortReadCounts()
 		repairedStream, unfilledStream := native.ShortReadRepairCounts()
 
-		fmt.Fprintf(w, `{"version":"%s", "config_source":"%s", "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":"%s", "update_available":%t, "warmup_duration_buckets_lt_2_5_10_15_30_60_120_gte120s":%s, "hedge_trigger_count":%d, "hedge_circuit_open":%t, "fetch_singleflight_dedup":%d, "peer_eject_count":%d, "v304_banned_peers":%d, "ip_blocklist_rejections":%d, "ip_blocklist_ips":%d, "fuse_short_reads":%d, "fuse_short_reads_repaired":%d, "fuse_short_reads_failed":%d, "short_read_stream":%d, "short_read_fetch":%d, "short_read_repaired":%d, "short_read_unfilled":%d, "peer_conns_tcp":%d, "peer_conns_utp":%d, "peer_rated_tcp":%d, "peer_rated_utp":%d, "peer_useful_bps_tcp":%.0f, "peer_useful_bps_utp":%.0f, "peer_eject_count_utp":%d, "peer_churn_count":%d, "peer_churn_count_utp":%d, "deadline_pieces":%d, "audio_namespace_state":"%s", "audio_namespace_entries":%d, "gradient2_peers":%d, "gradient2_backing_off":%d, "gradient2_limit_min":%d, "gradient2_limit_max":%d}`,
-			AppVersion,
-			gc().ConfigPath,
+		jsonString := func(v string) string { b, _ := json.Marshal(v); return string(b) }
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"version":%s, "config_source":%s, "uptime":"%s", "cache_entries":%d, "cache_size_mb":%.2f, "cleanup_hashes":%d, "cleanup_offsets":%d, "cleanup_activities":%d, "locks_total":%d, "master_concurrency_limit":%d, "negative_cache_entries":%d, "fullpack_cache_entries":%d, "streaming_threshold_kb":%d, "config_preload_workers":%d, "max_conns_per_host":%d, "read_ahead_total_bytes":%d, "read_ahead_active_bytes":%d, "read_ahead_stale_bytes":%d, "read_ahead_entries":%d, "read_ahead_budget":%d, "read_ahead_percent":%.2f, "read_ahead_active_percent":%.2f, "read_ahead_stale_percent":%.2f, "natpmp_port":%d, "latest_version":%s, "update_available":%t, "warmup_duration_buckets_lt_2_5_10_15_30_60_120_gte120s":%s, "hedge_trigger_count":%d, "hedge_circuit_open":%t, "fetch_singleflight_dedup":%d, "peer_eject_count":%d, "v304_banned_peers":%d, "ip_blocklist_rejections":%d, "ip_blocklist_ips":%d, "fuse_short_reads":%d, "fuse_short_reads_repaired":%d, "fuse_short_reads_failed":%d, "short_read_stream":%d, "short_read_fetch":%d, "short_read_repaired":%d, "short_read_unfilled":%d, "peer_conns_tcp":%d, "peer_conns_utp":%d, "peer_rated_tcp":%d, "peer_rated_utp":%d, "peer_useful_bps_tcp":%.0f, "peer_useful_bps_utp":%.0f, "peer_eject_count_utp":%d, "peer_churn_count":%d, "peer_churn_count_utp":%d, "deadline_pieces":%d, "audio_namespace_state":%s, "audio_namespace_entries":%d, "gradient2_peers":%d, "gradient2_backing_off":%d, "gradient2_limit_min":%d, "gradient2_limit_max":%d, "shield_active":%t, "shield_last_corruption":%d, "shield_need_s":%d, "github_stars":%d}`,
+			jsonString(AppVersion),
+			jsonString(gc().ConfigPath),
 			time.Since(startTime),
 			cacheStats.Entries, float64(cacheStats.Size)/(1024*1024),
 			cleanupStats.DeletedHashesTotal, cleanupStats.OffsetsTotal, cleanupStats.ActivitiesTotal,
@@ -5311,7 +5452,7 @@ func main() {
 			raTotal, raActive, raStale, raEntries, raBudget,
 			raPercent, raActivePercent, raStalePercent,
 			natPort,
-			updater.LatestVersion(), updater.UpdateAvailable(),
+			jsonString(updater.LatestVersion()), updater.UpdateAvailable(),
 			warmupBucketsJSON,
 			hedgeTriggerTotal, hedgeCircuitOpenAny, fetchFlightDedupCount.Load(), peerStats.EjectTotal, torr.V304BannedCount(),
 			torrent.IPBlocklistRejections(), torrent.IPBlocklistDistinctIPs(),
@@ -5319,8 +5460,9 @@ func main() {
 			peerStats.ConnsTCP, peerStats.ConnsUTP, peerStats.RatedTCP, peerStats.RatedUTP,
 			peerStats.UsefulBpsTCP, peerStats.UsefulBpsUTP,
 			peerStats.EjectUTP, peerStats.ChurnTotal, peerStats.ChurnUTP, deadlinePieces,
-			audioNamespaceState(), audioNamespaceEntries(),
-			g2Stats.Peers, g2Stats.BackingOff, g2Stats.LimitMin, g2Stats.LimitMax)
+			jsonString(audioNamespaceState()), audioNamespaceEntries(),
+			g2Stats.Peers, g2Stats.BackingOff, g2Stats.LimitMin, g2Stats.LimitMax,
+			shieldOn, shieldLastCorr, shieldNeed, updater.Stars())
 	})
 
 	// Which blocklist ranges are actually rejecting peers. The aggregate counters say
@@ -5355,7 +5497,24 @@ func main() {
 			gc().MaxConnsPerHost)
 	})
 
+	http.HandleFunc("/api/pieces", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		m := pieceMapFor(r.URL.Query().Get("hash"))
+		if m == nil {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("{}"))
+			return
+		}
+		json.NewEncoder(w).Encode(m)
+	})
+
+	http.HandleFunc("/api/recent-streams", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(recentSnapshot())
+	})
+
 	http.HandleFunc("/metrics/ttff", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"sessions_completed":%d,"sessions_filtered":%d,`+
 			`"open_to_header_ms":%s,"open_to_deep_read_ms":%s,"seek_latency_ms":%s,`+
 			`"read_latency_ms":{"warmup_head":%s,"warmup_tail":%s,"racache_hit":%s,"fetch_block":%s},`+
@@ -5367,26 +5526,47 @@ func main() {
 			ttffStats.stallCount.Load(), ttffStats.maxStallMS.Load())
 	})
 
+	http.Handle("/ui/", http.StripPrefix("/ui/", webui.Handler()))
+
 	http.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write(settingsHTML)
 	})
 
+	var configMu sync.Mutex // one save at a time: each one patches the config the last one stored
 	http.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(gc())
+			w.Header().Set("Cache-Control", "no-store")
+			json.NewEncoder(w).Encode(gc().Redacted()) // secrets are write-only (issue #26)
 			return
 		}
-		if r.Method == "POST" {
-			var newCfg config.Config
-			if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
+		if r.Method != "POST" {
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		{
+			configMu.Lock()
+			defer configMu.Unlock()
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+			if err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			// Update file
-			data, _ := json.MarshalIndent(newCfg, "", "  ")
-			if err := os.WriteFile(gc().ConfigPath, data, 0644); err != nil {
+			// A merge: keys left out keep their value, so a partial body cannot zero the ports.
+			newCfg, err := gc().Patch(body)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			// Trusted proxies decide whose X-Forwarded-For the login rate limit believes: a
+			// sign-in setting, so only a browser session may change it, not an API token.
+			if authSvc.Enabled() && auth.SessionFrom(r) == "" && !slices.Equal(newCfg.AuthTrustedProxies, gc().AuthTrustedProxies) {
+				http.Error(w, "auth_trusted_proxies changes only from the Control Panel, signed in", http.StatusForbidden)
+				return
+			}
+			if err := newCfg.WriteFile(gc().ConfigPath); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
@@ -5395,6 +5575,7 @@ func main() {
 			oldURL := gc().BlockListURL
 			oldFilter := gc().BlockListFilter
 			cfg := config.LoadConfig()
+			cfg.RootPath = gc().RootPath // comes from --path at start, not from the file
 			globalConfig.Store(&cfg)
 			prowlarrClient = prowlarr.NewClient(gc().Prowlarr)
 
@@ -5691,6 +5872,7 @@ func main() {
 				PlexToken:    gc().Plex.Token,
 				PlexMusicLib: strconv.Itoa(gc().Plex.MusicLibraryID),
 				LibraryURL:   fmt.Sprintf("http://127.0.0.1:%d", gc().MetricsPort),
+				LibraryToken: authSvc.InternalToken(),
 				StateDir:     GetStateDir(),
 				LogsDir:      logsDir,
 				ProwlarrCfg:  gc().Prowlarr,
@@ -5716,32 +5898,8 @@ func main() {
 
 		sched := scheduler.New(schedCfg, syncers, statePath)
 
-		http.HandleFunc("/api/scheduler/status", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(sched.Status())
-		})
-		http.HandleFunc("/api/scheduler/", func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost {
-				http.Error(w, "POST only", 405)
-				return
-			}
-			path := strings.TrimPrefix(r.URL.Path, "/api/scheduler/")
-			if strings.HasSuffix(path, "/stop") {
-				name := strings.TrimSuffix(path, "/stop")
-				if err := sched.StopJob(name); err != nil {
-					http.Error(w, err.Error(), 409)
-					return
-				}
-				w.WriteHeader(http.StatusAccepted)
-				return
-			}
-			name := strings.TrimSuffix(path, "/run")
-			if err := sched.TriggerRun(name); err != nil {
-				http.Error(w, err.Error(), 409)
-				return
-			}
-			w.WriteHeader(http.StatusAccepted)
-		})
+		http.HandleFunc("/api/scheduler/status", sched.ServeStatus)
+		http.HandleFunc("/api/scheduler/", sched.ServeAction)
 
 		// The loop always runs and reads Scheduler.Enabled on every tick, so
 		// turning the scheduler on or off in the control panel needs no restart.
@@ -5855,6 +6013,9 @@ func main() {
 			StateDir: GetStateDir,
 			Version:  AppVersion,
 			Logger:   logger,
+
+			InternalToken: authSvc.InternalToken(),
+			SignInOn:      authSvc.Enabled,
 		})
 	}
 
@@ -5894,12 +6055,48 @@ func main() {
 	http.HandleFunc("/api/logs", dashHandler.Logs)
 	http.HandleFunc("/api/plex-thumb", dashHandler.PlexThumb)
 	http.HandleFunc("/api/kill-stream/", dashHandler.KillStream)
+	clientSvc := clients.New(func() clients.Config {
+		return clients.Config{
+			ServerType: gc().MediaServerType,
+			URL:        gc().Plex.URL,
+			Token:      gc().Plex.Token,
+			Active: func() (playing bool) {
+				activeHandles.Range(func(_, _ interface{}) bool { playing = true; return false })
+				return playing
+			},
+			// Only files open right now: playbackRegistry keeps entries for minutes after close.
+			Resolve: func(base string) (hash string) {
+				open := false
+				activeHandles.Range(func(key, _ interface{}) bool {
+					if filepath.Base(key.(*MkvHandle).path) == base {
+						open = true
+						return false
+					}
+					return true
+				})
+				if !open {
+					return ""
+				}
+				playbackRegistry.Range(func(key, value interface{}) bool {
+					if filepath.Base(key.(string)) == base {
+						hash = value.(*PlaybackState).Hash
+						return false
+					}
+					return true
+				})
+				return hash
+			},
+		}
+	})
+	http.HandleFunc("/api/clients", clientSvc.Handler)
+	http.HandleFunc("/api/scan", clientSvc.ScanHandler)
+	monCollector.SetAuthToken(authSvc.InternalToken())
 	safeGo(func() {
 		monCollector.Run(backgroundStopChan)
 	})
 	logger.Printf("[Dashboard] enabled at :%d/dashboard", gc().MetricsPort)
 
-	go http.ListenAndServe(fmt.Sprintf(":%d", gc().MetricsPort), nil)
+	go http.ListenAndServe(fmt.Sprintf(":%d", gc().MetricsPort), auth.Wrap(authSvc, authTrusted, http.DefaultServeMux))
 
 	// Graceful shutdown: saves inode map and sync caches before exit.
 	sigChan := make(chan os.Signal, 1)

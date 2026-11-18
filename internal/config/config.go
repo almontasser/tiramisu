@@ -287,11 +287,15 @@ type Config struct {
 	MaxCacheEntries         int `json:"max_cache_entries"`
 
 	// --- Connectivity ---
-	GoStormBaseURL   string `json:"gostorm_url"`
+	GoStormBaseURL string `json:"gostorm_url"`
+	// GoStormListenIP opens :8090 beyond loopback: "all" or an IP. Empty = 127.0.0.1 (see GoStormBindIP).
+	GoStormListenIP  string `json:"gostorm_listen_ip,omitempty"`
 	ProxyListenPort  int    `json:"proxy_listen_port"`
 	MetricsPort      int    `json:"metrics_port"`
 	BlockListEnabled bool   `json:"blocklist_enabled"`
 	BlockListURL     string `json:"blocklist_url"`
+	// PeerGeoIPEnabled shows each peer's country in the swarm view (DB-IP Lite, downloaded monthly).
+	PeerGeoIPEnabled bool `json:"peer_geoip_enabled"`
 	// BlockListFilter keeps only the ranges whose description matches this regexp.
 	// Empty keeps the whole list. See blockedIP.go for why published lists need it.
 	BlockListFilter string `json:"blocklist_filter"`
@@ -409,8 +413,10 @@ type Config struct {
 	TelemetryURL    string `json:"telemetry_url"`
 
 	// --- State DB (V1.7.1) ---
-	EnableStateDB bool   `json:"enable_state_db"` // default: true
-	StateDBPath   string `json:"state_db_path"`   // default: <STATE>/tiramisu.db
+	EnableStateDB bool `json:"enable_state_db"` // default: true
+	// AuthTrustedProxies: reverse proxies whose X-Forwarded-For the :9080 login rate limit trusts.
+	AuthTrustedProxies []string `json:"auth_trusted_proxies,omitempty"`
+	StateDBPath        string   `json:"state_db_path"` // default: <STATE>/tiramisu.db
 }
 
 // Save persists the current configuration to config.json

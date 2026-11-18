@@ -66,6 +66,8 @@ type TorrentStatus struct {
 	DurationSeconds     float64     `json:"duration_seconds,omitempty"`
 	BitRate             string      `json:"bit_rate,omitempty"`
 	IsPriority          bool        `json:"is_priority"` // V186: If true, timeout is disabled
+	// PeerRates is each connected peer's useful download rate, fastest first (swarm view).
+	PeerRates []PeerRate `json:"peer_rates,omitempty"`
 
 	FileStats []*TorrentFileStat `json:"file_stats,omitempty"`
 }
@@ -74,4 +76,16 @@ type TorrentFileStat struct {
 	Id     int    `json:"id,omitempty"`
 	Path   string `json:"path,omitempty"`
 	Length int64  `json:"length,omitempty"`
+}
+
+// PeerRate is one connected peer: an anonymous stable id, its rate and whether it is a seeder.
+type PeerRate struct {
+	ID     string  `json:"id"`
+	KBps   float64 `json:"kbps"`
+	UpKBps float64 `json:"up_kbps,omitempty"` // what we upload to this peer
+	Seed   bool    `json:"seed"`
+	UTP    bool    `json:"utp,omitempty"`
+	CC     string  `json:"cc,omitempty"` // peer country (ISO code) when peer_geoip_enabled
+	ASN    uint    `json:"asn,omitempty"`
+	Org    string  `json:"org,omitempty"` // network owner, e.g. "Hetzner Online GmbH"
 }

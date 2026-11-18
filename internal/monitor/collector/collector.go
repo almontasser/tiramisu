@@ -34,6 +34,13 @@ const shieldEventWindow = 10 * time.Minute
 type ShieldEvent struct {
 	Type string `json:"type"`
 	Time int64  `json:"t"` // UnixMilli
+	// Hash is the torrent whose piece failed verification; empty for "restore" and for
+	// log lines written before the field existed.
+	Hash string `json:"hash,omitempty"`
+	// NeedS is the clean streak the engine requires before leaving STRICT ("strict" only).
+	NeedS int `json:"need_s,omitempty"`
+	// Piece is the piece that failed verification ("corruption" from a single-corruption line).
+	Piece int `json:"piece,omitempty"`
 }
 
 // HealthStatus holds the current system health snapshot.
@@ -61,6 +68,7 @@ type HealthStatus struct {
 	TotalPeers    int     `json:"total_peers"`
 	TotalSeeders  int     `json:"total_seeders"`
 	DownloadMbps  float64 `json:"download_mbps"`
+	UploadMbps    float64 `json:"upload_mbps"`
 
 	FUSEActivePct float64 `json:"fuse_active_pct"`
 	FUSEStalePct  float64 `json:"fuse_stale_pct"`
@@ -114,18 +122,24 @@ type TorrentInfo struct {
 	Year       string  `json:"year,omitempty"`
 	Poster     string  `json:"poster,omitempty"`
 	SpeedMBs   float64 `json:"speed_mbs"`
+	UpMBs      float64 `json:"up_mbs,omitempty"` // what this torrent uploads
 	Peers      int     `json:"peers"`
 	Seeders    int     `json:"seeders"`
 	Size       int64   `json:"size"`
 	BytesRead  int64   `json:"bytes_read"`
 	IsPriority bool    `json:"is_priority"`
 	Status     string  `json:"status"`
-	Is4K       bool    `json:"is_4k"`
-	IsDV       bool    `json:"is_dv"`
-	IsHDR      bool    `json:"is_hdr"`
-	Is1080p    bool    `json:"is_1080p"`
-	Audio      string  `json:"audio,omitempty"`
-	Channels   string  `json:"channels,omitempty"`
+	// HalfOpen and Pending are peers still connecting / queued: the swarm view draws them dashed.
+	HalfOpen int `json:"half_open"`
+	Pending  int `json:"pending"`
+	// PeerRates: each connected peer's useful download rate, fastest first.
+	PeerRates []PeerRate `json:"peer_rates,omitempty"`
+	Is4K      bool       `json:"is_4k"`
+	IsDV      bool       `json:"is_dv"`
+	IsHDR     bool       `json:"is_hdr"`
+	Is1080p   bool       `json:"is_1080p"`
+	Audio     string     `json:"audio,omitempty"`
+	Channels  string     `json:"channels,omitempty"`
 }
 
 // SpeedPoint is a timestamped speed measurement.
@@ -160,6 +174,7 @@ type Collector struct {
 	shieldEvents []ShieldEvent
 	start        time.Time
 	httpClient   *http.Client
+	authToken    string // engine-internal token for the loopback /metrics calls
 
 	prevCPUIdle  uint64
 	prevCPUTotal uint64
@@ -278,6 +293,9 @@ var (
 	reShieldStrict  = regexp.MustCompile(`\[AdaptiveShield\].*Force STRICT mode`)
 	reShieldRestore = regexp.MustCompile(`\[AdaptiveShield\].*Restoring FAST mode`)
 	reShieldCorr    = regexp.MustCompile(`\[AdaptiveShield\] (?:Single|Persistent) corruption`)
+	reShieldHash    = regexp.MustCompile(`torrent=([0-9a-f]{40})`)
+	reShieldNeed    = regexp.MustCompile(`need (\d+) s clean`)
+	reShieldPiece   = regexp.MustCompile(`for piece (\d+)`)
 )
 
 // parseShieldEvents reads the last portion of tiramisu.log and extracts
@@ -302,13 +320,25 @@ func (c *Collector) parseShieldEvents() []ShieldEvent {
 			continue
 		}
 		ms := t.UnixMilli()
+		hash := ""
+		if h := reShieldHash.FindStringSubmatch(line); h != nil {
+			hash = h[1]
+		}
 		switch {
 		case reShieldStrict.MatchString(line):
-			events = append(events, ShieldEvent{Type: "strict", Time: ms})
+			need := 0
+			if n := reShieldNeed.FindStringSubmatch(line); n != nil {
+				need, _ = strconv.Atoi(n[1])
+			}
+			events = append(events, ShieldEvent{Type: "strict", Time: ms, Hash: hash, NeedS: need})
 		case reShieldRestore.MatchString(line):
 			events = append(events, ShieldEvent{Type: "restore", Time: ms})
 		case reShieldCorr.MatchString(line):
-			events = append(events, ShieldEvent{Type: "corruption", Time: ms})
+			piece := 0
+			if pm := reShieldPiece.FindStringSubmatch(line); pm != nil {
+				piece, _ = strconv.Atoi(pm[1])
+			}
+			events = append(events, ShieldEvent{Type: "corruption", Time: ms, Hash: hash, Piece: piece})
 		}
 	}
 	return events
@@ -359,11 +389,12 @@ func (c *Collector) collect() {
 	torrents := c.fetchTorrents()
 	c.enrichTorrents(torrents)
 	var totalPeers, totalSeeders, activeCount int
-	var totalSpeedMB float64
+	var totalSpeedMB, totalUpMB float64
 	for _, t := range torrents {
 		totalPeers += t.Peers
 		totalSeeders += t.Seeders
 		totalSpeedMB += t.SpeedMBs
+		totalUpMB += t.UpMBs
 		if t.Status != "idle" {
 			activeCount++
 		}
@@ -379,6 +410,7 @@ func (c *Collector) collect() {
 	s.TotalPeers = totalPeers
 	s.TotalSeeders = totalSeeders
 	s.DownloadMbps = totalSpeedMB * 8
+	s.UploadMbps = totalUpMB * 8
 
 	point := SpeedPoint{Time: time.Now().UnixMilli(), Speed: s.DownloadMbps}
 	shieldEvts := c.parseShieldEvents()
@@ -414,16 +446,19 @@ func (c *Collector) fetchTorrents() []TorrentInfo {
 	data, _ := io.ReadAll(resp.Body)
 
 	var raw []struct {
-		Hash             string  `json:"hash"`
-		Title            string  `json:"title"`
-		DownloadSpeed    float64 `json:"download_speed"`
-		UploadSpeed      float64 `json:"upload_speed"`
-		ActivePeers      int     `json:"active_peers"`
-		ConnectedSeeders int     `json:"connected_seeders"`
-		TorrentSize      int64   `json:"torrent_size"`
-		BytesRead        int64   `json:"bytes_read"`
-		IsPriority       bool    `json:"is_priority"`
-		StatString       string  `json:"stat_string"`
+		Hash             string     `json:"hash"`
+		Title            string     `json:"title"`
+		DownloadSpeed    float64    `json:"download_speed"`
+		UploadSpeed      float64    `json:"upload_speed"`
+		ActivePeers      int        `json:"active_peers"`
+		ConnectedSeeders int        `json:"connected_seeders"`
+		HalfOpenPeers    int        `json:"half_open_peers"`
+		PendingPeers     int        `json:"pending_peers"`
+		TorrentSize      int64      `json:"torrent_size"`
+		BytesRead        int64      `json:"bytes_read"`
+		IsPriority       bool       `json:"is_priority"`
+		StatString       string     `json:"stat_string"`
+		PeerRates        []PeerRate `json:"peer_rates"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -446,21 +481,36 @@ func (c *Collector) fetchTorrents() []TorrentInfo {
 			Hash:       r.Hash,
 			Title:      r.Title,
 			SpeedMBs:   speedMB,
+			UpMBs:      sentMBs(r.PeerRates),
 			Peers:      r.ActivePeers,
 			Seeders:    r.ConnectedSeeders,
 			Size:       r.TorrentSize,
 			BytesRead:  r.BytesRead,
 			IsPriority: r.IsPriority,
 			Status:     status,
+			HalfOpen:   r.HalfOpenPeers,
+			Pending:    r.PendingPeers,
+			PeerRates:  r.PeerRates,
 		})
 	}
 	return out
 }
 
+// SetAuthToken makes the loopback /metrics calls pass sign-in on :9080.
+func (c *Collector) SetAuthToken(t string) { c.authToken = t }
+
+func (c *Collector) loopbackRequest(ctx context.Context, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err == nil && c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
+	return req, err
+}
+
 func (c *Collector) fetchFUSEBuffer(s *HealthStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.metricsURL, nil)
+	req, err := c.loopbackRequest(ctx, c.metricsURL)
 	if err != nil {
 		return
 	}
@@ -503,7 +553,7 @@ func (c *Collector) fetchFUSEBuffer(s *HealthStatus) {
 func (c *Collector) fetchCacheHitRate(s *HealthStatus) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.profilingURL, nil)
+	req, err := c.loopbackRequest(ctx, c.profilingURL)
 	if err != nil {
 		return
 	}
@@ -893,6 +943,7 @@ type plexSession struct {
 type plexMediaContainer struct {
 	XMLName xml.Name    `xml:"MediaContainer"`
 	Videos  []plexVideo `xml:"Video"`
+	Tracks  []plexVideo `xml:"Track"` // music: same attributes, album in parent*, artist in grandparent*
 }
 
 type plexVideo struct {
@@ -903,6 +954,9 @@ type plexVideo struct {
 	Year             string `xml:"year,attr"`
 	Thumb            string `xml:"thumb,attr"`
 	GrandparentThumb string `xml:"grandparentThumb,attr"` // series poster (episodes only)
+	ParentTitle      string `xml:"parentTitle,attr"`      // album (tracks only)
+	ParentYear       string `xml:"parentYear,attr"`       // album year (tracks only)
+	ParentThumb      string `xml:"parentThumb,attr"`      // album cover (tracks only)
 	ParentIndex      int    `xml:"parentIndex,attr"`      // season number
 	Index            int    `xml:"index,attr"`            // episode number
 	Media            []struct {
@@ -943,8 +997,8 @@ func (c *Collector) fetchPlexSessions() map[string]plexSession {
 		return result
 	}
 
-	reHash8 := regexp.MustCompile(`(?i)_([a-f0-9]{8})\.mkv$`)
-	for _, v := range container.Videos {
+	reHash8 := regexp.MustCompile(`(?i)_([a-f0-9]{8})\.[a-z0-9]+$`) // .mkv, and .flac/.mp3/.m4b for audio
+	for _, v := range append(container.Videos, container.Tracks...) {
 		// For episodes: use series title + series poster; for movies: use title + thumb
 		title := v.Title
 		year := v.Year
@@ -956,6 +1010,16 @@ func (c *Collector) fetchPlexSessions() map[string]plexSession {
 			}
 			if v.GrandparentThumb != "" {
 				thumbPath = v.GrandparentThumb
+			}
+		}
+		if v.Type == "track" {
+			// One torrent is one album: show "Artist - Album" with the album cover.
+			if v.GrandparentTitle != "" && v.ParentTitle != "" {
+				title = v.GrandparentTitle + " - " + v.ParentTitle
+			}
+			year = v.ParentYear
+			if v.ParentThumb != "" {
+				thumbPath = v.ParentThumb
 			}
 		}
 		poster := ""
@@ -1099,4 +1163,27 @@ func hostOf(rawURL string) string {
 		return rawURL
 	}
 	return u.Host
+}
+
+// PeerRate is one connected peer as GoStorm reports it: anonymous id, KB/s, seeder.
+type PeerRate struct {
+	ID     string  `json:"id"`
+	KBps   float64 `json:"kbps"`
+	UpKBps float64 `json:"up_kbps,omitempty"` // what we upload to this peer
+	Seed   bool    `json:"seed"`
+	UTP    bool    `json:"utp,omitempty"`
+	CC     string  `json:"cc,omitempty"`
+	ASN    uint    `json:"asn,omitempty"`
+	Org    string  `json:"org,omitempty"` // network owner, e.g. "Hetzner Online GmbH"
+}
+
+// sentMBs is the piece data sent to the listed peers, in MiB/s. GoStorm's upload_speed counts
+// every byte on the wire, requests and HAVEs included, which would show upload while we only
+// download.
+func sentMBs(peers []PeerRate) float64 {
+	var kb float64
+	for _, p := range peers {
+		kb += p.UpKBps
+	}
+	return kb / 1024
 }
