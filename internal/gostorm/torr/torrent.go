@@ -279,9 +279,14 @@ func (t *Torrent) updateRA() {
 	go t.cache.AdjustRA(adj)
 }
 
-// IsStreaming returns true if the torrent has active FUSE readers or non-zero download speed.
-// Used by listActiveTorrents to avoid serializing idle bt.torrents entries.
+// IsStreaming returns true if the torrent has a confirmed playback (priority), active FUSE
+// readers or non-zero download speed. Used by listActiveTorrents to avoid serializing idle
+// bt.torrents entries. Priority counts on its own: a fully cached episode has no download and,
+// between the player's reads, no reader, and it dropped out of the dashboard mid-playback.
 func (t *Torrent) IsStreaming() bool {
+	if t.IsPriority.Load() {
+		return true
+	}
 	if t.cache != nil && t.cache.Readers() > 0 {
 		return true
 	}
