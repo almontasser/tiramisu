@@ -1555,10 +1555,10 @@ type MkvHandle struct {
 	streamedOnce   atomic.Bool  // read sequentially like a player at least once
 	openedAt       time.Time    // set once at Open
 	wakeWait       *pendingWake // activation still running when Open returned; set once
-	bitrateKnown    atomic.Bool  // the film bitrate reached the pump reader
-	bitrateTried    atomic.Int64 // unix nanos of the last header parse attempt
-	mp4HeadTried    atomic.Bool  // an MP4's larger head was searched for its moov once
-	mp4TailTried    atomic.Bool  // an MP4's SSD tail was searched for its moov once
+	bitrateKnown   atomic.Bool  // the film bitrate reached the pump reader
+	bitrateTried   atomic.Int64 // unix nanos of the last header parse attempt
+	mp4HeadTried   atomic.Bool  // an MP4's larger head was searched for its moov once
+	mp4TailTried   atomic.Bool  // an MP4's SSD tail was searched for its moov once
 }
 
 // pendingWake is a torrent activation Open stopped waiting for.
