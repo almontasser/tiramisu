@@ -1,6 +1,7 @@
 package warmup
 
 import (
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tiramisu/internal/gostorm/settings"
 	"tiramisu/internal/library"
 )
 
@@ -23,6 +23,7 @@ const (
 	warmupQuota    int64 = 32 * 1024 * 1024 * 1024 // fallback default 32 GB (overridden by config)
 	warmupSuffix         = ".warmup"
 	tailSuffix           = ".warmup-tail"    // V265: separate file for tail
+	tailDoneSuffix       = ".ok"             // next to a tail file: the window was complete and synced
 	denseMarker          = ".dense-migrated" // one-shot marker: head cache rebuilt for the density invariant
 	warmupWriteBuf       = 16 * 1024 * 1024  // 16 MB — matches pump chunk size
 	handleIdleMax        = 30 * time.Second  // close idle file handles after 30s
@@ -171,27 +172,20 @@ type DiskWarmupCache struct {
 	tailCoverage sync.Map   // V265: path -> *tailRange (written range tracking)
 	tailFills    sync.Map   // path -> true while a sequential tail fill is running
 	warmupStarts sync.Map   // path -> time.Time (STARTING timestamp, for duration histogram)
+	touched      sync.Map   // path -> time.Time of the last mtime refresh on read
 	writeCh      chan warmupWrite
 }
 
-// InitDiskWarmup creates the global warmup cache if UseDisk is enabled.
 var logf = log.New(os.Stdout, "[DiskWarmup] ", log.LstdFlags)
 
-func InitDiskWarmup(quotaGB int64) {
+// InitDiskWarmup creates the global warmup cache in dir when useDisk is set (the engine
+// settings UseDisk and TorrentsSavePath, read once at start).
+func InitDiskWarmup(quotaGB int64, useDisk bool, dir string) {
 	diskQuotaGB = quotaGB
 	FileSize = 64 * 1024 * 1024 // default, overridden by config
-	for i := 0; i < 15; i++ {
-		if settings.BTsets != nil {
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
-
-	if settings.BTsets == nil || !settings.BTsets.UseDisk {
+	if !useDisk {
 		return
 	}
-
-	dir := settings.BTsets.TorrentsSavePath
 	if dir == "" || dir == "/" {
 		return
 	}
@@ -218,7 +212,7 @@ func InitDiskWarmup(quotaGB int64) {
 		dropHeads = true
 	}
 
-	if total, dropped, residues, err := scanExisting(dir, dropHeads); err == nil {
+	if total, dropped, residues, err := DiskWarmup.scanExisting(dropHeads); err == nil {
 		atomic.StoreInt64(&DiskWarmup.totalSize, total)
 		logf.Printf("[DiskWarmup] Initial size: %.1fGB (dropped %d stale cache files, %d residues)", float64(total)/(1<<30), dropped, residues)
 	}
@@ -236,21 +230,38 @@ func InitDiskWarmup(quotaGB int64) {
 	logf.Printf("[DiskWarmup] Active — dir=%s quota=%dGB warmup=%dMB", dir, quotaGB, FileSize/1024/1024)
 }
 
-// scanExisting walks the cache at startup. Tail files always go, because their
-// coverage lives in memory only and a tail left by a previous run cannot prove which
-// ranges are real. Head files go when the one-shot density migration runs, and a head
-// below the ready floor goes as a residue: the reaper only walks open handles, so the
-// backlog left by a previous process would otherwise live until quota pressure and
-// keep passing for warm coverage.
-func scanExisting(dir string, dropHeads bool) (total int64, dropped, residues int, err error) {
+// scanExisting walks the cache at startup. A tail stays only with its completion marker
+// (written after the full window was synced) and is restored as fully covered; any other
+// tail goes, since nothing on disk proves which of its ranges are real. Head files go when
+// the one-shot density migration runs, and a head below the ready floor goes as a residue.
+func (d *DiskWarmupCache) scanExisting(dropHeads bool) (total int64, dropped, residues int, err error) {
+	dir := d.dir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	for _, e := range entries {
 		name := e.Name()
-		isTail := strings.HasSuffix(name, tailSuffix)
-		if isTail || (dropHeads && strings.HasSuffix(name, warmupSuffix)) {
+		if strings.HasSuffix(name, tailSuffix+tailDoneSuffix) {
+			if _, serr := os.Stat(filepath.Join(dir, strings.TrimSuffix(name, tailDoneSuffix))); serr != nil {
+				os.Remove(filepath.Join(dir, name)) // orphan marker
+			}
+			continue
+		}
+		if strings.HasSuffix(name, tailSuffix) {
+			path := filepath.Join(dir, name)
+			if info, ierr := e.Info(); ierr == nil && info.Size() == TailWarmupSize && fileExists(path+tailDoneSuffix) {
+				d.tailRangeFor(path).add(0, TailWarmupSize)
+				total += TailWarmupSize
+				continue
+			}
+			os.Remove(path + tailDoneSuffix)
+			if os.Remove(path) == nil {
+				dropped++
+			}
+			continue
+		}
+		if dropHeads && strings.HasSuffix(name, warmupSuffix) {
 			if os.Remove(filepath.Join(dir, name)) == nil {
 				dropped++
 			}
@@ -271,6 +282,44 @@ func scanExisting(dir string, dropHeads bool) (total int64, dropped, residues in
 		}
 	}
 	return total, dropped, residues, nil
+}
+
+// touchInterval bounds mtime refreshes on read: eviction orders by mtime, minutes are enough.
+const touchInterval = time.Minute
+
+// touch marks path as used now, so quota eviction follows reads and not only the last write.
+func (d *DiskWarmupCache) touch(path string) {
+	now := time.Now()
+	if v, ok := d.touched.Load(path); ok && now.Sub(v.(time.Time)) < touchInterval {
+		return
+	}
+	d.touched.Store(path, now)
+	os.Chtimes(path, now, now)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// removeTail deletes a tail file with its completion marker and forgets its coverage.
+func (d *DiskWarmupCache) removeTail(path string) {
+	d.tailCoverage.Delete(path)
+	os.Remove(path + tailDoneSuffix)
+}
+
+// markTailDone syncs a complete tail and writes its marker, so the next start keeps it.
+func (d *DiskWarmupCache) markTailDone(path string, ch *cachedHandle) {
+	if fileExists(path + tailDoneSuffix) {
+		return
+	}
+	if err := ch.f.Sync(); err != nil {
+		return
+	}
+	if f, err := os.Create(path + tailDoneSuffix); err == nil {
+		f.Sync()
+		f.Close()
+	}
 }
 
 func (d *DiskWarmupCache) handleReaper() {
@@ -620,6 +669,9 @@ func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64)
 	}
 
 	n, err := ch.f.ReadAt(buf, off)
+	if n > 0 {
+		d.touch(path)
+	}
 	return n, err
 }
 
@@ -655,11 +707,16 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 		os.MkdirAll(d.dir, 0755)
 		d.missing.Delete(path)
 
+		// Kept across restarts, so the whole window counts against the quota from the start.
+		d.mu.Lock()
+		d.enforceQuotaLocked(tailLen)
+		d.mu.Unlock()
 		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			return
 		}
 		library.ApplyOwner(path)
+		atomic.AddInt64(&d.totalSize, tailLen)
 		tailCh := &cachedHandle{f: f}
 		tailCh.lastUsedNano.Store(time.Now().UnixNano())
 		d.handles.Store(path, tailCh)
@@ -681,6 +738,9 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 	}
 	d.sizeCache.Store(path, sizeEntry{size: relOffset + int64(n), updatedAt: time.Now()})
 	tr.add(relOffset, relOffset+int64(n))
+	if tr.complete() {
+		d.markTailDone(path, ch)
+	}
 }
 
 func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absoluteOffset, fileSize int64) (int, error) {
@@ -716,6 +776,9 @@ func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absolute
 	}
 
 	n, err := ch.f.ReadAt(buf, relOffset)
+	if n > 0 {
+		d.touch(path)
+	}
 	return n, err
 }
 
@@ -733,7 +796,8 @@ func (d *DiskWarmupCache) RemoveHash(hash string) {
 
 			d.closeHandle(fullPath)
 			d.sizeCache.Delete(fullPath)
-			d.tailCoverage.Delete(fullPath)
+			d.touched.Delete(fullPath)
+			d.removeTail(fullPath)
 			os.Remove(fullPath)
 		}
 	}
@@ -779,9 +843,14 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 		if diskTotal+needed <= quota {
 			break
 		}
+		// A live handle means a reader or writer is on it now: never evict from under it.
+		if v, ok := d.handles.Load(fi.path); ok && time.Since(time.Unix(0, v.(*cachedHandle).lastUsedNano.Load())) < handleIdleMax {
+			continue
+		}
+		d.touched.Delete(fi.path)
 		d.closeHandle(fi.path)
 		d.sizeCache.Delete(fi.path)
-		d.tailCoverage.Delete(fi.path)
+		d.removeTail(fi.path)
 		os.Remove(fi.path)
 		diskTotal -= fi.size
 	}
@@ -798,6 +867,38 @@ const tailFillChunk = 1024 * 1024 // per-request size of the sequential fill
 // tailFillPacing spaces out the fill so it stays a background trickle; a var so tests
 // don't have to wait it out.
 var tailFillPacing = 250 * time.Millisecond
+
+// maxTailFills bounds the fills fetching at once; the rest wait their turn.
+const maxTailFills = 2
+
+var tailFillSlots = make(chan struct{}, maxTailFills)
+
+// TailFillYield, when set, stops a fill whose file is back in playback (checked per chunk).
+var TailFillYield func(hash string, fileID int) bool
+
+// TailIdleDelay is how long a closed file must stay idle before EnsureTailWhenIdle fills its tail.
+// Below the 30s pump grace: the pump's stream keeps the torrent resident until then.
+var TailIdleDelay = 10 * time.Second
+
+// EnsureTailWhenIdle fills the tail after TailIdleDelay if idle still holds: a library scan or a
+// player that sends no media.stop leaves the file closed without anything else starting the fill.
+func (d *DiskWarmupCache) EnsureTailWhenIdle(hash string, fileID int, fileSize int64, idle func() bool) {
+	if d == nil || d.TailReady(hash, fileID) {
+		return
+	}
+	time.AfterFunc(TailIdleDelay, func() {
+		if idle() {
+			d.EnsureTail(hash, fileID, fileSize)
+		}
+	})
+}
+
+// TailPaused is the error Fetch returns while speculative reads are paused (a stream at risk
+// of stalling): the fill waits and retries instead of giving up. Wired at startup.
+var TailPaused error
+
+// tailPausedRetry spaces the retries while paused; tailPausedMax bounds the wait.
+var tailPausedRetry, tailPausedMax = 2 * time.Second, 15 * time.Minute
 
 // EnsureTail fills the whole tail window sequentially in the background so TailReady can
 // actually become true. Opportunistic WriteTail only records the ranges a client happened
@@ -818,8 +919,13 @@ func (d *DiskWarmupCache) EnsureTail(hash string, fileID int, fileSize int64) {
 		return
 	}
 
+	// Read once: tests swap them.
+	fetch, pacing, yield := Fetch, tailFillPacing, TailFillYield
+	paused, pausedRetry, pausedMax := TailPaused, tailPausedRetry, tailPausedMax
 	go func() {
 		defer d.tailFills.Delete(path)
+		tailFillSlots <- struct{}{}
+		defer func() { <-tailFillSlots }()
 
 		tailStart := fileSize - TailWarmupSize
 		if tailStart < 0 {
@@ -840,7 +946,16 @@ func (d *DiskWarmupCache) EnsureTail(hash string, fileID int, fileSize int64) {
 				rel = end
 				continue
 			}
-			n, err := Fetch(hash, fileID, tailStart+rel, buf[:end-rel])
+			if yield != nil && yield(hash, fileID) {
+				logf.Printf("[DiskWarmup] Tail fill paused at %.1f/%.1fMB for %s: file back in playback",
+					float64(rel)/(1<<20), float64(tailLen)/(1<<20), filepath.Base(path))
+				return
+			}
+			n, err := fetch(hash, fileID, tailStart+rel, buf[:end-rel])
+			if paused != nil && errors.Is(err, paused) && time.Since(started) < pausedMax {
+				time.Sleep(pausedRetry)
+				continue
+			}
 			if err != nil || n <= 0 {
 				logf.Printf("[DiskWarmup] Tail fill stopped at %.1f/%.1fMB for %s: %v",
 					float64(rel)/(1<<20), float64(tailLen)/(1<<20), filepath.Base(path), err)
@@ -849,7 +964,7 @@ func (d *DiskWarmupCache) EnsureTail(hash string, fileID int, fileSize int64) {
 			d.WriteTail(hash, fileID, buf[:n], tailStart+rel, fileSize)
 			fetched += int64(n)
 			rel += int64(n)
-			time.Sleep(tailFillPacing)
+			time.Sleep(pacing)
 		}
 		if d.TailReady(hash, fileID) {
 			logf.Printf("[DiskWarmup] TAIL COMPLETE %s (%.1fMB fetched in %s)",

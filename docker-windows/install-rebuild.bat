@@ -279,22 +279,46 @@ call :ensure_dir "%BASE_DIR_WIN%\tiramisu-mkv-real\tv"
 call :ensure_dir "%BASE_DIR_WIN%\%CONTAINER_NAME%\config"
 call :ensure_dir "%BASE_DIR_WIN%\%CONTAINER_NAME%\transcode"
 
-REM Ensure config.json exists
-set "CONFIG_PATH=%BASE_DIR_WIN%\tiramisu-mkv-real\config\config.json"
-if not exist "%CONFIG_PATH%" (
+REM The configuration lives in the state DB (tiramisu\STATE\tiramisu.db). A config.json in
+REM tiramisu\ is imported on the next start and then renamed, so one is written only to import:
+REM  - the single-file config of an older install, moved here once (then renamed .migrated);
+REM  - config.json.example, on a fresh install with no state DB.
+REM A rebuild of a migrated install writes nothing: a file now would undo Control Panel changes.
+call :ensure_dir "%BASE_DIR_WIN%\tiramisu"
+set "CONFIG_PATH=%BASE_DIR_WIN%\tiramisu\config.json"
+set "LEGACY_CONFIG=%BASE_DIR_WIN%\tiramisu-mkv-real\config\config.json"
+set "STATE_DB=%BASE_DIR_WIN%\tiramisu\STATE\tiramisu.db"
+set "CONFIG_IMPORT=0"
+if exist "%CONFIG_PATH%" set "CONFIG_IMPORT=1"
+if "%CONFIG_IMPORT%"=="0" if exist "%LEGACY_CONFIG%" (
+  copy /y "%LEGACY_CONFIG%" "%CONFIG_PATH%" >nul
+  if errorlevel 1 (
+    echo ERROR: Failed to move %LEGACY_CONFIG% to %CONFIG_PATH%
+    exit /b 1
+  )
+  move /y "%LEGACY_CONFIG%" "%LEGACY_CONFIG%.migrated" >nul
+  set "CONFIG_IMPORT=1"
+)
+if "%CONFIG_IMPORT%"=="0" if not exist "%STATE_DB%" (
   copy /y "%REPO_ROOT%\config.json.example" "%CONFIG_PATH%" >nul
   if errorlevel 1 (
     echo ERROR: Failed to create config.json from config.json.example
     exit /b 1
   )
   set "CONFIG_CREATED=1"
+  set "CONFIG_IMPORT=1"
 )
 
-REM Patch config.json + read internal metrics port
-call :patch_config "%CONFIG_PATH%" "%BASE_DIR_WIN%\tiramisu-mkv-real\backup" "%FLAVOR%"
-if errorlevel 1 (
-  echo ERROR: Failed to patch/read config.json at %CONFIG_PATH%
-  exit /b !ERRORLEVEL!
+if "%CONFIG_IMPORT%"=="1" (
+  REM Patch the file to import + read internal metrics port
+  call :patch_config "%CONFIG_PATH%" "%BASE_DIR_WIN%\tiramisu-mkv-real\backup" "%FLAVOR%"
+  if errorlevel 1 (
+    echo ERROR: Failed to patch/read config.json at %CONFIG_PATH%
+    exit /b !ERRORLEVEL!
+  )
+) else (
+  REM Already in the state DB: the internal metrics port is the default unless changed there.
+  if "%TIRAMISU_METRICS_PORT%"=="" set "TIRAMISU_METRICS_PORT=9080"
 )
 if "%TIRAMISU_METRICS_PORT%"=="" (
   echo ERROR: Failed to determine internal metrics port from config.json
@@ -371,9 +395,11 @@ echo   JELLYFIN_HOST_PORT : %JELLYFIN_HOST_PORT% ^> 8096
 echo   METRICS_HOST_PORT  : %METRICS_HOST_PORT% ^> %TIRAMISU_METRICS_PORT%
 echo   Internal metrics   : %TIRAMISU_METRICS_PORT%
 echo.
-echo config.json:
-if "%CONFIG_CREATED%"=="1" (echo   - created from config.json.example) else (echo   - existed)
-if "%CONFIG_CHANGED%"=="1" (echo   - patched keys) else (echo   - no changes required)
+echo configuration:
+if "%CONFIG_IMPORT%"=="0" (echo   - kept in the state DB, nothing written) else (
+  if "%CONFIG_CREATED%"=="1" (echo   - config.json created from config.json.example, imported on start) else (echo   - config.json imported on start)
+  if "%CONFIG_CHANGED%"=="1" (echo   - patched keys) else (echo   - no changes required)
+)
 if /i "%FLAVOR%"=="jellyfin" (
   if not "%CONFIG_BACKUP%"=="" echo   - backup: %CONFIG_BACKUP%
 )
@@ -621,7 +647,7 @@ if "%_internal%"=="" exit /b 1
 
 set "__INTERNAL=%_internal%"
 
-for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $internal=[int]$env:__INTERNAL; $used = New-Object System.Collections.Generic.HashSet[int]; $ids = @(); try { $ids = docker ps -aq 2>$null } catch { $ids=@() }; foreach($id in $ids){ try { $j = docker inspect $id | ConvertFrom-Json } catch { continue }; if($null -eq $j -or $j.Count -lt 1){ continue }; $ports = $j[0].NetworkSettings.Ports; if($null -eq $ports){ continue }; foreach($prop in $ports.PSObject.Properties){ $bindings = $prop.Value; if($null -eq $bindings){ continue }; foreach($b in $bindings){ if($null -ne $b.HostPort -and $b.HostPort -match '^[0-9]+$'){ [void]$used.Add([int]$b.HostPort) } } } }; $reserved = New-Object System.Collections.Generic.HashSet[int]; function NextFree([int]$start){ $p=$start; while($used.Contains($p) -or $reserved.Contains($p)){ $p++ }; [void]$reserved.Add($p); return $p }; $plex = NextFree 32400; $jelly = NextFree 8096; $gostorm = NextFree 8090; $metrics = NextFree 9080; Write-Output ('PLEX_HOST_PORT='+$plex); Write-Output ('JELLYFIN_HOST_PORT='+$jelly); Write-Output ('GOSTORM_HOST_PORT='+$gostorm); Write-Output ('METRICS_HOST_PORT='+$metrics) }"`) do (
+for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $internal=[int]$env:__INTERNAL; $used = New-Object System.Collections.Generic.HashSet[int]; $ids = @(); try { $ids = docker ps -aq 2>$null } catch { $ids=@() }; foreach($id in $ids){ try { $j = docker inspect $id | ConvertFrom-Json } catch { continue }; if($null -eq $j -or $j.Count -lt 1){ continue }; $ports = $j[0].NetworkSettings.Ports; if($null -eq $ports){ continue }; foreach($prop in $ports.PSObject.Properties){ $bindings = $prop.Value; if($null -eq $bindings){ continue }; foreach($b in $bindings){ if($null -ne $b.HostPort -and $b.HostPort -match '^[0-9]+$'){ [void]$used.Add([int]$b.HostPort) } } } }; $reserved = New-Object System.Collections.Generic.HashSet[int]; function NextFree([int]$start){ $p=$start; while($used.Contains($p) -or $reserved.Contains($p)){ $p++ }; [void]$reserved.Add($p); return $p }; $plex = NextFree 32400; $jelly = NextFree 8096; $metrics = NextFree 9080; Write-Output ('PLEX_HOST_PORT='+$plex); Write-Output ('JELLYFIN_HOST_PORT='+$jelly); Write-Output ('METRICS_HOST_PORT='+$metrics) }"`) do (
   set "%%A=%%B"
 )
 
@@ -768,7 +794,6 @@ echo [stack] Writing .env
   echo.
   echo PLEX_HOST_PORT=%PLEX_HOST_PORT%
   echo JELLYFIN_HOST_PORT=%JELLYFIN_HOST_PORT%
-  echo GOSTORM_HOST_PORT=%GOSTORM_HOST_PORT%
   echo METRICS_HOST_PORT=%METRICS_HOST_PORT%
   echo.
   echo TIRAMISU_METRICS_PORT=%TIRAMISU_METRICS_PORT%

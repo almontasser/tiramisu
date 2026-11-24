@@ -14,12 +14,14 @@ import (
 
 // MoviesSyncer runs the movie sync in pure Go (Fase 4).
 type MoviesSyncer struct {
-	engine *MovieGoEngine
+	engine   *MovieGoEngine
+	afterRun func(ctx context.Context)
 }
 
 // MoviesSyncerConfig holds config for the Go movie engine.
 type MoviesSyncerConfig struct {
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -38,6 +40,10 @@ type MoviesSyncerConfig struct {
 	// DB is optional: without it the engine simply never reaps dead releases.
 	DB            *metadb.DB
 	AudioRegistry library.AudioRegistry
+	// Release, when set, is the library's single release point (ReleaseIfUnused).
+	Release ReleaseFunc
+	// AfterRun, when set, runs after a successful sync (the orphan collection).
+	AfterRun func(ctx context.Context)
 }
 
 // NewMoviesSyncer creates a new Go-based movie syncer.
@@ -60,6 +66,7 @@ func NewMoviesSyncer(cfg MoviesSyncerConfig) *MoviesSyncer {
 
 	engineCfg := MovieEngineConfig{
 		GoStormURL:      cfg.GoStormURL,
+		Torrents:        cfg.Torrents,
 		TMDBAPIKey:      cfg.TMDBAPIKey,
 		TorrentioURL:    cfg.TorrentioURL,
 		PlexURL:         cfg.PlexURL,
@@ -75,10 +82,12 @@ func NewMoviesSyncer(cfg MoviesSyncerConfig) *MoviesSyncer {
 		InvalidatePath:  cfg.InvalidatePath,
 		DB:              cfg.DB,
 		AudioRegistry:   cfg.AudioRegistry,
+		Release:         cfg.Release,
 	}
 
 	return &MoviesSyncer{
-		engine: NewMovieGoEngine(engineCfg),
+		engine:   NewMovieGoEngine(engineCfg),
+		afterRun: cfg.AfterRun,
 	}
 }
 
@@ -87,6 +96,9 @@ func (s *MoviesSyncer) Name() string { return "movies" }
 func (s *MoviesSyncer) Run(ctx context.Context) error {
 	if err := s.engine.Run(ctx); err != nil {
 		return fmt.Errorf("movie sync: %w", err)
+	}
+	if s.afterRun != nil && ctx.Err() == nil {
+		s.afterRun(ctx)
 	}
 	return nil
 }

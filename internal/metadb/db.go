@@ -17,9 +17,11 @@ type Logger interface {
 
 // DB wraps a SQLite database connection for tiramisu state persistence.
 type DB struct {
-	db     *sql.DB
-	path   string
-	logger Logger
+	db       *sql.DB
+	ro       *sql.DB // read-only pool for hot reads; nil falls back to db
+	path     string
+	logger   Logger
+	readOnly bool // from OpenReadOnly: SELECT only, no checkpoint on close
 }
 
 // New opens or creates a SQLite database at dbPath, applies pragmas,
@@ -28,8 +30,12 @@ func New(dbPath string, logger Logger) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
 		return nil, fmt.Errorf("metadb: create dir: %w", err)
 	}
+	// The DB holds the configuration and its secrets: created owner-only.
+	if f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+		f.Close()
+	}
 
-	d, err := sql.Open("sqlite", dbPath)
+	d, err := sql.Open("sqlite", dbPath+"?"+rwPragmas)
 	if err != nil {
 		return nil, fmt.Errorf("metadb: open: %w", err)
 	}
@@ -46,20 +52,80 @@ func New(dbPath string, logger Logger) (*DB, error) {
 		d.Close()
 		return nil, fmt.Errorf("metadb: pragmas: %w", err)
 	}
+	db.tightenPerms()
 
 	if err := db.ExecSchema(); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("metadb: schema: %w", err)
 	}
+	db.openReaders()
 
 	return db, nil
 }
 
-// Close performs a WAL checkpoint and closes the database connection.
+// readConns is the size of the read pool: WAL lets readers run beside the one writer.
+const readConns = 4
+
+// openReaders opens the read-only pool. Without it every read waits behind the writer, as
+// before, so a failure only logs.
+func (d *DB) openReaders() {
+	ro, err := sql.Open("sqlite", d.path+"?"+roPoolPragmas)
+	if err == nil {
+		err = ro.Ping()
+	}
+	if err != nil {
+		if ro != nil {
+			ro.Close()
+		}
+		if d.logger != nil {
+			d.logger.Printf("[StateDB] WARN read pool unavailable, reads share the writer: %v", err)
+		}
+		return
+	}
+	ro.SetMaxOpenConns(readConns)
+	ro.SetMaxIdleConns(readConns)
+	d.ro = ro
+}
+
+// reader is the pool for reads that must not wait behind a write transaction.
+func (d *DB) reader() *sql.DB {
+	if d.ro != nil {
+		return d.ro
+	}
+	return d.db
+}
+
+// Close performs a WAL checkpoint and closes the database connection. A handle from
+// OpenReadOnly only closes: the checkpoint belongs to the engine that owns the DB.
 func (d *DB) Close() error {
-	_, _ = d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if d.ro != nil {
+		d.ro.Close() // a TRUNCATE checkpoint needs no open readers
+	}
+	if !d.readOnly {
+		_, _ = d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	}
 	return d.db.Close()
 }
+
+// walSizeLimit is the WAL size kept after a checkpoint: readers on the pool can stop the
+// WAL from restarting, and without a limit the file stays at its peak until restart.
+const walSizeLimit = 64 << 20
+
+// Checkpoint folds the WAL back into the DB and truncates it. A reader still on the WAL
+// makes it busy: that is reported, since the result row, not the error, carries it.
+func (d *DB) Checkpoint() error {
+	var busy, logFrames, done int
+	if err := d.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &done); err != nil {
+		return err
+	}
+	if busy != 0 {
+		return fmt.Errorf("metadb: checkpoint incomplete, a reader holds the WAL (%d of %d frames)", done, logFrames)
+	}
+	return nil
+}
+
+// Path is the DB file.
+func (d *DB) Path() string { return d.path }
 
 // hasColumn reports whether a table already carries a column.
 func (d *DB) hasColumn(table, column string) bool {
@@ -94,24 +160,37 @@ func (d *DB) SetLogger(l Logger) {
 	}
 }
 
+// tightenPerms makes the DB and its WAL files owner-only; older installs created them 0644.
+func (d *DB) tightenPerms() {
+	for _, p := range []string{d.path, d.path + "-wal", d.path + "-shm"} {
+		fi, err := os.Stat(p)
+		if err != nil || fi.Mode().Perm() == 0600 {
+			continue
+		}
+		if err := os.Chmod(p, 0600); err != nil && d.logger != nil {
+			d.logger.Printf("[StateDB] WARN cannot restrict %s to 0600: %v", p, err)
+		}
+	}
+}
+
 // SQL returns the underlying *sql.DB for direct access (e.g. transactions).
 func (d *DB) SQL() *sql.DB {
 	return d.db
 }
 
+// Pragmas go in the DSN so the driver applies them to every connection it opens: set with
+// Exec they held only on the first one, and a reopened connection silently lost them.
+const (
+	rwPragmas = "_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" +
+		"&_pragma=journal_size_limit(67108864)"
+	roPragmas = "_pragma=busy_timeout(5000)"
+	// The read pool: query_only makes any write on it fail, so the writer stays the only one.
+	roPoolPragmas = "_pragma=busy_timeout(5000)&_pragma=query_only(1)"
+)
+
+// applyPragmas opens the first connection, so a pragma that fails is reported by New.
 func (d *DB) applyPragmas() error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA foreign_keys=ON",
-	}
-	for _, p := range pragmas {
-		if _, err := d.db.Exec(p); err != nil {
-			return fmt.Errorf("%s: %w", p, err)
-		}
-	}
-	return nil
+	return d.db.Ping()
 }
 
 // ExecSchema creates all tables if they do not exist. Idempotent.
@@ -256,5 +335,33 @@ CREATE TABLE IF NOT EXISTS metadata_failures (
 	if err := d.execAuthSchema(); err != nil {
 		return err
 	}
+	if err := d.execConfigSchema(); err != nil {
+		return err
+	}
+	if err := d.execGoStormSchema(); err != nil {
+		return err
+	}
+	if err := d.execGoStormVersionsSchema(); err != nil {
+		return err
+	}
 	return d.execAudioSchema()
+}
+
+// OpenReadOnly opens an existing DB for reading next to a running engine: no directory,
+// no pragmas, no schema. It is opened read-write on purpose: mode=ro fails on a stopped
+// engine's DB that has no -wal/-shm yet. Callers only SELECT.
+func OpenReadOnly(dbPath string) (*DB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("metadb: %w", err)
+	}
+	d, err := sql.Open("sqlite", dbPath+"?"+roPragmas)
+	if err != nil {
+		return nil, fmt.Errorf("metadb: open: %w", err)
+	}
+	d.SetMaxOpenConns(1)
+	if err := d.Ping(); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("metadb: busy_timeout: %w", err)
+	}
+	return &DB{db: d, path: dbPath, readOnly: true}, nil
 }

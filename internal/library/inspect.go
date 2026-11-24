@@ -26,7 +26,7 @@ type InspectRequest struct {
 }
 
 // InspectFile is one source file as the engine sees it. source_path is what a
-// caller selects by; file_index is GoStorm's own resolved state. The rest is
+// caller selects by; file_index is Tentacle's own resolved state. The rest is
 // what the name gives away.
 type InspectFile struct {
 	SourcePath string `json:"source_path"`
@@ -146,7 +146,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 		if !preexisting {
 			m.dropTorrent(ctx, lockKey)
 		}
-		return nil, errf(http.StatusBadGateway, "gostorm rejected the torrent: %v", err)
+		return nil, errf(http.StatusBadGateway, "Tentacle rejected the torrent: %v", err)
 	}
 	engineHash := strings.ToLower(strings.TrimSpace(addedHash))
 	if !reInfoHash.MatchString(engineHash) {
@@ -154,7 +154,7 @@ func (m *Manager) Inspect(ctx context.Context, req InspectRequest) (*InspectResp
 		if !preexisting {
 			m.dropTorrent(ctx, lockKey)
 		}
-		return nil, errf(http.StatusBadGateway, "gostorm returned a malformed info hash %q", addedHash)
+		return nil, errf(http.StatusBadGateway, "Tentacle returned a malformed info hash %q", addedHash)
 	}
 	// A base32 magnet comes back in hex, and everything from here is keyed on the
 	// spelling the engine reported, so the lock has to cover it too.
@@ -307,7 +307,7 @@ func (m *Manager) inspectCueTracks(ctx context.Context, hash string, files []Fil
 // knownTorrentHashes snapshots what the engine already holds. A failed listing
 // reports not-ok: the caller must not add without it.
 func (m *Manager) knownTorrentHashes(ctx context.Context) (map[string]bool, bool) {
-	torrents, err := m.cfg.GoStorm.ListTorrents(ctx)
+	torrents, err := m.cfg.GoStorm.ListTorrentRefs(ctx)
 	if err != nil {
 		// Logged because this fails the whole request: without it the caller sees
 		// only "cannot establish ownership" and the cause is invisible.

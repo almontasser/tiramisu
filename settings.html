@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/ui/theme.css">
     <script src="/ui/theme.js"></script>
     <script src="/ui/auth.js"></script>
+    <script src="/ui/restart.js"></script>
     <style>
         .page-intro { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; scroll-margin-top: 80px; }
         .page-intro .row { display: flex; align-items: flex-end; gap: 16px; }
@@ -35,12 +36,11 @@
 
         /* language flags */
         .chip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-        .chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 8px; border-radius: 3px; background: var(--ink); color: var(--inv); font-size: 11px; font-weight: 500; }
-        #excluded-flags-row .chip { background: transparent; color: var(--ink); box-shadow: inset 0 0 0 1px var(--hair2); }
-        .chip button { border: 0; background: transparent; color: inherit; cursor: pointer; opacity: .7; padding: 0 4px; }
-        .chip button:hover { opacity: 1; }
+        .lang-chip { gap: 4px; padding-right: 2px; }
+        .lang-chip button { border: 0; background: transparent; color: inherit; cursor: pointer; opacity: .7; padding: 0 4px; font: inherit; }
+        .lang-chip button:hover { opacity: 1; }
         .picker-anchor { position: relative; }
-        .picker { display: none; position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 260px; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; padding: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .12); }
+        .picker { display: none; position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 260px; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; padding: 8px; }
         .picker.open { display: block; }
         .picker input { width: 100%; height: 30px; border: 1px solid var(--hair); border-radius: 4px; background: var(--well); padding: 0 8px; outline: 0; }
         .picker-list { max-height: 220px; overflow-y: auto; margin-top: 6px; display: flex; flex-direction: column; }
@@ -93,7 +93,7 @@
         .seg .preset-custom:not(.active) { opacity: .45; }
         .search .input { width: 300px; }
         .search .kbd { font-family: var(--mono); font-size: 10px; color: var(--ink3); border: 1px solid var(--hair2); border-radius: 3px; padding: 0 4px; }
-        .search-results { display: none; position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 30; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, .12); }
+        .search-results { display: none; position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 30; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; padding: 4px; }
         .search-results.open { display: block; }
         .search-results button { display: flex; width: 100%; gap: 8px; align-items: baseline; border: 0; background: transparent; padding: 7px 8px; border-radius: 4px; cursor: pointer; text-align: left; }
         .search-results button:hover, .search-results button.hl { background: var(--well); }
@@ -149,7 +149,64 @@
         .acc-token { display: flex; align-items: center; gap: 10px; padding: 0 6px 0 12px; height: 40px; border: 1px solid var(--ink); border-radius: 4px; background: var(--well); }
         .acc-token code { flex: 1; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: all; }
         .acc-snippet { margin: 0; padding: 14px 16px; border-radius: 4px; background: var(--term); color: var(--term-text); font-family: var(--mono); font-size: 11px; line-height: 16px; white-space: pre-wrap; word-break: break-all; }
+        .tls-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .tls-step { display: flex; gap: 16px; padding: 16px 0; border-top: 1px solid var(--hair); }
+        .tls-step .b { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+        .tls-step .t { font-weight: 500; }
+        .tls-step.later .t { color: var(--ink3); }
+        .tls-num { flex: 0 0 24px; height: 24px; border-radius: 50%; box-shadow: inset 0 0 0 1px var(--hair2); display: inline-flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; color: var(--ink3); }
+        .tls-num.now { box-shadow: inset 0 0 0 1.5px var(--ink); color: var(--ink); }
+        .tls-num.done { background: var(--ink); box-shadow: none; color: var(--inv); font-family: inherit; font-size: 11px; }
+        .tls-addr { display: flex; align-items: center; gap: 10px; padding: 0 4px 0 12px; height: 36px; max-width: 520px; background: var(--well); border: 1px solid var(--hair); border-radius: 4px; }
+        .tls-addr code { flex: 1; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tls-step .b > .seg, .tls-step .b > .tls-line { align-self: flex-start; max-width: 100%; }
+        .tls-fp { min-width: 0; word-break: break-all; }
+        .tls-step pre.acc-snippet { word-break: normal; overflow-wrap: anywhere; max-width: 760px; }
+        #tls-details:not([hidden]) { display: flex; flex-direction: column; gap: 16px; padding-top: 16px; border-top: 1px solid var(--hair); }
+        .tls-details-head { display: flex; align-items: center; gap: 8px; }
+        .tls-details-head .label { color: var(--ink3); }
+        .tls-kv { display: grid; grid-template-columns: 150px 1fr; gap: 10px 16px; margin: 0; }
+        .tls-kv dt { font-size: 12px; font-weight: 500; color: var(--ink2); }
+        .tls-kv dd { margin: 0; font-family: var(--mono); font-size: 11px; word-break: break-all; }
+        .tls-use { display: flex; align-items: center; gap: 16px; padding: 8px 12px; border-radius: 4px; background: var(--well); flex-wrap: wrap; font-size: 12px; }
+        .tls-use .mono { font-family: var(--mono); font-size: 11px; }
+        #tls-warn, #tls-err { margin-top: 12px; }
         @media (max-width: 900px) { .acc-status { flex-direction: column; align-items: flex-start; } .acc-row .dev { min-width: 0; } }
+        @media (max-width: 900px) { .tls-kv { grid-template-columns: 1fr; gap: 2px 0; } .tls-kv dd { margin-bottom: 8px; } }
+        .hist-row { padding: 14px 24px; display: flex; flex-direction: column; gap: 12px; }
+        .hist-row + .hist-row { border-top: 1px solid var(--hair); }
+        .hist-row.open, .hist-row.restoring { background: var(--well); }
+        .hist-head { display: flex; align-items: center; gap: 16px; min-width: 0; }
+        .hist-head .id { width: 44px; flex: 0 0 44px; color: var(--ink2); font-weight: 500; }
+        .hist-head .when { width: 130px; flex: 0 0 130px; color: var(--ink2); }
+        .hist-head .who { width: 230px; flex: 0 0 230px; display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+        .hist-head .who b { font-weight: 500; }
+        .hist-head .who span { color: var(--ink3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hist-head .sum { flex: 1 1 auto; min-width: 0; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hist-detail { display: flex; flex-direction: column; gap: 8px; padding-left: 60px; }
+        .hist-detail > .label { color: var(--ink3); }
+        .hist-ch { display: flex; align-items: center; gap: 12px; min-width: 0; }
+        .hist-ch .k { width: 300px; flex: 0 0 300px; overflow-wrap: anywhere; }
+        .hist-ch .v { display: flex; gap: 8px; align-items: center; min-width: 0; flex-wrap: wrap; }
+        .hist-ch .from { color: var(--ink3); overflow-wrap: anywhere; }
+        .hist-ch .to { overflow-wrap: anywhere; }
+        .hist-actions { display: flex; align-items: center; gap: 12px; padding-top: 4px; flex-wrap: wrap; }
+        .hist-row.open .chip-tag.soft, .hist-row.restoring .chip-tag.soft { border-color: var(--hair); }
+        .hist-foot { display: flex; align-items: center; gap: 10px; padding: 12px 24px; border-top: 1px solid var(--hair); }
+        .hist-empty { padding: 18px 24px; }
+        @media (max-width: 900px) {
+            .hist-row { padding: 12px 16px; gap: 8px; }
+            .hist-head { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 8px; }
+            .hist-head .id, .hist-head .when, .hist-head .who { width: auto; flex: none; }
+            .hist-head .who { grid-column: 1 / -1; grid-row: 2; }
+            .hist-head .sum { grid-column: 1 / 3; grid-row: 3; white-space: normal; }
+            .hist-head .btn { grid-column: 3; grid-row: 3; }
+            .hist-head .chip-tag { justify-self: end; }
+            .hist-detail { padding-left: 0; }
+            .hist-ch { flex-direction: column; align-items: flex-start; gap: 2px; }
+            .hist-ch .k { width: auto; flex: none; color: var(--ink2); font-size: 12px; }
+            .hist-foot { padding: 12px 16px; }
+        }
     </style>
 </head>
 
@@ -172,17 +229,18 @@
                 <a href="#streaming" data-sec="sec-streaming"><span class="num">01</span>Streaming &amp; FUSE<span class="dirty"></span></a>
                 <a href="#network" data-sec="sec-network"><span class="num">02</span>Network &amp; VPN<span class="dirty"></span></a>
                 <a href="#sources" data-sec="sec-sources"><span class="num">03</span>Sources &amp; Media<span class="dirty"></span></a>
-                <a href="#engine" data-sec="sec-engine"><span class="num">04</span>Engine<span class="dirty"></span></a>
+                <a href="#engine" data-sec="sec-engine"><span class="num">04</span>Tentacle<span class="dirty"></span></a>
                 <a href="#release" data-sec="sec-release"><span class="num">05</span>Release Selection<span class="dirty"></span></a>
                 <a href="#scheduler" data-sec="sec-scheduler"><span class="num">06</span>Scheduler<span class="dirty"></span></a>
                 <a href="#access" data-sec="sec-access"><span class="num">07</span>Access</a>
+                <a href="#history" data-sec="sec-history"><span class="num">08</span>History<span class="dirty"></span></a>
             </nav>
             <nav class="nav">
                 <span class="label">Reference</span>
                 <a href="/api-docs"><span class="num">{}</span>API</a>
             </nav>
             <div class="rail-foot">
-                <div class="row"><span class="lamp run" id="rail-lamp"></span><span class="small" style="font-weight:500" id="rail-state">Engine online</span></div>
+                <div class="row"><span class="lamp run" id="rail-lamp"></span><span class="small" style="font-weight:500" id="rail-state">Tentacle online</span></div>
                 <span class="mono faint small" id="rail-version">—</span>
                 <a class="row" id="rail-update" hidden href="https://github.com/MrRobotoGit/tiramisu/releases/latest" target="_blank" rel="noopener"><span class="chip-tag">Update</span><span class="txt small"></span></a>
                 <hr>
@@ -240,7 +298,7 @@
                                         <div class="head"><label for="f-budget">FUSE Cache Budget</label><span class="val"><span data-for="read_ahead_budget_mb">256</span><small>MB</small></span></div>
                                         <div class="track"><span class="ticks"></span><input id="f-budget" type="range" name="read_ahead_budget_mb" min="128" max="512" step="32"></div>
                                         <div class="scale"><span>128</span><span>▾ recommended 256 MB</span><span>512</span></div>
-                                        <div class="hint">RAM for the raCache pre-read buffer.</div>
+                                        <div class="hint">RAM for the FUSE read-ahead buffer.</div>
                                     </div>
                                     <div style="display:flex;flex-direction:column;gap:20px">
                                         <div class="field"><label>Master Concurrency</label>
@@ -339,7 +397,7 @@
                             <div class="card-head"><span class="num">02.1</span><span class="label ink">NAT-PMP (WireGuard)</span><span class="chip-tag">Adv</span><span class="spacer"></span><span class="scope"><span class="lamp off"></span><span class="label">Restart</span></span></div>
                             <div class="card-body">
                                 <div class="toggle-row" style="padding-top:0">
-                                    <div class="text"><div class="title">Enable NAT-PMP</div><div class="hint">Maps the peer port through the VPN gateway. When on, the GoStorm Listen Port is managed here.</div></div>
+                                    <div class="text"><div class="title">Enable NAT-PMP</div><div class="hint">Maps the peer port through the VPN gateway. When on, the engine Listen Port is managed here.</div></div>
                                     <label class="switch"><input type="checkbox" name="natpmp_enabled" data-nested="natpmp.enabled" onchange="updateNatPmpState()"><span class="slider"></span></label>
                                 </div>
                                 <div class="grid3">
@@ -375,8 +433,9 @@
                             <div class="card-head"><span class="num">02.2</span><span class="label ink">Connectivity &amp; Rescue</span><span class="chip-tag">Adv</span><span class="spacer"></span><span class="scope"><span class="lamp off"></span><span class="label">Restart</span></span></div>
                             <div class="card-body">
                                 <div class="grid3">
-                                    <div class="field"><label>GoStorm URL</label>
+                                    <div class="field"><label>Stub URL prefix</label>
                                         <div class="input mono"><input type="text" name="gostorm_url"></div>
+                                        <div class="hint">Written into every stub as an identifier; nothing listens there. Changing it rewrites stubs.</div>
                                     </div>
                                     <div class="field"><label>Rescue Grace</label>
                                         <div class="input"><input type="number" name="rescue_grace_period_seconds"><span class="unit">s</span></div>
@@ -530,25 +589,25 @@
 
                 <!-- ================= 04 ENGINE ================= -->
                 <form id="gostorm-form" autocomplete="off">
-                    <section class="settings" id="sec-engine" data-title="Engine">
+                    <section class="settings" id="sec-engine" data-title="Tentacle">
                         <div class="page-intro">
                             <span class="label">Settings · 04</span>
                             <div class="row">
-                                <h1 class="h1">Engine</h1><span class="spacer"></span>
-                                <span class="scope"><span class="lamp run"></span><span class="label">GoStorm · applies live</span></span>
+                                <h1 class="h1">Tentacle</h1><span class="spacer"></span>
+                                <span class="scope"><span class="lamp"></span><span class="label">Applies live</span></span>
                             </div>
-                            <p>The embedded GoStorm torrent engine: piece cache, warmup on SSD, swarm limits and protocol behaviour.</p>
+                            <p>Tentacle, the embedded torrent engine: piece cache, warmup on SSD, swarm limits and protocol behaviour.</p>
                         </div>
 
                         <div class="card">
-                            <div class="card-head"><span class="num">04.1</span><span class="label ink">Cache &amp; Data</span><span class="spacer"></span><span class="scope"><span class="lamp run"></span><span class="label">Live</span></span></div>
+                            <div class="card-head"><span class="num">04.1</span><span class="label ink">Cache &amp; Data</span><span class="spacer"></span><span class="scope"><span class="lamp"></span><span class="label">Live</span></span></div>
                             <div class="card-body">
                                 <div class="grid2">
                                     <div class="fader" data-rec="128">
                                         <div class="head"><label for="f-cache">Cache Size</label><span class="val"><span data-for="cacheSize">128</span><small>MB</small></span></div>
                                         <div class="track"><span class="ticks"></span><input id="f-cache" type="range" name="cacheSize" min="64" max="256" step="16"></div>
                                         <div class="scale"><span>64</span><span>▾ recommended 128 MB</span><span>256</span></div>
-                                        <div class="hint">GoStorm piece buffer, feeds raCache. Below 96 MB playback buffers.</div>
+                                        <div class="hint">Tentacle piece buffer, feeds the FUSE read-ahead. Below 96 MB playback buffers.</div>
                                     </div>
                                     <div class="fader" data-rec="75">
                                         <div class="head"><label for="f-ra">Readahead Cache</label><span class="val"><span data-for="readerReadAHead">75</span><small>%</small></span></div>
@@ -562,7 +621,7 @@
                         </div>
 
                         <div class="card">
-                            <div class="card-head"><span class="num">04.2</span><span class="label ink">Warmup &amp; SSD</span><span class="spacer"></span><span class="scope"><span class="lamp run"></span><span class="label">Live · quota on restart</span></span></div>
+                            <div class="card-head"><span class="num">04.2</span><span class="label ink">Warmup &amp; SSD</span><span class="spacer"></span><span class="scope"><span class="lamp"></span><span class="label">Live · quota on restart</span></span></div>
                             <div class="card-body">
                                 <div class="toggle-row" style="padding-top:0">
                                     <div class="text"><div class="title">Use Warmup Cache</div><div class="hint">Keeps the head and tail of every title on SSD for an instant start.</div></div>
@@ -582,7 +641,7 @@
                         </div>
 
                         <div class="card">
-                            <div class="card-head"><span class="num">04.3</span><span class="label ink">Swarm Limits</span><span class="spacer"></span><span class="scope"><span class="lamp run"></span><span class="label">Live</span></span></div>
+                            <div class="card-head"><span class="num">04.3</span><span class="label ink">Swarm Limits</span><span class="spacer"></span><span class="scope"><span class="lamp"></span><span class="label">Live</span></span></div>
                             <div class="card-body">
                                 <div class="grid4">
                                     <div class="field"><label>Connections Limit</label>
@@ -606,7 +665,7 @@
                         </div>
 
                         <div class="card">
-                            <div class="card-head"><span class="num">04.4</span><span class="label ink">Network &amp; Protocol</span><span class="spacer"></span><span class="scope"><span class="lamp run"></span><span class="label">Live</span></span></div>
+                            <div class="card-head"><span class="num">04.4</span><span class="label ink">Network &amp; Protocol</span><span class="spacer"></span><span class="scope"><span class="lamp"></span><span class="label">Live</span></span></div>
                             <div class="card-body">
                                 <div class="grid2 adv-only">
                                     <div class="field"><label>Listen Port <span class="chip-tag">Adv</span><span class="chip-tag" id="listen-lock" hidden>NAT-PMP</span></label>
@@ -641,7 +700,7 @@
                         </div>
 
                         <div class="card">
-                            <div class="card-head"><span class="num">04.5</span><span class="label ink">Behaviors</span><span class="spacer"></span><span class="scope"><span class="lamp run"></span><span class="label">Live</span></span></div>
+                            <div class="card-head"><span class="num">04.5</span><span class="label ink">Behaviors</span><span class="spacer"></span><span class="scope"><span class="lamp"></span><span class="label">Live</span></span></div>
                             <div class="card-body tight">
                                 <div class="toggle-row" style="padding-top:0">
                                     <div class="text"><div class="title">Smart Responsive Mode</div><div class="hint">FAST mode: serves data without waiting for full piece verification. Pair with Adaptive Shield to auto-protect against corruption.</div></div>
@@ -847,7 +906,7 @@
                                 </div>
                                 <div class="job" style="padding:16px 0 0">
                                     <span class="lamp off"></span>
-                                    <span class="small faint">Music sync keeps its own schedule from config.json — not editable here, preserved on save.</span>
+                                    <span class="small faint">Music sync keeps its own schedule from the saved configuration — not editable here, preserved on save.</span>
                                 </div>
                             </div>
                         </div>
@@ -861,7 +920,7 @@
                         <span class="label">Settings · 07</span>
                         <div class="row">
                             <h1 class="h1">Access</h1><span class="spacer"></span>
-                            <span class="scope"><span class="lamp" id="acc-scope-lamp"></span><span class="label">Applies immediately</span></span>
+                            <span class="scope"><span class="lamp" id="acc-scope-lamp"></span><span class="label">Applies live</span></span>
                         </div>
                         <p>Who can open the Control Panel, the Dashboard, the API and the MCP server on this port. Webhooks from Plex and Jellyfin are always accepted.</p>
                     </div>
@@ -911,17 +970,75 @@
                         </div>
                     </div>
 
+                    <div class="card" id="acc-tls-card">
+                        <div class="card-head"><span class="num">07.4</span><span class="label ink">HTTPS</span><span class="spacer"></span><span class="scope"><span class="lamp off"></span><span class="label">Restart</span></span></div>
+                        <div class="card-body tight">
+                            <div class="toggle-row" style="padding-top:0">
+                                <div class="text"><div class="title">Serve this port over HTTPS</div>
+                                    <div class="hint">Encrypts the Control Panel, the API and /mcp. Webhooks and calls from this machine keep working over http://; pages move to https://.</div></div>
+                                <label class="switch"><input type="checkbox" id="tls-enabled" data-label="https.enabled" aria-label="Serve this port over HTTPS" disabled><span class="slider"></span></label>
+                            </div>
+                            <div class="warn-note" id="tls-warn" hidden></div>
+                            <div class="acc-err" id="tls-err" hidden><span class="lamp err"></span><span></span></div>
+                            <div id="tls-steps" hidden></div>
+                            <div class="adv-only" id="tls-details" hidden>
+                                <div class="tls-details-head"><span class="label">Certificate details</span><span class="chip-tag">Adv</span></div>
+                                <input type="hidden" id="tls-source-v" data-label="https.certificate" value="local CA">
+                                <div class="tls-line"><span class="small" style="font-weight:500;width:150px">Certificate</span>
+                                    <div class="seg sm" id="tls-source" role="group" aria-label="Certificate"><button type="button" data-v="local CA">Local CA (automatic)</button><button type="button" data-v="own files">My own files</button></div></div>
+                                <div id="tls-self">
+                                    <div class="field"><label for="tls-extra">Extra hostnames</label>
+                                        <div class="input mono"><input id="tls-extra" data-label="https.extra_hostnames" placeholder="10.0.0.5, nas.lan"></div>
+                                        <div class="hint">Names or IPs added to the certificate, comma-separated. Docker: the host's IP or name, which the container cannot see.</div></div>
+                                </div>
+                                <div id="tls-file" hidden>
+                                    <div class="grid2">
+                                        <div class="field"><label for="tls-cert">Certificate file</label><div class="input mono"><input id="tls-cert" data-label="https.cert_file" placeholder="/etc/letsencrypt/live/host/fullchain.pem"></div></div>
+                                        <div class="field"><label for="tls-key">Key file</label><div class="input mono"><input id="tls-key" data-label="https.key_file" placeholder="/etc/letsencrypt/live/host/privkey.pem"></div></div>
+                                    </div>
+                                    <div class="hint">Paths on the host. Renewed files are picked up within a minute, no restart. If they cannot be read, Tiramisu falls back to the local CA and logs [TLS] ERROR.</div>
+                                </div>
+                                <div class="warn-note" id="tls-apply-hint" hidden>Apply & restart in the bar at the bottom to use these settings, or Discard to go back.</div>
+                                <dl class="tls-kv" id="tls-kv"></dl>
+                            </div>
+                        </div>
+                    </div>
                     <div class="card" id="acc-off-card" hidden>
-                        <div class="card-head"><span class="num">07.4</span><span class="label ink">Turn off sign-in</span></div>
+                        <div class="card-head"><span class="num">07.5</span><span class="label ink">Turn off sign-in</span></div>
                         <div class="card-body">
                             <div class="acc-status">
                                 <div class="hint" style="flex:1">Removes the requirement for this port. The user and the tokens are kept, so turning it back on restores them. Asks for the password.</div>
-                                <button type="button" class="btn danger sm" onclick="accDisable()">Turn off</button>
+                                <button type="button" class="btn danger sm" onclick="accDisable()"><span class="ico">■</span>Turn off</button>
                             </div>
                         </div>
                     </div>
 
-                    <div class="acc-note"><span class="lamp off"></span><span class="small faint">Port :8090 (GoStorm API) answers on this machine only (127.0.0.1); gostorm_listen_ip in config.json opens it to the network.</span></div>
+                </section>
+
+                <section class="settings" id="sec-history" data-title="History">
+                    <div class="page-intro">
+                        <span class="label">Settings · 08</span>
+                        <div class="row">
+                            <h1 class="h1">History</h1><span class="spacer"></span>
+                            <span class="scope"><span class="lamp off"></span><span class="label">Restart</span></span>
+                        </div>
+                        <p>Every saved change to the configuration and to the Tentacle settings, newest first. Restore an older version: it goes through the bar below like any other change. The last 50 versions of each are kept.</p>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-head"><span class="num">08.1</span><span class="label ink">Versions</span><span class="spacer"></span>
+                            <div class="seg sm" role="group" aria-label="Filter versions" id="hist-filter">
+                                <button type="button" data-f="all" class="active" aria-pressed="true">All</button>
+                                <button type="button" data-f="restart" aria-pressed="false">Restart</button>
+                                <button type="button" data-f="secret" aria-pressed="false">Secrets</button>
+                                <button type="button" data-f="engine" aria-pressed="false">Tentacle</button>
+                            </div>
+                        </div>
+                        <div class="card-body flush">
+                            <div id="hist-list"><div class="hist-empty small faint">Loading…</div></div>
+                            <div class="hist-foot"><span class="lamp off"></span><span class="small faint">Keys and tokens are never shown, only that they changed. Export a copy with <code>tiramisu --export-config</code>.</span></div>
+                        </div>
+                    </div>
                 </section>
             </div>
 
@@ -929,7 +1046,7 @@
             <div class="changebar" id="changebar" aria-live="polite">
                 <span class="count" id="cb-count"><span class="lamp" id="cb-lamp"></span><span id="cb-title">Loading…</span></span>
                 <span class="list" id="cb-list"></span>
-                <span class="chip-tag accent" id="cb-restart" hidden></span>
+                <span class="chip-tag accent on-dark" id="cb-restart" hidden></span>
                 <span class="msg small" id="cb-msg"></span>
                 <button type="button" class="btn ghost sm" id="cb-discard" hidden onclick="discardChanges()">Discard</button>
                 <button type="button" class="btn primary sm" id="cb-apply" hidden onclick="applyChanges()">Apply</button>
@@ -941,27 +1058,15 @@
     <script>
         // --- Restart ---
         // confirmed: the caller already asked (Apply & restart asks before saving anything).
+        // Saved changes that wait for a restart, as the change bar listed them.
+        let savedForRestart = [];
         async function restartTiramisu(confirmed) {
-            const btn = document.getElementById('btn-restart');
-            if (confirmed !== true && !confirm('Restart tiramisu? The service will be unavailable for a few seconds.')) return;
-            btn.disabled = true;
-            btn.textContent = 'Restarting…';
-            try {
-                await fetch('/api/restart', { method: 'POST' });
-            } catch (_) { /* expected: connection drops on restart */ }
-            // Poll until back up
-            const poll = setInterval(async () => {
-                try {
-                    const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
-                    if (r.ok) {
-                        clearInterval(poll);
-                        btn.disabled = false;
-                        btn.innerHTML = '<span class="ico">↻</span><span class="hide-sm">Restart</span>';
-                        restartPending = false;
-                        renderChangeBar();
-                    }
-                } catch (_) { }
-            }, 1500);
+            if (confirmed !== true && !(await TiramisuRestart.confirm({ title: 'Restart Tiramisu?', changes: savedForRestart,
+                discarded: allChanges().map(c => c.text), ok: 'Restart' }))) return;
+            document.getElementById('btn-restart').disabled = true;
+            // HTTPS switched on or off: the page changes scheme once the new process answers.
+            const scheme = window.tlsSchemeAfterRestart ? window.tlsSchemeAfterRestart() : undefined;
+            await TiramisuRestart.run({ changes: savedForRestart.length, scheme });
         }
 
         // --- NAT-PMP state → Listen Port readonly ---
@@ -1131,16 +1236,16 @@
             else if (headroom < 16) warn = `headroom too low (${headroom} MB), risk of stalls`;
             else if (pct > 75) warn = 'Readahead % above recommended (75%)';
             else if (pct < 50) warn = 'Readahead % too low (min 50%)';
-            else if (cacheSize > budget) warn = 'Cache Size exceeds Budget, wasted GoStorm RAM';
+            else if (cacheSize > budget) warn = 'Cache Size exceeds Budget, wasted Tentacle RAM';
             else if (budget >= cacheSize * 4) warn = 'Budget too large for Cache Size, wasted RAM';
             metric.className = 'readahead-metric' + (warn ? ' warn' : '');
-            metric.textContent = warn ? `${base} ⚠ ${warn}` : `${base} ✓`;
+            metric.textContent = warn ? `${base} · ${warn}` : base;
         }
         ['read_ahead_budget_mb', 'cacheSize', 'readerReadAHead'].forEach(name => {
             const el = document.querySelector(`[name="${name}"]`);
             if (el) el.addEventListener('input', updateReadaheadCoupling);
         });
-        // Only run coupling after both Tiramisu and GoStorm have loaded real values
+        // Only run coupling after both Tiramisu and Tentacle have loaded real values
         let _couplingLoaded = 0;
         function markCouplingLoaded() { if (++_couplingLoaded >= 2) updateReadaheadCoupling(); }
 
@@ -1176,14 +1281,15 @@
         }
 
         function currentLangCodes(rowId) {
-            return [...document.getElementById(rowId).querySelectorAll('.chip')].map(c => c.dataset.code);
+            return [...document.getElementById(rowId).querySelectorAll('.lang-chip')].map(c => c.dataset.code);
         }
 
         function renderLangChip(rowId, code, name) {
             const row = document.getElementById(rowId);
             const anchor = row.querySelector('.picker-anchor');
             const chip = document.createElement('span');
-            chip.className = 'chip';
+            // The system chip: filled for preferred, outline for excluded.
+            chip.className = 'chip-tag lang-chip' + (rowId === 'excluded-flags-row' ? '' : ' fill');
             chip.dataset.code = code;
 
             const flagSpan = document.createElement('span');
@@ -1204,7 +1310,7 @@
 
         function setLangChips(rowId, codes) {
             const row = document.getElementById(rowId);
-            row.querySelectorAll('.chip').forEach(c => c.remove());
+            row.querySelectorAll('.lang-chip').forEach(c => c.remove());
             (codes || []).forEach(code => {
                 const entry = LANG_COUNTRIES.find(([c]) => c === code);
                 renderLangChip(rowId, code, entry ? entry[1] : code);
@@ -1795,7 +1901,7 @@
 
         async function loadCore() {
             try {
-                const res = await fetch('/api/gostorm/settings', {
+                const res = await fetch('/api/tentacle/settings', {
                     method: 'POST',
                     body: JSON.stringify({ action: 'get' }),
                     headers: { 'Content-Type': 'application/json' }
@@ -1846,13 +1952,13 @@
                 const isUIOn = formData.has(formKey);
                 sets[k] = NEGATIVE_KEYS.includes(k) ? !isUIOn : isUIOn;
             });
-            const res = await fetch('/api/gostorm/settings', {
+            const res = await fetch('/api/tentacle/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action: 'set', sets: sets })
             });
             if (res.ok) await loadCore();
-            return { ok: res.ok, message: res.ok ? '' : 'Engine: apply error' };
+            return { ok: res.ok, message: res.ok ? '' : 'Tentacle: apply error' };
         }
 
         // Enter in a field applies everything pending, like the old Save buttons did.
@@ -2035,7 +2141,7 @@
             const cfgRes = await fetch('/api/config');
             const data = await cfgRes.json();
 
-            // The card has no music row: keep its schedule, the backend rewrites the whole file.
+            // The card has no music row: keep its schedule, the backend rewrites the whole document.
             const musicSync = data.scheduler?.music_sync;
             data.scheduler = {
                 enabled: document.getElementById('sched-enabled').checked,
@@ -2090,10 +2196,14 @@
         const GROUPS = {
             tiramisu: { scope: 'restart', label: 'Tiramisu config' },
             release: { scope: 'restart', label: 'Release selection' },
-            core: { scope: 'live', label: 'Engine' },
+            core: { scope: 'live', label: 'Tentacle' },
             sched: { scope: 'restart', label: 'Scheduler' },
+            https: { scope: 'restart', label: 'HTTPS' },
+            restore: { scope: 'restart', label: 'Restore' },
         };
-        const SECTION_OF = { tiramisu: null, release: 'sec-release', core: 'sec-engine', sched: 'sec-scheduler' };
+        const HIST_OTHERS = 'Apply or discard the other changes before restoring a version';
+        const HIST_ALONE = 'Restore a version on its own: apply or discard the other changes first';
+        const SECTION_OF = { tiramisu: null, release: 'sec-release', core: 'sec-engine', sched: 'sec-scheduler', https: 'sec-access', restore: 'sec-history' };
         const snapshots = {};
         let restartPending = false;
         let applying = false;
@@ -2101,6 +2211,7 @@
         let savedAt = '';
 
         function groupControls(group) {
+            if (group === 'https') return ['tls-enabled', 'tls-source-v', 'tls-extra', 'tls-cert', 'tls-key'].map(id => document.getElementById(id));
             if (group === 'tiramisu') {
                 // The Tiramisu form, minus the release-selection controls that share it.
                 return [...document.getElementById('tiramisu-form').elements]
@@ -2153,6 +2264,7 @@
         }
 
         function changesOf(group) {
+            if (group === 'restore') return histRestoreChanges();
             const base = snapshots[group];
             if (!base) return [];
             const out = [];
@@ -2171,6 +2283,8 @@
 
         function refreshDirty() {
             const changes = allChanges();
+            // A restore refused because of other edits: once those are gone, so is the message.
+            if ((lastError === HIST_OTHERS || lastError === HIST_ALONE) && !changes.some(c => c.group !== 'restore')) lastError = '';
             // Rail dots: the section each pending change lives in.
             const secs = new Set();
             changes.forEach(c => {
@@ -2195,9 +2309,10 @@
                     : restartPending ? 'Saved — restart to apply' : 'All changes saved';
             const stamp = savedAt ? `Saved ${savedAt} · ` : '';
             const vis = typeof sections !== 'undefined' ? sections.find(s => !s.hidden) : null;
-            const effect = vis && vis.id === 'sec-engine' ? 'engine settings apply live' : 'takes effect after Restart';
+            const effect = { 'sec-engine': 'engine settings apply live', 'sec-access': 'applies live',
+                'sec-release': 'used by the next sync', 'sec-scheduler': 'picked up within 1 minute' }[vis && vis.id] || 'takes effect after Restart';
             document.getElementById('cb-list').textContent = n ? changes.map(c => c.text).join('  ·  ')
-                : restartPending ? stamp + 'takes effect after Restart. Engine changes are already live.'
+                : restartPending ? stamp + 'takes effect after Restart. Tentacle changes are already live.'
                     : stamp + effect;
             const rc = document.getElementById('cb-restart');
             rc.hidden = !restartN;
@@ -2218,8 +2333,16 @@
             const dirty = Object.keys(GROUPS).filter(isDirty);
             if (!dirty.length) return;
             const wantRestart = dirty.some(g => GROUPS[g].scope === 'restart');
+            // A restore replaces the whole configuration: saving other edits with it would undo it.
+            if (dirty.includes('restore') && dirty.length > 1) {
+                lastError = HIST_ALONE;
+                renderChangeBar();
+                return;
+            }
             // Ask before saving: "Cancel" must leave everything as it was, not save without restarting.
-            if (wantRestart && !confirm('Save and restart tiramisu? The service will be unavailable for a few seconds.')) return;
+            // Only what waits for the restart: engine settings apply live.
+            const pending = allChanges().filter(c => GROUPS[c.group].scope === 'restart').map(c => c.text);
+            if (wantRestart && !(await TiramisuRestart.confirm({ title: 'Apply and restart Tiramisu?', changes: pending, ok: 'Apply & restart', unsaved: true }))) return;
             applying = true;
             lastError = '';
             // Freeze the form while saving: an edit typed now would be snapshotted as saved.
@@ -2230,6 +2353,10 @@
             try {
                 // Order matters: the engine save writes the whole config, the schedule save
                 // re-reads it and writes it again, so the schedule goes last.
+                if (dirty.includes('restore')) {
+                    const r = await histApplyRestore();
+                    if (r.ok) { if (r.restart) restartPending = true; } else errors.push(r.message);
+                }
                 if (dirty.includes('core')) {
                     const r = await saveCore();
                     if (!r.ok) errors.push(r.message);
@@ -2241,6 +2368,11 @@
                         snapshot('tiramisu');
                         snapshot('release');
                     } else errors.push(r.message);
+                }
+                // After the engine save (which writes the whole config), before the schedule.
+                if (dirty.includes('https')) {
+                    const r = await window.tlsSaveSettings();
+                    if (r.ok) { restartPending = true; await window.tlsLoad(); } else errors.push(r.message);
                 }
                 if (dirty.includes('sched')) {
                     const r = await saveScheduler();
@@ -2255,7 +2387,9 @@
             lastError = errors.join(' · ');
             if (!errors.length) savedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
             refreshDirty();
-            if (!errors.length && wantRestart) restartTiramisu(true);
+            histLoad(); // every save is a new version
+            if (!errors.length && wantRestart) { savedForRestart = savedForRestart.concat(pending); restartTiramisu(true); }
+            else if (!errors.length && restartPending) savedForRestart = savedForRestart.concat(pending);
         }
 
         async function discardChanges() {
@@ -2265,13 +2399,272 @@
             if (dirty.includes('tiramisu') || dirty.includes('release')) await loadEngine();
             if (dirty.includes('core')) await loadCore();
             if (dirty.includes('sched')) { snapshots.sched = null; await loadScheduler(); }
+            if (dirty.includes('https')) await window.tlsLoad();
+            if (dirty.includes('restore')) histCancelRestore();
             refreshDirty();
         }
+
+        // =============================================================
+        // 08 History: configuration versions and restore
+        // =============================================================
+        const HIST_SOURCE = { ui: 'Control Panel', api: 'API token', internal: 'Tiramisu', import: 'Import', cli: 'Command line', rollback: 'Restore', default: 'Defaults' };
+        let histEntries = [];
+        let histOpen = null;      // version whose changes are shown
+        let histRestore = null;   // version waiting in the change bar
+        let histPreview = null;   // what restoring it changes, computed by the server
+        let histFocus = '';       // control to focus after a re-render
+        let histFilter = 'all';
+        let histEngineMissing = false; // the last Engine history fetch failed
+        // Configuration and Engine versions have their own ids: a row is known by kind and id.
+        const histKey = e => (e.kind || 'config') + ':' + e.id;
+        const histIsEngine = k => typeof k === 'string' && k.startsWith('engine:');
+        // Engine versions read E3, configuration versions #3: the two series number apart.
+        const histLabel = e => (e.kind === 'engine' ? 'E' : '#') + e.id;
+
+        function histFmt(v) {
+            if (v === undefined || v === '' || v === 'null' || v === '""' || v === '[]') return '∅';
+            try {
+                const x = JSON.parse(v);
+                if (x === true) return 'on';
+                if (x === false) return 'off';
+                if (Array.isArray(x)) return x.length ? x.map(e => typeof e === 'object' ? JSON.stringify(e) : String(e)).join(', ') : '∅';
+                if (typeof x === 'object' && x) return JSON.stringify(x);
+                return String(x);
+            } catch (_) { return v; }
+        }
+
+        function histWhen(ts) {
+            const d = new Date(ts * 1000), now = new Date();
+            const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const mins = Math.round((now - d) / 60000);
+            if (mins >= 0 && mins < 60) return mins < 1 ? 'just now' : `${mins} min ago`;
+            const day = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+            const days = Math.round((day(now) - day(d)) / 86400000);
+            if (days === 0) return 'today ' + hm;
+            if (days === 1) return 'yesterday ' + hm;
+            return d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + hm;
+        }
+
+        function histSummary(e) {
+            if (e.baseline) return 'Oldest version kept';
+            if (e.note === 'baseline') return 'Tentacle settings when the history started';
+            if (e.note === 'defaults') return 'Default Tentacle settings';
+            if (e.note) return e.note.replace(/^rollback to #/, 'Restored version ' + (e.kind === 'engine' ? 'E' : '#'));
+            if (e.source === 'import') return e.changes.length ? `Imported, ${e.changes.length} setting${e.changes.length > 1 ? 's' : ''} changed` : 'Imported, nothing changed';
+            if (!e.changes.length) return e.source === 'default' ? 'Default settings' : 'No changes';
+            return e.changes[0].key + (e.changes.length > 1 ? ` and ${e.changes.length - 1} more` : '');
+        }
+
+        function histRestoreChanges() {
+            if (!histRestore || !histPreview) return [];
+            const ch = histPreview.changes;
+            const fmt = v => { const t = histFmt(v); return t.length > 24 ? t.slice(0, 22) + '…' : t; };
+            const items = ch.map(c => ({ group: 'restore', el: null,
+                text: c.secret ? `${c.key} changed` : `${c.key} ${fmt(c.from)} → ${fmt(c.to)}` }));
+            // Restoring a version identical to the one in use still has to be applyable.
+            const id = (histIsEngine(histRestore) ? 'E' : '#') + histRestore.split(':')[1];
+            return items.length ? items : [{ group: 'restore', el: null, text: `Restore ${id} (same as the ${histIsEngine(histRestore) ? 'Engine settings in use' : 'saved configuration'})` }];
+        }
+
+        function histEl(tag, cls, text) {
+            const el = document.createElement(tag);
+            if (cls) el.className = cls;
+            if (text !== undefined) el.textContent = text;
+            return el;
+        }
+
+        function histChange(c) {
+            const r = histEl('div', 'hist-ch');
+            r.appendChild(histEl('span', 'k mono', c.key));
+            const v = histEl('span', 'v');
+            if (c.secret) {
+                v.appendChild(histEl('span', 'chip-tag soft', 'secret'));
+                v.appendChild(histEl('span', 'small faint', 'changed'));
+            } else {
+                v.appendChild(histEl('span', 'from mono', histFmt(c.from)));
+                v.appendChild(histEl('span', 'small faint', '→'));
+                v.appendChild(histEl('span', 'to mono', histFmt(c.to)));
+            }
+            r.appendChild(v);
+            return r;
+        }
+
+        function histRender() {
+            const list = document.getElementById('hist-list');
+            list.replaceChildren();
+            const shown = histEntries.filter(e => histFilter === 'all'
+                || (histFilter === 'restart' && e.restart)
+                || (histFilter === 'secret' && e.changes.some(c => c.secret))
+                || (histFilter === 'engine' && e.kind === 'engine'));
+            if (!shown.length) {
+                list.appendChild(histEl('div', 'hist-empty small faint', histEntries.length ? 'No version matches this filter.' : 'No saved versions yet.'));
+                return;
+            }
+            shown.forEach(e => {
+                const key = histKey(e), engine = e.kind === 'engine';
+                const restoring = histRestore === key, open = histOpen === key && !restoring;
+                const row = histEl('div', 'hist-row' + (open ? ' open' : '') + (restoring ? ' restoring' : ''));
+                const head = histEl('div', 'hist-head');
+                head.appendChild(histEl('span', 'id mono', histLabel(e)));
+                head.appendChild(histEl('span', 'when small', histWhen(e.created_at)));
+                const who = histEl('span', 'who');
+                who.appendChild(histEl('b', '', HIST_SOURCE[e.source] || e.source));
+                if (e.actor) who.appendChild(histEl('span', 'small', '· ' + e.actor));
+                if (engine) who.appendChild(histEl('span', 'chip-tag soft', 'tentacle'));
+                head.appendChild(who);
+                head.appendChild(histEl('span', 'sum small', histSummary(e)));
+                if (e.current && engine) head.appendChild(histEl('span', 'chip-tag sig-green', 'in use'));
+                else if (e.current) head.appendChild(restartPending ? histEl('span', 'chip-tag soft', 'saved, restart pending') : histEl('span', 'chip-tag sig-green', 'in use'));
+                else if (restoring) head.appendChild(histEl('span', 'chip-tag accent', 'will be restored'));
+                else if (e.restart && e.changes.length) head.appendChild(histEl('span', 'chip-tag soft', 'restart'));
+                if (!e.current && !restoring) {
+                    const b = histEl('button', 'btn ghost sm', open ? 'Hide' : 'Show changes');
+                    b.type = 'button';
+                    b.setAttribute('aria-expanded', open);
+                    b.dataset.hf = key + ':toggle';
+                    b.onclick = () => { histOpen = open ? null : key; histFocus = key + ':toggle'; histRender(); };
+                    head.appendChild(b);
+                }
+                row.appendChild(head);
+                if (restoring) {
+                    const d = histEl('div', 'hist-detail');
+                    d.appendChild(histEl('span', 'label', `Restoring ${histLabel(e)} brings back`));
+                    const ch = histPreview ? histPreview.changes : [];
+                    if (ch.length) ch.forEach(c => d.appendChild(histChange(c)));
+                    else d.appendChild(histEl('span', 'small faint', 'The same settings as the version in use.'));
+                    if (ch.some(c => c.secret)) d.appendChild(histEl('div', 'warn-note', 'This brings back the keys and tokens this version had. If one was replaced because it leaked or was revoked, set it again after the restore.'));
+                    const a = histEl('div', 'hist-actions');
+                    const b = histEl('button', 'btn sm', 'Cancel restore');
+                    b.type = 'button';
+                    b.dataset.hf = key + ':cancel';
+                    b.onclick = () => { histCancelRestore(); histFocus = key + ':toggle'; histRender(); refreshDirty(); };
+                    a.appendChild(b);
+                    const newer = histEntries.filter(x => (x.kind || 'config') === (e.kind || 'config') && x.id > e.id).map(histLabel);
+                    if (engine) d.appendChild(histEl('div', 'warn-note', 'Applying may reconnect the BitTorrent client: timeout, retrackers, read-ahead, Responsive and Shield apply live; disk warmup and the save path wait for a restart. A reconnect stops playback in progress.'));
+                    const keep = !newer.length ? '' : ` ${newer.length > 3 ? 'The newer versions' : newer.length > 1 ? newer.slice(0, -1).join(', ') + ' and ' + newer.at(-1) : newer[0]} stay${newer.length === 1 ? 's' : ''} in the list.`;
+                    a.appendChild(histEl('span', 'small faint', `${engine ? 'Apply' : 'Apply & restart'} in the bar below to restore.${keep}`));
+                    d.appendChild(a);
+                    row.appendChild(d);
+                } else if (open) {
+                    const d = histEl('div', 'hist-detail');
+                    d.appendChild(histEl('span', 'label', `What ${histLabel(e)} changed`));
+                    if (e.changes.length) e.changes.forEach(c => d.appendChild(histChange(c)));
+                    else d.appendChild(histEl('span', 'small faint', e.baseline ? 'The versions before it are no longer kept, so what it changed is not known.' : 'Nothing changed against the version before.'));
+                    const a = histEl('div', 'hist-actions');
+                    const b = histEl('button', 'btn sm', 'Restore this version');
+                    b.type = 'button';
+                    b.dataset.hf = key + ':restore';
+                    b.onclick = () => histStartRestore(key);
+                    a.appendChild(b);
+                    a.appendChild(histEl('span', 'small faint', `Brings back the ${engine ? 'Tentacle ' : ''}settings as they were right after ${histLabel(e)}; newer versions stay in the list.`));
+                    d.appendChild(a);
+                    row.appendChild(d);
+                }
+                list.appendChild(row);
+            });
+            if (histFocus) {
+                const el = list.querySelector(`[data-hf="${histFocus}"]`);
+                histFocus = '';
+                if (el) el.focus();
+            }
+        }
+
+        async function histStartRestore(key) {
+            const id = key.split(':')[1], base = histIsEngine(key) ? '/api/tentacle/history' : '/api/config/history';
+            const others = Object.keys(GROUPS).filter(g => g !== 'restore' && isDirty(g));
+            if (others.length) {
+                lastError = HIST_OTHERS;
+                renderChangeBar();
+                return;
+            }
+            lastError = '';
+            await histLoad(); // the preview is computed against what is saved now
+            let p;
+            try {
+                const r = await fetch(`${base}/${id}/restore`, { cache: 'no-store' });
+                if (!r.ok) throw new Error((await r.text()).trim() || r.status);
+                p = await r.json();
+            } catch (err) {
+                lastError = 'Restore: ' + err.message;
+                renderChangeBar();
+                return;
+            }
+            histRestore = key;
+            histPreview = p;
+            GROUPS.restore.scope = p.restart ? 'restart' : 'live';
+            histOpen = null;
+            histFocus = key + ':cancel';
+            histRender();
+            refreshDirty();
+        }
+
+        function histCancelRestore() {
+            if (histRestore) histOpen = histRestore;
+            histRestore = null;
+            histPreview = null;
+            histRender();
+        }
+
+        async function histApplyRestore() {
+            const engine = histIsEngine(histRestore), id = Number(histRestore.split(':')[1]);
+            let r;
+            try {
+                r = await fetch(engine ? '/api/tentacle/rollback' : '/api/config/rollback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+            } catch (_) { return { ok: false, message: 'Restore: connection error' }; }
+            if (!r.ok) {
+                const msg = 'Restore: ' + ((await r.text()).trim() || r.status);
+                await histLoad(); // a version pruned meanwhile leaves the bar
+                return { ok: false, message: msg };
+            }
+            const res = await r.json().catch(() => ({}));
+            histRestore = null;
+            histPreview = null;
+            if (engine) { await loadCore(); await histLoad(); return { ok: true, restart: !!res.restart }; }
+            // The engine already uses the restored configuration: show it, so the next save builds on it
+            // and the restart knows whether the scheme changes.
+            await loadEngine();
+            snapshots.sched = null;
+            await loadScheduler();
+            if (window.tlsLoad) await window.tlsLoad();
+            await histLoad();
+            return { ok: true, restart: !!(res.changed && res.restart) };
+        }
+
+        async function histLoad() {
+            try {
+                const r = await fetch('/api/config/history?limit=50', { cache: 'no-store' });
+                if (!r.ok) throw new Error(r.status);
+                const cfg = await r.json();
+                // The Engine history is optional: an older engine without it still shows the configuration.
+                const eng = await fetch('/api/tentacle/history?limit=50', { cache: 'no-store' })
+                    .then(x => x.ok ? x.json() : null).catch(() => null);
+                histEngineMissing = eng === null;
+                histEntries = cfg.concat(eng || []).sort((a, b) => b.created_at - a.created_at || b.id - a.id);
+            } catch (_) {
+                histEntries = [];
+                document.getElementById('hist-list').replaceChildren(histEl('div', 'hist-empty small faint', 'The history could not be loaded.'));
+                return;
+            }
+            // A failed Engine fetch says nothing about a pending Engine restore: keep it.
+            if (histRestore && !(histEngineMissing && histIsEngine(histRestore)) && !histEntries.some(e => histKey(e) === histRestore)) { histRestore = null; histPreview = null; }
+            histRender();
+            refreshDirty();
+        }
+
+        document.querySelectorAll('#hist-filter button').forEach(b => b.addEventListener('click', () => {
+            histFilter = b.dataset.f;
+            document.querySelectorAll('#hist-filter button').forEach(x => {
+                x.classList.toggle('active', x === b);
+                x.setAttribute('aria-pressed', x === b);
+            });
+            histRender();
+        }));
+        histLoad();
 
         document.addEventListener('input', () => refreshDirty());
         document.addEventListener('change', () => refreshDirty());
         window.addEventListener('beforeunload', e => {
-            if (allChanges().length) { e.preventDefault(); e.returnValue = ''; }
+            if (allChanges().length && !TiramisuRestart.leaving) { e.preventDefault(); e.returnValue = ''; }
         });
 
         // Build pickers then load data
@@ -2308,8 +2701,8 @@
                     box.appendChild(row);
                 });
                 const lamp = document.getElementById('rail-lamp');
-                lamp.className = 'lamp ' + (h.gostorm && h.gostorm.ok ? 'run' : 'err');
-                document.getElementById('rail-state').textContent = h.gostorm && h.gostorm.ok ? 'Engine online' : 'Engine unreachable';
+                lamp.className = 'lamp ' + (h.tentacle && h.tentacle.ok ? 'run' : 'err');
+                document.getElementById('rail-state').textContent = h.tentacle && h.tentacle.ok ? 'Tentacle online' : 'Tentacle unreachable';
             } catch (_) { }
         }
         loadLive();
@@ -2695,10 +3088,220 @@
             }
             window.accLogoutOthers = async function () { await api('POST', 'logout-others').catch(() => { }); loadSessions(); };
 
+            // ---------- HTTPS (/api/auth/tls) ----------
+            // The settings go through the changebar (group "https", restart); the card only
+            // tells what to do next. Steps 2-3 cannot be seen from the server: what this
+            // browser did is remembered locally, per CA fingerprint.
+            let tls = null, tlsCfg = {};
+            const caKey = k => 'tiramisu.https.' + k + '.' + ((tls && tls.certificate && tls.certificate.fingerprint_sha256) || '');
+            const remember = (k, v) => { try { v ? localStorage.setItem(caKey(k), '1') : localStorage.removeItem(caKey(k)); } catch (_) { } };
+            const remembered = k => { try { return localStorage.getItem(caKey(k)) === '1'; } catch (_) { return false; } };
+            function tlsError(msg) { const e = $('tls-err'); e.hidden = !msg; e.lastElementChild.textContent = msg || ''; }
+            const TRUST = {
+                macOS: '# Open tiramisu-ca.crt → Keychain Access → double-click it\n# → Trust → When using this certificate: Always Trust. Or:\nsudo security add-trusted-cert -d -r trustRoot \\\n  -k /Library/Keychains/System.keychain ~/Downloads/tiramisu-ca.crt',
+                iOS: 'Send tiramisu-ca.crt to the device (AirDrop or Files) and open it\n→ Settings › Profile Downloaded → Install\n→ Settings › General › About › Certificate Trust Settings → enable "Tiramisu local CA"',
+                'Claude Code': 'export NODE_EXTRA_CA_CERTS=~/tiramisu-ca.crt\n# MCP: https://' + location.hostname + ':' + (location.port || '9080') + '/mcp',
+                Python: 'export REQUESTS_CA_BUNDLE=~/tiramisu-ca.crt\n# or: requests.get(url, verify="/path/to/tiramisu-ca.crt")',
+                curl: 'curl --cacert ~/tiramisu-ca.crt https://' + location.hostname + ':' + (location.port || '9080') + '/metrics',
+            };
+            function stepNode(n, state, title, hint) {
+                const r = el('div', 'tls-step ' + state);
+                r.appendChild(el('span', 'tls-num ' + state, state === 'done' ? '✓' : String(n)));
+                const b = el('div', 'b');
+                b.appendChild(el('div', 't', title));
+                if (hint) b.appendChild(el('div', 'hint', hint));
+                r.appendChild(b);
+                $('tls-steps').appendChild(r);
+                return b;
+            }
+            function addrRow(b) {
+                const url = 'https://' + location.host;
+                const r = el('div', 'tls-addr');
+                r.appendChild(el('code', null, url));
+                const c = el('button', 'btn ghost sm', 'Copy'); c.type = 'button';
+                c.onclick = () => accCopy(url, c);
+                r.appendChild(c);
+                b.appendChild(r);
+            }
+            // The source selector lives in Advanced: the way back must not depend on it.
+            function localCAButton(b) {
+                const back = el('button', 'btn sm', 'Use the local CA instead'); back.type = 'button';
+                back.onclick = () => { setSource('local CA'); refreshDirty(); renderSteps(); };
+                b.appendChild(el('div', 'tls-line')); b.lastChild.appendChild(back);
+            }
+            function renderSteps() {
+                const box = $('tls-steps');
+                box.replaceChildren();
+                const on = $('tls-enabled').checked;
+                box.hidden = !on && !(tls && tls.running);
+                if (!tls) return;
+                const unsaved = typeof isDirty === 'function' && isDirty('https');
+                // Saved but not in use yet: the running server still has the settings it started with.
+                const pending = !unsaved && tls.restart_reason === 'the https settings changed';
+                if (!on) {
+                    if (tls.running) box.appendChild(el('div', 'warn-note', unsaved
+                        ? 'HTTPS turns off after Apply & restart in the bar below; Discard keeps it on. Clients set to https:// will have to go back to http://.'
+                        : 'Saved: HTTPS turns off when Tiramisu restarts (Restart in the top bar). To keep it, turn the switch back on and apply.'));
+                    return;
+                }
+                // The steps follow the settings in the card, not the certificate the server happens to run.
+                const running = tls.running && !pending, c = tls.certificate, own = $('tls-source-v').value === 'own files';
+                $('tls-apply-hint').hidden = !unsaved;
+                // Unsaved HTTPS settings: nothing below applies until they do.
+                if (unsaved) {
+                    stepNode(1, 'now', 'Turn on HTTPS', running
+                        ? 'You changed the HTTPS settings: Apply & restart in the bar below to use them.'
+                        : 'Apply & restart in the bar below.');
+                    ['Download the CA certificate', 'Trust it on each device', 'Switch your clients to https://']
+                        .slice(own ? 2 : 0).forEach((t, i) => stepNode(own ? 2 : i + 2, 'later', t));
+                    if (own) localCAButton($('tls-steps').lastChild.querySelector('.b'));
+                    return;
+                }
+                stepNode(1, running ? 'done' : 'now', 'Turn on HTTPS',
+                    running ? 'HTTPS runs on this port. To turn it off, use the switch above.'
+                        : tls.start_error ? 'HTTPS could not start: see the error above.'
+                            : 'Saved, not in use yet: Restart in the top bar to apply. To undo, change the settings back and apply.');
+                if (own && running && c && c.source === 'self-signed') {
+                    // The files did not load and the server fell back to the local CA.
+                    $('tls-steps').replaceChildren();
+                    stepNode(1, 'now', 'Turn on HTTPS', 'Your certificate files could not be read ([TLS] ERROR in the log): the local CA is in use. Fix the paths in Advanced, or use the local CA.');
+                    localCAButton($('tls-steps').lastChild.querySelector('.b'));
+                    return;
+                }
+                if (own) {
+                    const b = stepNode(2, running ? 'now' : 'later', 'Switch your clients to https://',
+                        'Your certificate is issued by a public CA: devices trust it already.');
+                    if (running) addrRow(b);
+                    localCAButton(b);
+                    return;
+                }
+                const got = running && remembered('downloaded'), trusted = got && remembered('trusted');
+                const b2 = stepNode(2, !running ? 'later' : got ? 'done' : 'now', 'Download the CA certificate',
+                    running ? 'One certificate for all your devices, valid until ' + day(Date.parse(c.ca_not_after) / 1000) + '.' : 'After the restart.');
+                if (running) {
+                    const r = el('div', 'tls-line');
+                    const a = el('a', 'btn sm ' + (got ? '' : 'primary'), '↓ Download tiramisu-ca.crt');
+                    a.href = '/api/auth/tls/cert'; a.download = 'tiramisu-ca.crt';
+                    a.onclick = () => { remember('downloaded', true); setTimeout(renderSteps, 0); };
+                    r.append(a, el('span', 'mono small tls-fp', 'SHA-256  ' + c.fingerprint_sha256));
+                    if (got) {
+                        const undo = el('button', 'btn sm', 'Not downloaded yet'); undo.type = 'button';
+                        undo.onclick = () => { remember('downloaded', false); remember('trusted', false); renderSteps(); };
+                        r.appendChild(undo);
+                    }
+                    b2.appendChild(r);
+                }
+                const b3 = stepNode(3, !got ? 'later' : trusted ? 'done' : 'now', 'Trust it on each device',
+                    got ? 'Once per device: the server certificate it signs renews on its own. Check that the SHA-256 ends in ' + c.fingerprint_sha256.slice(-8) + '.' : null);
+                if (got && !trusted) {
+                    const seg = el('div', 'seg sm'); seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', 'Client');
+                    const pre = el('pre', 'acc-snippet', TRUST.macOS);
+                    Object.keys(TRUST).forEach((k, i) => {
+                        const bt = el('button', i === 0 ? 'active' : '', k); bt.type = 'button'; bt.setAttribute('aria-pressed', String(i === 0));
+                        bt.onclick = () => { seg.querySelectorAll('button').forEach(x => { x.classList.toggle('active', x === bt); x.setAttribute('aria-pressed', String(x === bt)); }); pre.textContent = TRUST[k]; };
+                        seg.appendChild(bt);
+                    });
+                    const done = el('button', 'btn sm', 'Done, my devices trust it'); done.type = 'button';
+                    done.onclick = () => { remember('trusted', true); renderSteps(); };
+                    b3.append(seg, pre, el('div', 'tls-line'));
+                    b3.lastChild.appendChild(done);
+                } else if (trusted) {
+                    const again = el('button', 'btn sm', 'Not yet: show the instructions'); again.type = 'button';
+                    again.onclick = () => { remember('trusted', false); renderSteps(); };
+                    b3.appendChild(el('div', 'tls-line')); b3.lastChild.appendChild(again);
+                }
+                const b4 = stepNode(4, trusted ? 'now' : 'later', 'Switch your clients to https://',
+                    trusted ? 'Menu bar app, Hermes, Claude Code and scripts: change http:// to https://.' : null);
+                if (trusted) addrRow(b4);
+                const uses = (running && tls.cleartext_uses) || [];
+                for (const u of uses) {
+                    const r = el('div', 'tls-use');
+                    r.append(lamp('err'), el('span', 'title', u.name), el('span', 'mono', u.prefix + '…'),
+                        el('span', 'small', 'still on http:// · from ' + u.ip + ' · ' + ago(u.last) + ' · ' + u.count + '×'),
+                        el('span', 'chip-tag', tls.access_on_at_start ? 'refused · 403' : 'served'));
+                    b4.appendChild(r);
+                }
+                if (uses.length) b4.appendChild(el('div', 'small faint', 'The token already travelled in clear: switch the client and consider revoking it.'));
+            }
+            function setSource(v) {
+                $('tls-source-v').value = v;
+                for (const b of $('tls-source').children) { b.classList.toggle('active', b.dataset.v === v); b.setAttribute('aria-pressed', String(b.dataset.v === v)); }
+                $('tls-self').hidden = v !== 'local CA';
+                $('tls-file').hidden = v !== 'own files';
+            }
+            $('tls-source').addEventListener('click', e => {
+                const v = e.target.dataset && e.target.dataset.v;
+                if (!v) return;
+                setSource(v);
+                refreshDirty();
+                renderSteps();
+            });
+            $('tls-enabled').addEventListener('change', () => { $('tls-details').hidden = !$('tls-enabled').checked; renderSteps(); });
+            ['tls-extra', 'tls-cert', 'tls-key'].forEach(id => $(id).addEventListener('input', () => renderSteps()));
+            // "a,b" and "a, b" are the same list: normalise so the changebar only sees real changes.
+            $('tls-extra').addEventListener('change', () => {
+                $('tls-extra').value = $('tls-extra').value.split(',').map(x => x.trim()).filter(Boolean).join(', ');
+                refreshDirty(); renderSteps();
+            });
+            async function loadTLS() {
+                try {
+                    tls = await api('GET', 'tls');
+                    // Read here: originalEngine may still be loading.
+                    const r = await fetch('/api/config', { cache: 'no-store' });
+                    tlsCfg = r.ok ? ((await r.json()).https || {}) : {};
+                } catch (e) { tlsError('HTTPS settings unavailable: ' + e.message); return; }
+                $('tls-enabled').disabled = false;
+                $('tls-enabled').checked = !!tlsCfg.enabled;
+                $('tls-details').hidden = !tlsCfg.enabled;
+                setSource(tlsCfg.cert_file || tlsCfg.key_file ? 'own files' : 'local CA');
+                $('tls-extra').value = (tlsCfg.extra_hostnames || []).join(', ');
+                $('tls-cert').value = tlsCfg.cert_file || '';
+                $('tls-key').value = tlsCfg.key_file || '';
+                const w = $('tls-warn');
+                w.hidden = !(tls.restart_reason || '').startsWith('sign-in');
+                w.textContent = st && st.enabled
+                    ? 'Sign-in is on, but until Tiramisu restarts passwords and tokens can still travel over plain HTTP from the LAN. Restart from the top bar.'
+                    : 'Sign-in is off: after a restart the API answers plain HTTP from the LAN again. Restart from the top bar.';
+                tlsError(tls.start_error ? 'HTTPS could not start: ' + tls.start_error : '');
+                const c = tls.certificate, kv = $('tls-kv');
+                kv.replaceChildren();
+                if (c) {
+                    const rows = c.source === 'self-signed'
+                        ? [['Server certificate', 'until ' + day(Date.parse(c.not_after) / 1000) + ' · renewed on its own'], ['Names', (c.san || []).join(' · ')], ['Folder', c.path.replace(/[^/]*$/, '')]]
+                        : [['In use now', (c.san || []).join(' · ') + ' · until ' + day(Date.parse(c.not_after) / 1000)], ['SHA-256', c.fingerprint_sha256]];
+                    for (const [k, v] of rows) kv.append(el('dt', null, k), el('dd', null, v));
+                }
+                snapshot('https');
+                renderSteps();
+            }
+            // Called by applyChanges: posts only the https block (POST /api/config merges).
+            window.tlsSaveSettings = async function () {
+                const own = $('tls-source-v').value === 'own files';
+                const https = { enabled: $('tls-enabled').checked,
+                    cert_file: own ? $('tls-cert').value.trim() : '', key_file: own ? $('tls-key').value.trim() : '',
+                    extra_hostnames: $('tls-extra').value.split(',').map(x => x.trim()).filter(Boolean) };
+                if (own && (!https.cert_file || !https.key_file)) return { ok: false, message: 'HTTPS: set both the certificate and the key file' };
+                const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ https }) });
+                if (!r.ok) return { ok: false, message: 'HTTPS: ' + ((await r.text()).trim() || 'HTTP ' + r.status) };
+                // saveEngine posts originalEngine whole: keep it current.
+                if (typeof originalEngine === 'object' && originalEngine) originalEngine.https = https;
+                tlsCfg = https;
+                return { ok: true };
+            };
+            window.tlsLoad = loadTLS;
+            // 'https:' / 'http:' when a restart switches this port's scheme, '' otherwise. Only when
+            // Tiramisu itself serves TLS: behind an HTTPS proxy the page is https:// either way.
+            window.tlsSchemeAfterRestart = () => {
+                const runs = !!(tls && tls.running);
+                if (tlsCfg.enabled && !runs && location.protocol === 'http:') return 'https:';
+                if (!tlsCfg.enabled && runs && location.protocol === 'https:') return 'http:';
+                return '';
+            };
+
             // ---------- state ----------
             async function load() {
                 try { st = await TiramisuAuth.status(); } catch (_) { st = null; }
-                if (!st) { $('acc-title').textContent = 'Unavailable'; return; }
+                if (!st) { $('acc-title').textContent = 'Unavailable'; loadTLS(); return; }
                 const on = st.enabled, btn = $('acc-main-btn');
                 $('acc-mcp-url').textContent = accMcpURL();
                 $('acc-lamp').className = 'lamp ' + (on ? '' : 'off');
@@ -2714,7 +3317,7 @@
                 btn.disabled = !st.available || st.reset_pending;
                 if (!st.available) {
                     $('acc-title').textContent = 'Sign-in unavailable';
-                    $('acc-hint').textContent = 'Sign-in needs the state database (enable_state_db in config.json), which is off or could not be opened.';
+                    $('acc-hint').textContent = 'Sign-in needs the state database (STATE/tiramisu.db), which could not be opened: see the log.';
                     btn.hidden = true;
                 } else if (on) {
                     $('acc-title').textContent = 'Sign-in required';
@@ -2727,6 +3330,7 @@
                 }
                 if (st.available) loadTokens();
                 if (on) loadSessions();
+                loadTLS();
             }
             load();
         })();

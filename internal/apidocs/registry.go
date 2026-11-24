@@ -47,7 +47,7 @@ var Common = []Status{
 var MCPTools = []string{
 	"resolve_title", "search_releases", "get_job", "cancel_job", "add_release",
 	"resolve_album", "search_album", "add_album", "inspect_torrent", "add_audio",
-	"list_library", "list_gaps", "remove_entries",
+	"list_library", "list_gaps", "remove_entries", "check_consistency",
 }
 
 // Groups is the stable public API. UI-only routes stay out on purpose.
@@ -117,10 +117,55 @@ var Groups = []Group{
 			Errors:   []Status{{405, "not GET"}, {500, "a media directory or the gaps could not be read"}, {503, "audio registry unavailable"}},
 		},
 		{
+			Method: "GET", Path: "/api/library/diagnostics", Summary: "Read-only consistency check of the library against the engine",
+			Desc: "Compares the torrents Tentacle holds with what the library references (stubs under movies/ and tv/, tv_episodes, audio " +
+				"projections) and with the inode map. Each check has a count and up to 20 samples: orphan_torrents (with " +
+				"older_than_30_days), missing_torrents, stubs_without_hash, tv_stubs_unregistered, tv_registry_without_stub, " +
+				"inode_ghosts, stale_metadata_failures, stuck_audio. It changes nothing; one run at a time. Torrents added in " +
+				"the last 10 minutes are not counted as orphans; while a sync runs the counts can be off by what it is changing. " +
+				"With cached=1 it returns the last result since startup (null before the first) without walking anything.",
+			Params:   []Param{{"cached", "1", false, "Return the last result instead of running the check"}},
+			ParamsIn: "query",
+			Example:  "curl -H 'Authorization: Bearer tmr_…' {{ORIGIN}}/api/library/diagnostics",
+			Response: "{\n  \"at\": 1795600000,\n  \"duration_ms\": 900,\n  \"checks\": [\n    {\"id\": \"orphan_torrents\", \"description\": \"…\", \"count\": 598, \"older_than_30_days\": 594, \"samples\": [\"0a1b… Some.Release (2026-09-23)\"]}\n  ]\n}",
+			OK:       200,
+			Errors:   []Status{{405, "not GET"}, {409, "a check is already running"}, {500, "the state DB or a media directory could not be read"}},
+		},
+		{
+			Method: "POST", Path: "/api/library/orphans", Summary: "List or remove the torrents nothing references",
+			Desc: "The orphan torrents of the consistency check, older than min_age_days, oldest first. dry_run defaults to " +
+				"true and only lists them; with dry_run false each one is removed from the engine after a last check that no " +
+				"stub, tv_episodes row, audio projection or add in flight cites it (kept otherwise). At most max per call. " +
+				"Refused while a stub cannot be read, since its torrent cannot be told. One run at a time, shared with the check.",
+			Params: []Param{
+				{"dry_run", "bool", false, "true (default) lists only"},
+				{"max", "int", false, "Torrents per call, default 50, at most 1000"},
+				{"min_age_days", "int", false, "Only torrents added before this many days ago, default 7"},
+				{"counters_only", "bool", false, "With dry_run false: clear the stale failure counters, remove no torrent"},
+			},
+			ParamsIn: "body",
+			Example:  "curl -X POST -H 'Authorization: Bearer tmr_…' -d '{\"dry_run\":true}' {{ORIGIN}}/api/library/orphans",
+			Response: "{\n  \"dry_run\": true,\n  \"candidates\": 598,\n  \"selected\": [{\"hash\": \"0a1b…\", \"title\": \"Some.Release\", \"added\": \"2026-04-04\"}],\n  \"released\": [], \"kept\": [], \"failed\": [],\n  \"duration_ms\": 1100\n}",
+			OK:       200,
+			Errors:   []Status{{400, "malformed body"}, {405, "not POST"}, {409, "a check or collection is running, or a stub cannot be read"}, {500, "the state DB or a media directory could not be read"}},
+		},
+		{
+			Method: "POST", Path: "/api/library/release", Summary: "Remove a torrent from the engine if nothing references it",
+			Desc: "For a client that hydrated a torrent (inspect) and filed nothing from it. The torrent goes only if no stub, " +
+				"tv_episodes row, audio projection or add in flight cites it; released says whether it went.",
+			Params:   []Param{{"hash", "string", true, "40-character info hash"}},
+			ParamsIn: "body",
+			Example:  "curl -X POST -H 'Authorization: Bearer tmr_…' -d '{\"hash\":\"0a1b…\"}' {{ORIGIN}}/api/library/release",
+			Response: "{\"released\": true}",
+			OK:       200,
+			Errors:   []Status{{400, "malformed body or hash"}, {404, "the engine does not hold this torrent"}, {405, "not POST"}, {502, "the engine or a reference check failed"}},
+		},
+		{
 			Method: "POST", Path: "/api/library/remove", Summary: "Remove a stub, optionally blacklisting the release",
 			Desc: "The torrent goes only when no other stub points at it: a season pack is one torrent behind many episodes. " +
 				"Without blacklist the sync may add the title back, which is what you want when replacing a release. " +
-				"warnings appears only when something went half-way, e.g. the stub went but the blacklist was not written. " +
+				"warnings appears only when something went half-way, e.g. the stub went but the blacklist was not written; " +
+				"torrent_errors when the stub went but the engine kept the torrent (the orphan collection takes it later). " +
 				"Audio is idempotent and answers other objects: by path {type, path, removed (bool), state \"absent\" when " +
 				"nothing was there, torrent_referenced, torrent_dropped}; by prefix {type, prefix, removed (count), " +
 				"torrent_referenced, torrent_dropped}.",
@@ -195,22 +240,22 @@ var Groups = []Group{
 	}},
 	{ID: "status", Name: "Status & metrics", Desc: "Read-only: what the engine is doing.", Endpoints: []Endpoint{
 		{
-			Method: "GET", Path: "/api/health", Summary: "Engine, FUSE, VPN, media servers and system load",
-			Desc: "A snapshot refreshed every 5 s, always 200: a down service shows ok false. Right after start every field is " +
+			Method: "GET", Path: "/api/health", Summary: "Tentacle, FUSE, VPN, media servers and system load",
+			Desc: "A snapshot refreshed every 2.5 s, always 200: a down service shows ok false. Right after start every field is " +
 				"empty until the first refresh. media_servers is null when none is configured; cache_hit_rate_pct is null " +
 				"unless something is streaming. download_mbps and upload_mbps are megabits per second.",
 			Example: "curl -H 'Authorization: Bearer tmr_…' {{ORIGIN}}/api/health",
 			Response: "{\n  \"timestamp\": \"2026-11-17T20:01:05.12+01:00\",\n  \"uptime\": \"3h12m5s\",\n  \"cpu_pct\": 14.2,\n  \"ram_pct\": 48.1,\n" +
-				"  \"gostorm\": {\"ok\": true, \"latency_ms\": 2},\n  \"fuse\": {\"ok\": true, \"latency_ms\": 0},\n  \"vpn\": {\"ok\": true, \"latency_ms\": 0},\n" +
+				"  \"tentacle\": {\"ok\": true, \"latency_ms\": 2},\n  \"fuse\": {\"ok\": true, \"latency_ms\": 0},\n  \"vpn\": {\"ok\": true, \"latency_ms\": 0},\n" +
 				"  \"natpmp\": {\"ok\": true, \"latency_ms\": 0},\n  \"media_servers\": [{\"product\": \"Plex\", \"ok\": true, \"latency_ms\": 12}],\n" +
 				"  \"total_torrents\": 3,\n  \"active_count\": 1,\n  \"download_mbps\": 38.4,\n  \"upload_mbps\": 1.2,\n  \"cache_hit_rate_pct\": null,\n  …\n}",
 			OK: 200,
 		},
 		{
 			Method: "GET", Path: "/api/torrents", Summary: "Torrents in memory with speed and peers",
-			Desc: "Refreshed every 5 s. status is idle, downloading (above 0.01 MiB/s) or streaming (active but not " +
+			Desc: "Refreshed every 2.5 s. status is idle, downloading (above 0.01 MiB/s) or streaming (active but not " +
 				"downloading); speed_mbs and up_mbs are MiB/s; each entry of peer_rates carries kbps (download) and up_kbps (upload) in KiB/s. title is the engine's name; clean_title is filled only while a media " +
-				"server plays it. An unreachable engine answers [].",
+				"server plays it. cache_filled and cache_capacity are the bytes the piece cache in RAM holds for the torrent and its size. An unreachable engine answers [].",
 			Example: "curl -H 'Authorization: Bearer tmr_…' {{ORIGIN}}/api/torrents",
 			Response: "[\n  {\n    \"hash\": \"e7f8…\",\n    \"title\": \"Dummy.Bunny.2024.2160p.DV.mkv\",\n    \"clean_title\": \"\",\n    \"speed_mbs\": 4.8,\n    \"up_mbs\": 0.15,\n    \"peers\": 31,\n    \"seeders\": 22,\n" +
 				"    \"size\": 61203886080,\n    \"bytes_read\": 1073741824,\n    \"is_priority\": true,\n    \"status\": \"downloading\",\n    \"is_4k\": true,\n    \"is_dv\": true\n  }\n]",
@@ -222,7 +267,7 @@ var Groups = []Group{
 				"first update check), update_available, config_source, read_ahead_*, shield_active, github_stars. The " +
 				"other fields are diagnostic and may change between releases.",
 			Example: "curl -H 'Authorization: Bearer tmr_…' {{ORIGIN}}/metrics | jq '{version, uptime, update_available}'",
-			Response: "{\n  \"version\": \"v1.11.15\",\n  \"config_source\": \"/home/pi/Tiramisu/config.json\",\n  \"uptime\": \"3h12m5.183746291s\",\n" +
+			Response: "{\n  \"version\": \"v1.11.15\",\n  \"config_source\": \"/home/pi/Tiramisu/STATE/tiramisu.db#42\",\n  \"uptime\": \"3h12m5.183746291s\",\n" +
 				"  \"latest_version\": \"v1.11.15\",\n  \"update_available\": false,\n  \"read_ahead_budget\": 268435456,\n  \"shield_active\": false,\n  \"github_stars\": 159,\n  …\n}",
 			OK: 200,
 		},
@@ -239,7 +284,7 @@ var Groups = []Group{
 			OK: 200,
 		},
 	}},
-	{ID: "config", Name: "Configuration", Desc: "config.json over HTTP. Secrets are write-only. Error bodies are plain text.", Endpoints: []Endpoint{
+	{ID: "config", Name: "Configuration", Desc: "The configuration and the Tentacle settings, stored in tiramisu.db as versions. Secrets are write-only. Error bodies are plain text.", Endpoints: []Endpoint{
 		{
 			Method: "GET", Path: "/api/config", Summary: "Current configuration, secrets left empty",
 			Desc: "The values in effect, environment overrides included. The secrets (Plex token, TMDB and Prowlarr keys) come " +
@@ -251,18 +296,123 @@ var Groups = []Group{
 			Method: "POST", Path: "/api/config", Summary: "Change settings",
 			Desc: "Send only the keys to change: the rest keeps its value, nested objects merge key by key, arrays are " +
 				"replaced whole; null resets only arrays and optional objects. A scoring profile never saved starts from the " +
-				"defaults. The whole object GET returns works too. An empty secret keeps the stored one. Values set by " +
-				"environment variables are written to the file as well, and comments in config.json are dropped. Most " +
-				"settings apply at once; ports, FUSE, the scheduler switch and auth_trusted_proxies need POST /api/restart.",
+				"defaults. The whole object GET returns works too. An empty secret keeps the stored one. Each change is saved " +
+				"as a new version; values set by environment variables are never saved, a key sent back with the env's value " +
+				"keeps the saved one. A request that changes nothing adds no version. The blocklist, log_level and telemetry " +
+				"apply at once; everything else is read at start-up (mount, syncers, clients) and needs POST /api/restart.",
 			ParamsIn: "body",
 			Example: "curl -X POST -H 'Authorization: Bearer tmr_…' \\\n" +
 				"  -H 'Content-Type: application/json' \\\n  -d '{\"log_level\":\"DEBUG\"}' {{ORIGIN}}/api/config",
 			Response: "(empty body)",
 			OK:       200,
-			Errors:   []Status{{400, "not a JSON object, a field of the wrong type, or over 1 MiB"}, {405, "not GET or POST"}, {500, "config.json could not be written"}},
+			Errors:   []Status{{400, "not a JSON object, a field of the wrong type, or over 1 MiB"}, {405, "not GET or POST"}, {403, "with sign-in on, an API token changed a key that only a signed-in session may change"}, {500, "the configuration could not be saved"}},
 		},
 		{
-			Method: "POST", Path: "/api/restart", Summary: "Restart the engine",
+			Method: "GET", Path: "/api/config/history", Summary: "Configuration versions, newest first",
+			Desc: "The last 50 saved versions, each with who saved it (source ui, api, internal, import, cli, rollback, " +
+				"default; actor the user or the token name) and the keys it changed against the version before. The very first " +
+				"version is compared to the defaults; once older versions are pruned the oldest kept one is a baseline " +
+				"(baseline true, no changes). Secrets show as changed, never their values. restart says the version's changes " +
+				"need POST /api/restart; it is not a restart pending. With sign-in on, only a signed-in Control Panel session: " +
+				"tokens get 403.",
+			ParamsIn: "query",
+			Params:   []Param{{Name: "limit", Type: "int", Desc: "how many versions, 1-50 (default 50)"}},
+			Example:  "curl {{ORIGIN}}/api/config/history?limit=5",
+			Errors:   []Status{{403, "sign-in on and no Control Panel session"}},
+			Response: "[\n  {\"id\": 42, \"created_at\": 1795530000, \"source\": \"ui\", \"actor\": \"admin\", \"note\": \"\",\n" +
+				"   \"changes\": [{\"key\": \"log_level\", \"from\": \"\\\"INFO\\\"\", \"to\": \"\\\"DEBUG\\\"\"}],\n" +
+				"   \"restart\": false, \"current\": true}\n]",
+			OK: 200,
+		},
+		{
+			Method: "GET", Path: "/api/config/history/{id}", Summary: "One saved version",
+			Desc:    "The configuration as version id saved it, secrets left empty as in GET /api/config. Same access rule as the history.",
+			Example: "curl {{ORIGIN}}/api/config/history/41",
+			OK:      200,
+			Errors:  []Status{{400, "id is not a number"}, {403, "sign-in on and no Control Panel session"}, {404, "no such version: the history keeps the last 50"}},
+		},
+		{
+			Method: "GET", Path: "/api/config/history/{id}/restore", Summary: "What restoring a version would change",
+			Desc: "The changes POST /api/config/rollback would make for id, without saving anything: the same answer, computed " +
+				"against the configuration saved now. A key or token changed and later set back is no change. Same access rule as the history.",
+			Example:  "curl {{ORIGIN}}/api/config/history/41/restore",
+			Response: "{\"id\": 41, \"changed\": true, \"changes\": [{\"key\": \"metrics_port\", \"from\": \"9191\", \"to\": \"9080\"}], \"restart\": true}",
+			OK:       200,
+			Errors:   []Status{{400, "id is not a number"}, {403, "sign-in on and no Control Panel session"}, {404, "no such version"}},
+		},
+		{
+			Method: "POST", Path: "/api/config/rollback", Summary: "Restore a saved version",
+			Desc: "Saves version id again as the newest one (source rollback, note \"rollback to #id\"): nothing is deleted, so a " +
+				"rollback can be rolled back. It keeps the install's telemetry id, and brings back the keys and tokens that version " +
+				"had. It applies like POST /api/config; restart says whether POST /api/restart is needed. Unlike POST /api/config " +
+				"it answers with the new version and what changed; changed is false when the version equals the one in use " +
+				"(nothing is saved). Same access rule as the history.",
+			ParamsIn: "body",
+			Params:   []Param{{Name: "id", Type: "int", Required: true, Desc: "the version to restore"}},
+			Example:  "curl -X POST -H 'Content-Type: application/json' -d '{\"id\":41}' {{ORIGIN}}/api/config/rollback",
+			Response: "{\"id\": 43, \"changed\": true, \"changes\": [{\"key\": \"metrics_port\", \"from\": \"9191\", \"to\": \"9080\"}], \"restart\": true}",
+			OK:       200,
+			Errors:   []Status{{400, "the body is not {\"id\": N}"}, {403, "sign-in on and no Control Panel session"}, {404, "no such version"}, {500, "the configuration could not be saved"}},
+		},
+		{
+			Method: "POST", Path: "/api/tentacle/settings", Summary: "Read, change or reset the Tentacle settings",
+			Desc: "action get answers with the settings document in use (field names as keys, keys Tentacle does not interpret " +
+				"included). action set saves sets: only the keys it names change, the others keep their values; unknown keys " +
+				"are ignored and values out of range are clamped (ReaderReadAHead 5-100; ConnectionsLimit, CacheSize and " +
+				"TorrentDisconnectTimeout at 0 or below take 25, 128 MiB and 30). action def puts the defaults back. set and def " +
+				"answer 200 with an empty body and are recorded in the history unless nothing changed. TorrentDisconnectTimeout, " +
+				"RetrackersMode, ResponsiveMode, AdaptiveShield and ReaderReadAHead apply live; any other change reconnects the " +
+				"BitTorrent client, so playback in progress stops. UseDisk and TorrentsSavePath take effect at the next start. " +
+				"While NAT-PMP is on it owns PeersListenPort: set and def keep the forwarded port. Open to API tokens.",
+			ParamsIn: "body",
+			Params: []Param{{Name: "action", Type: "string", Required: true, Desc: "get, set or def"},
+				{Name: "sets", Type: "object", Desc: "set only: the keys to change, e.g. {\"ConnectionsLimit\": 30}"}},
+			Example: "curl -X POST -H 'Authorization: Bearer tmr_…' \\\n" +
+				"  -H 'Content-Type: application/json' \\\n  -d '{\"action\":\"set\",\"sets\":{\"ConnectionsLimit\":30}}' {{ORIGIN}}/api/tentacle/settings",
+			Response: "(get) {\"CacheSize\": 134217728, \"ReaderReadAHead\": 75, \"ConnectionsLimit\": 25, \"ResponsiveMode\": true, …}\n(set, def) empty body",
+			OK:       200,
+			Errors: []Status{{400, "bad JSON, sets missing or not an object, or an unknown action"}, {405, "not POST"},
+				{500, "a value of the wrong type, or the settings could not be stored or applied (a failed apply stays saved and the next save retries it)"}},
+		},
+		{
+			Method: "GET", Path: "/api/tentacle/history", Summary: "Tentacle settings versions, newest first",
+			Desc: "The last 50 manual saves of the Tentacle settings (Control Panel, POST /api/tentacle/settings set or def, " +
+				"a restore), each with source and actor and the keys it changed against the version before; kind is \"engine\". " +
+				"Automatic changes are not versions: the NAT-PMP peer port, defaults written at start-up. StoreSettingsInJson, and " +
+				"PeersListenPort while NAT-PMP is on, are never compared. The first entry is the settings when the history started " +
+				"(note \"baseline\"). current says the settings in use match the newest version. Same access rule as the configuration history.",
+			ParamsIn: "query",
+			Params:   []Param{{Name: "limit", Type: "int", Desc: "how many versions, 1-50 (default 50)"}},
+			Example:  "curl {{ORIGIN}}/api/tentacle/history?limit=5",
+			Response: "[\n  {\"id\": 3, \"created_at\": 1795560000, \"source\": \"ui\", \"actor\": \"admin\", \"note\": \"\",\n" +
+				"   \"changes\": [{\"key\": \"ConnectionsLimit\", \"from\": \"26\", \"to\": \"25\"}],\n" +
+				"   \"restart\": false, \"current\": true, \"kind\": \"engine\"}\n]",
+			OK:     200,
+			Errors: []Status{{403, "sign-in on and no Control Panel session"}},
+		},
+		{
+			Method: "GET", Path: "/api/tentacle/history/{id}/restore", Summary: "What restoring Tentacle settings would change",
+			Desc:     "The changes POST /api/tentacle/rollback would make for id, against the settings in use, without applying anything.",
+			Example:  "curl {{ORIGIN}}/api/tentacle/history/2/restore",
+			Response: "{\"id\": 2, \"changed\": true, \"changes\": [{\"key\": \"ConnectionsLimit\", \"from\": \"25\", \"to\": \"26\"}], \"restart\": false}",
+			OK:       200,
+			Errors:   []Status{{400, "id is not a number"}, {403, "sign-in on and no Control Panel session"}, {404, "no such version"}},
+		},
+		{
+			Method: "POST", Path: "/api/tentacle/rollback", Summary: "Restore saved Tentacle settings",
+			Desc: "Puts version id in use like a Tentacle save: keys read on use (timeout, retrackers, responsive mode, shield, " +
+				"read-ahead) apply live; any other change reconnects the BitTorrent client, so playback in progress stops. It is " +
+				"recorded as a new version (source rollback, note \"rollback to #id\") unless it equals the settings in use. " +
+				"changed is true only when a key the engine interprets changed. The peer port while NAT-PMP is on keeps its current value. restart is true when UseDisk or TorrentsSavePath changed: they take effect at the next start.",
+			ParamsIn: "body",
+			Params:   []Param{{Name: "id", Type: "int", Required: true, Desc: "the version to restore"}},
+			Example:  "curl -X POST -H 'Content-Type: application/json' -d '{\"id\":2}' {{ORIGIN}}/api/tentacle/rollback",
+			Response: "{\"changed\": true, \"changes\": [{\"key\": \"ConnectionsLimit\", \"from\": \"25\", \"to\": \"26\"}], \"restart\": false}",
+			OK:       200,
+			Errors:   []Status{{400, "the body is not {\"id\": N}"}, {403, "sign-in on and no Control Panel session"}, {404, "no such version"}, {500, "the settings could not be applied or recorded"}},
+		},
+		{
+			Method: "POST", Path: "/api/restart", Summary: "Restart Tiramisu",
 			Desc: "Answers, then shuts down gracefully and exits with code 75: systemd restarts it on any exit, the Docker " +
 				"image on this code. Started by hand, it just exits.",
 			Example:  "curl -X POST -H 'Authorization: Bearer tmr_…' {{ORIGIN}}/api/restart",

@@ -6,6 +6,12 @@
 (function () {
   const NS = 'http://www.w3.org/2000/svg';
   const DEFAULT_CLEAN_S = 30;     // engine minimum; the strict log line states the real one
+  const STATION_R = 18, GAUGE_R = 9; // pipe stations (Tentacle, FUSE) and their inner gauge
+  // Clockwise arc from 12 o'clock covering frac of the circle.
+  const arcD = (c, r, frac) => {
+    const f = Math.min(0.999, frac), a = -Math.PI / 2 + 2 * Math.PI * f;
+    return `M${c[0]} ${c[1] - r} A${r} ${r} 0 ${f > 0.5 ? 1 : 0} 1 ${c[0] + r * Math.cos(a)} ${c[1] + r * Math.sin(a)}`;
+  };
   const WAVE_MS = 12000;          // how long a corruption wave stays on screen
   const DRAIN_MS = 10000;         // how long the tint takes to leave after a restore
   const MAX_PEERS = 48, MAX_PENDING = 8;
@@ -160,14 +166,21 @@
   const reducedMotion = () => motionQuery.matches;
   motionQuery.addEventListener('change', () => { if (host) draw(true); });
 
-  function signature() {
-    const t = (data.torrents || []).filter(x => x.status !== 'idle')
-      .map(x => [x.hash.slice(0, 8), x.speed_mbs.toFixed(1), (x.up_mbs || 0).toFixed(2), x.peers, x.seeders, x.half_open, x.is_priority,
-        (x.peer_rates || []).map(p => p.id + Math.round(Math.log2(1 + p.kbps)) + '/' + Math.round(Math.log2(1 + (p.up_kbps || 0)))).sort().join(',')].join(':')).join('|');
-    const sh = shieldState(data.shield, Date.now());
-    return [host.clientWidth, host.clientWidth < 560 ? document.documentElement.clientHeight : 0, document.documentElement.dataset.theme, t, sh.mode, sh.cleanS, sh.wave, (data.health || {}).v304_banned_peers,
-      (data.health || {}).cache_hit_rate_pct, Math.round((data.health || {}).fuse_active_pct || 0),
-      Math.round((data.health || {}).fuse_stale_pct || 0), transport && transport.utp, clients && JSON.stringify([...clients].map(([k, c]) => [k, c.label, c.state, c.state === 'paused' ? c.pos : 0])), reducedMotion(),
+  // speeds=false keeps only what changes the drawing's shape (which elements exist, in which
+  // order): two polls that differ in speeds alone can be eased into each other.
+  function signature(d = data, speeds = true) {
+    const act = (d.torrents || []).filter(x => x.status !== 'idle');
+    const order = speeds ? '' : act.slice().sort((a, b) => b.speed_mbs - a.speed_mbs).slice(0, 4).map(x => x.hash.slice(0, 8)).join(',');
+    const t = act
+      .map(x => [x.hash.slice(0, 8), speeds ? x.speed_mbs.toFixed(1) : x.speed_mbs > 0.01, speeds ? (x.up_mbs || 0).toFixed(2) : (x.up_mbs || 0) * 8 >= 0.05,
+        x.peers, x.seeders, x.half_open, x.is_priority,
+        (speeds ? (x.peer_rates || []) : (x.peer_rates || []).slice(0, MAX_PEERS)).map(p => p.id + (speeds ? Math.round(Math.log2(1 + p.kbps)) + '/' + Math.round(Math.log2(1 + (p.up_kbps || 0)))
+          : (p.kbps >= 0.5 ? '+' : '-') + ((p.up_kbps || 0) >= 0.5 ? '+' : '-'))).sort().join(',')].join(':')).join('|') + '>' + order;
+    const sh = shieldState(d.shield, Date.now());
+    return [host.clientWidth, host.clientWidth < 560 ? document.documentElement.clientHeight : 0, document.documentElement.dataset.theme, t, sh.mode, sh.cleanS, sh.wave, (d.health || {}).v304_banned_peers,
+      // Readings that move on every poll: a change shows in the next frame, it is not a change of shape.
+      speeds ? (d.health || {}).cache_hit_rate_pct : '', speeds ? act.map(x => x.cache_capacity ? Math.round(100 * x.cache_filled / x.cache_capacity) : '').join(',') : '', speeds ? Math.round((d.health || {}).fuse_active_pct || 0) : '',
+      speeds ? Math.round((d.health || {}).fuse_stale_pct || 0) : '', transport && transport.utp, clients && JSON.stringify([...clients].map(([k, c]) => [k, c.label, c.state, c.state === 'paused' ? c.pos : 0])), reducedMotion(),
       focusKey, recent.length && recent[0].started_at,
       scan && scan.active ? [scan.label, scan.files_per_min, scan.files_read,
         Object.entries(scan.torrents || {}).map(([h, a]) => h.slice(0, 8) + Math.floor(a / 10)).sort().join(',')].join(':') : ''].join('#');
@@ -184,7 +197,23 @@
     return Math.round(Math.max(400, Math.min(620, avail)));
   }
 
-  function draw(force) {
+  // Dash phase per flow, carried across rebuilds: a new speed continues the motion from where it
+  // is, where the clock's phase for the new duration would jump.
+  const phases = new Map();
+  function flowDelay(key, dur, now, seed) {
+    const prev = phases.get(key);
+    const pos = prev && now - prev.at < 60000 ? (prev.pos + (now - prev.at) / (prev.dur * 1000)) % 1
+      : ((now / 1000 + seed * dur) % dur) / dur;
+    phases.set(key, { pos, at: now, dur });
+    return `${-(pos * dur).toFixed(3)}s`;
+  }
+  function prunePhases(now) { phases.forEach((v, k) => { if (now - v.at > 60000) phases.delete(k); }); }
+
+  // What the labels say: the engine's numbers, also while a tween eases the drawing.
+  const realS = t => t.real ? t.real.s : t.speed_mbs, realU = t => t.real ? t.real.u : (t.up_mbs || 0);
+
+  function draw(force, tween) {
+    if (host && host.hidden) orbit.wasHidden = true;   // what changed meanwhile is old news: no flight
     if (!host || host.hidden || !data) return;
     curKey = null;
     setTimeout(closeOrphan, 0);
@@ -196,8 +225,8 @@
     const H = vertical ? fitHeight() : 470;
     // Cross-fade: the previous drawing fades out on top while the new one fades in, instead of a cut.
     // Only data updates fade; forced redraws (resize, theme, motion setting) and height changes cut.
-    const prevSvg = [...host.children].find(n => !n.classList.contains('sw-old'));
-    const fade = !force && !reducedMotion() && prevSvg && prevSvg.getAttribute('height') == H;
+    const prevSvg = [...host.children].find(n => n.tagName.toLowerCase() === 'svg' && !n.classList.contains('sw-old'));
+    const fade = !force && !tween && !reducedMotion() && prevSvg && prevSvg.getAttribute('height') == H;
     [...host.children].filter(n => n.tagName.toLowerCase() === 'svg').forEach(n => {
       if (!fade || n.classList.contains('sw-old')) { n.remove(); return; }
       n.classList.remove('sw-new');
@@ -211,11 +240,11 @@
     if (!ui) { ui = document.createElement('div'); host.appendChild(ui); }
     ui.className = vertical ? 'sw-ui v' : 'sw-ui';
     ui.innerHTML = '';
-    if (!torrents.length && vertical) { drawIdlePhone(); return; }
     const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, width: '100%', height: H, class: fade ? 'swarm sw-new' : 'swarm', role: 'img', 'aria-label': 'Swarm network' }, host);
     host.insertBefore(svg, ui);
     if (focusKey && !torrents.some(t => t.hash === focusKey) && !String(focusKey).startsWith('dev:')) focusKey = null;
     const now = Date.now();
+    prunePhases(now);
     const sh = shieldState(data.shield, now);
     const h = data.health || {};
 
@@ -257,6 +286,7 @@
     const maxSpeed = Math.max(1, ...torrents.map(t => t.speed_mbs));
     const width = s => s > 0.01 ? Math.max(1.5, s / maxSpeed * 9) : 1;
     const pipes = [];
+    const spots = [];   // where the peers are drawn: the orbit flies to them, and back from them
 
     torrents.forEach((t, i) => {
       curKey = t.hash;
@@ -275,7 +305,8 @@
       // Peers. With per-peer rates from the engine each node is a real peer (stable id, real
       // seeder flag, its own rate); without them (older engine) nodes are numbered slots.
       const rates = Array.isArray(t.peer_rates) ? t.peer_rates.slice(0, MAX_PEERS) : null;
-      const list = rates ? rates.map(p => ({ key: p.id, seed: p.seed, kbps: p.kbps, utp: !!p.utp, up: p.up_kbps || 0, cc: p.cc || '', asn: p.asn || 0, org: p.org || '' }))
+      const list = rates ? rates.map(p => ({ key: p.id, seed: p.seed, kbps: p.kbps, utp: !!p.utp, up: p.up_kbps || 0, cc: p.cc || '', asn: p.asn || 0, org: p.org || '',
+        lk: p.real_kbps ?? p.kbps, lu: p.real_up ?? (p.up_kbps || 0) }))
         : Array.from({ length: n }, (_, k) => ({ key: String(k), seed: k < seeds, kbps: null, utp: null }));
       // Track arrivals and departures between polls, by key.
       let L = life.get(t.hash);
@@ -296,6 +327,7 @@
       const flowDur = kbps => Math.max(0.5, Math.min(6, 30 / Math.sqrt(kbps)));
       list.forEach(p => {
         const pp = spot(p.key, ':');
+        if (spots.length < ORBIT_MAX) spots.push(pp);
         const edge = el('path', { d: curve(pp, tp), class: 'sw-edge' }, edgeLayer);
         // uTP vs TCP is known only in aggregate: the share is applied per peer, by its key.
         const node = isUtp(p.key, p.utp) ? el('rect', { x: pp[0] - 3, y: pp[1] - 3, width: 6, height: 6, class: p.seed ? 'sw-peer seed' : 'sw-peer' }, peerLayer)
@@ -307,14 +339,14 @@
           const dur = p.kbps == null ? 2.6 : flowDur(p.kbps);
           // Two animations may run on a newborn flow (dash + fade-in): keep the fade-in at 0.9 s.
           fl.style.animationDuration = `${dur.toFixed(2)}s, ${BORN_MS / 1000}s`;
-          fl.style.animationDelay = `${-((now / 1000 + rng(t.hash + ':f' + p.key)() * dur) % dur).toFixed(2)}s`;
+          fl.style.animationDelay = flowDelay(t.hash + ':f' + p.key, dur, now, rng(t.hash + ':f' + p.key)());
         }
         // Upload: blue segments running back along the same line, from the torrent to the peer.
         if (p.up >= 0.5) {
           const ue = el('path', { d: curve(pp, tp), class: 'sw-up-edge' }, edgeLayer);
           const uf = el('path', { d: curve(pp, tp), class: 'sw-up-flow', pathLength: 100 }, edgeLayer);
           const ud = flowDur(p.up);
-          const run = `${-((now / 1000 + rng(t.hash + ':up' + p.key)() * ud) % ud).toFixed(2)}s`;
+          const run = flowDelay(t.hash + ':up' + p.key, ud, now, rng(t.hash + ':up' + p.key)());
           uf.style.animationDuration = `${ud.toFixed(2)}s`;
           uf.style.animationDelay = run;
           // A newborn peer's upload fades in with it, like its download line.
@@ -334,8 +366,8 @@
             title: countryName(p.cc) || 'Peer',
             sub: p.org ? p.org + (p.asn ? ` · AS${p.asn}` : '') : '',
           }, [
-            ['Download', mbps(p.kbps / 1024)],
-            ['Upload', p.up > 0 ? mbps(p.up / 1024) : '—'],
+            ['Download', mbps(p.lk / 1024)],
+            ['Upload', p.lu > 0 ? mbps(p.lu / 1024) : '—'],
             ['Role', p.seed ? 'seeder' : 'leecher'],
             ['Transport', p.utp ? 'uTP' : 'TCP'],
           ], { rect: hit.getBoundingClientRect(), node: hit }));
@@ -411,8 +443,8 @@
     const dx = fuseP[0] - cacheP[0], dy = fuseP[1] - cacheP[1];
     const len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len, nx = -uy, ny = ux;
     // The tube is one piece of pipe from node to node, like every other pipe: its ends run under
-    // the boxes. The dots stay clear of the boxes (and of GoStorm's ring in STRICT).
-    const inA = sh.mode === 'strict' ? 25 : 18, inB = 18;
+    // the stations. The dots stay clear of the stations (and of Tentacle's ring in STRICT).
+    const inA = sh.mode === 'strict' ? STATION_R + 13 : STATION_R + 7, inB = STATION_R + 7;
     const t0 = [cacheP[0] + ux * inA, cacheP[1] + uy * inA];
     el('path', { d: `M${cacheP[0]} ${cacheP[1]} L${fuseP[0]} ${fuseP[1]}`, class: 'sw-gauge-rim', 'stroke-width': tubeW + 2 }, gauge);
     el('path', { d: `M${cacheP[0]} ${cacheP[1]} L${fuseP[0]} ${fuseP[1]}`, class: 'sw-gauge-free', 'stroke-width': tubeW }, gauge);
@@ -439,7 +471,7 @@
       const steady = c + 0.5 <= level - 1;
       const near = !steady && c + 0.5 <= level + 1;
       rows.forEach(r => {
-        const along = c * step + step / 2;
+        const along = (inner - cols * step) / 2 + c * step + step / 2; // the leftover split at both ends
         const pos = { cx: t0[0] + ux * along + nx * r, cy: t0[1] + uy * along + ny * r, r: 1.6 };
         if (steady) { el('circle', { ...pos, class: cls }, gauge); return; }
         if (!near || fill < 0.01) { el('circle', { ...pos, class: 'sw-dot off' }, gauge); return; }
@@ -527,8 +559,8 @@
       const p = el('path', { d, class: cls, 'stroke-width': w, pathLength: 100 }, flowLayer);
       if (dur) {
         p.style.animationDuration = dur + 's';
-        // Phase from the clock, so a rebuild continues the motion instead of restarting it.
-        p.style.animationDelay = `${-((now / 1000) % dur).toFixed(2)}s`;
+        // Phase carried across rebuilds, so the motion continues instead of restarting.
+        p.style.animationDelay = flowDelay(cls + ':' + curKey, dur, now, 0);
       }
       return p;
     };
@@ -568,7 +600,7 @@
       const g = moreG = el('g', { class: 'sw-more' }, nodeLayer);
       const label = `+${hidden.length} more${vertical ? '' : ' torrent' + (hidden.length > 1 ? 's' : '')}`;
       if (vertical) {
-        // A pill in the free space left of GoStorm, clear of the torrent labels.
+        // A pill in the free space left of Tentacle, clear of the torrent labels.
         const p = P(F.cache, 0.14), w = 64;
         el('rect', { x: p[0] - w / 2, y: p[1] - 10, width: w, height: 20, rx: 10, class: 'sw-more-ring' }, g);
         txt(g, p[0], p[1] + 4, label, 'sw-sub', 'middle');
@@ -583,7 +615,7 @@
         const r = g.querySelector('circle, rect').getBoundingClientRect();
         details(`${hidden.length} more active torrent${hidden.length > 1 ? 's' : ''}`,
           hidden.map(t => [short(t.clean_title || t.title || t.hash.slice(0, 8), 30),
-            t.speed_mbs > 0.01 ? `${mbps(t.speed_mbs)} · ${t.peers} peer${t.peers === 1 ? '' : 's'}` : 'warming up']),
+            t.speed_mbs > 0.01 ? `${mbps(realS(t))} · ${t.peers} peer${t.peers === 1 ? '' : 's'}` : 'warming up']),
           { rect: r, node: g });
       });
     }
@@ -609,10 +641,10 @@
       el('circle', { cx: p.tp[0], cy: p.tp[1], r: rad, class: p.live ? 'sw-torrent' : 'sw-torrent idle' }, nodeLayer).style.pointerEvents = 'none';
       const name = short(t.clean_title || t.title || t.hash.slice(0, 8), vertical ? (torrents.length > 3 ? 9 : 12) : 24);
       const hiddenPeers = Math.max(0, (t.peers || 0) - p.shown), hiddenPend = Math.max(0, (t.half_open || 0) - p.pendShown);
-      const sub = (p.live ? `↓ ${mbps(t.speed_mbs)} · ${t.peers} peers` : `idle · ${t.peers} peers`);
+      const sub = (p.live ? `↓ ${mbps(realS(t))} · ${t.peers} peers` : `idle · ${t.peers} peers`);
       // Upload line, only while this torrent sends: rate and how many peers receive it.
       const upPeers = (t.peer_rates || []).filter(x => (x.up_kbps || 0) >= 0.5).length;
-      const upLine = (t.up_mbs || 0) * 8 >= 0.05 ? `↑ ${mbps(t.up_mbs)} · ${upPeers} peer${upPeers === 1 ? '' : 's'}` : '';
+      const upLine = (t.up_mbs || 0) * 8 >= 0.05 ? `↑ ${mbps(realU(t))} · ${upPeers} peer${upPeers === 1 ? '' : 's'}` : '';
       // Third line, only when something is left out: the graph never passes a sample for the whole.
       // Woken by a library scan, not by a player: a dashed ring and a "scan" note.
       const scanAgo = scan && scan.active && !(clients && clients.get(t.hash)) && scan.torrents ? scan.torrents[t.hash] : undefined;
@@ -622,8 +654,8 @@
         .filter(Boolean).join(' · ');
       if (vertical) {
         txt(nodeLayer, p.tp[0], p.tp[1] + rad + 14, name, 'sw-name', 'middle');
-        txt(nodeLayer, p.tp[0], p.tp[1] + rad + 26, (p.live ? '↓ ' + mbps(t.speed_mbs) : 'idle') + (hiddenPeers ? ` · ${p.shown}/${t.peers}` : ''), 'sw-sub', 'middle');
-        if (upLine) txt(nodeLayer, p.tp[0], p.tp[1] + rad + 38, '↑ ' + mbps(t.up_mbs), 'sw-sub up', 'middle');
+        txt(nodeLayer, p.tp[0], p.tp[1] + rad + 26, (p.live ? '↓ ' + mbps(realS(t)) : 'idle') + (hiddenPeers ? ` · ${p.shown}/${t.peers}` : ''), 'sw-sub', 'middle');
+        if (upLine) txt(nodeLayer, p.tp[0], p.tp[1] + rad + 38, '↑ ' + mbps(realU(t)), 'sw-sub up', 'middle');
         else if (scanAgo !== undefined) txt(nodeLayer, p.tp[0], p.tp[1] + rad + 38, 'scan', 'sw-sub dim', 'middle');
       } else {
         const below = i > 0 && i === pipes.length - 1;
@@ -644,22 +676,34 @@
 
     // Cache and FUSE nodes.
     const strict = sh.mode === 'strict';
-    [[cacheP, 'GoStorm', strict ? `STRICT · ${vertical ? "" : "clean "}${sh.cleanS}/${sh.need} s` : sh.mode === 'recover' ? 'FAST · restored'
-      : sh.wave !== undefined ? 'FAST kept' : 'FAST · piece cache'],
-    [fuseP, 'raCache', `${Math.round(h.fuse_budget_mb || 0)} MB · hit ${h.cache_hit_rate_pct == null ? '—' : Math.round(h.cache_hit_rate_pct) + '%'}`]]
+    const lead = torrents.find(t => t.is_priority) || torrents[0];
+    const cacheFill = lead && lead.cache_capacity > 0 ? Math.min(1, lead.cache_filled / lead.cache_capacity) : null;
+    const hitRate = h.cache_hit_rate_pct == null ? null : Math.min(1, h.cache_hit_rate_pct / 100);
+    [[cacheP, 'Tentacle', strict ? `STRICT · ${vertical ? "" : "clean "}${sh.cleanS}/${sh.need} s` : sh.mode === 'recover' ? 'FAST · restored'
+      : sh.wave !== undefined ? 'FAST kept' : cacheFill == null ? 'FAST · piece cache' : `FAST · piece cache ${Math.round(cacheFill * 100)}%`],
+    [fuseP, 'FUSE', `${Math.round(h.fuse_budget_mb || 0)} MB · hit ${h.cache_hit_rate_pct == null ? '—' : Math.round(h.cache_hit_rate_pct) + '%'}`]]
       .forEach(([p, name, sub], i) => {
+        // A station on the pipe: a ring the flow runs through, with a gauge of its own reading
+        // (Tentacle: the playing torrent's piece cache fill; FUSE: the read-ahead hit rate).
+        const red = i === 0 && strict ? ' strict' : '';
         if (i === 0 && (strict || sh.mode === 'recover')) {
-          el('circle', { cx: p[0], cy: p[1], r: 19, class: 'sw-ring' }, nodeLayer);
-          const frac = strict ? sh.clean : 1, a = -Math.PI / 2 + 2 * Math.PI * Math.min(0.999, frac);
-          if (frac > 0) el('path', { d: `M${p[0]} ${p[1] - 19} A19 19 0 ${frac > 0.5 ? 1 : 0} 1 ${p[0] + 19 * Math.cos(a)} ${p[1] + 19 * Math.sin(a)}`, class: strict ? 'sw-ring-arc strict' : 'sw-ring-arc' }, nodeLayer);
+          el('circle', { cx: p[0], cy: p[1], r: STATION_R + 6, class: 'sw-ring' }, nodeLayer);
+          const frac = strict ? sh.clean : 1;
+          if (frac > 0) el('path', { d: arcD(p, STATION_R + 6, frac), class: strict ? 'sw-ring-arc strict' : 'sw-ring-arc' }, nodeLayer);
         }
-        el('rect', { x: p[0] - 10, y: p[1] - 10, width: 20, height: 20, rx: 4, class: i === 0 && strict ? 'sw-box strict' : 'sw-box' }, nodeLayer);
+        const st = el('circle', { cx: p[0], cy: p[1], r: STATION_R, class: 'sw-station' + red }, nodeLayer);
+        const g = i === 0 ? cacheFill : hitRate;
+        el('title', {}, st).textContent = i === 0
+          ? (g == null ? 'Tentacle piece cache' : `Tentacle piece cache ${Math.round(g * 100)}% full`)
+          : (g == null ? 'FUSE read-ahead' : `FUSE read-ahead hit rate ${Math.round(g * 100)}%`);
+        el('circle', { cx: p[0], cy: p[1], r: GAUGE_R, class: 'sw-meter-track' + red }, nodeLayer);
+        if (g > 0) el('path', { d: arcD(p, GAUGE_R, g), class: 'sw-meter' + red }, nodeLayer);
         if (vertical) {
-          txt(nodeLayer, p[0] + 26, p[1] - 1, name, 'sw-name');
-          txt(nodeLayer, p[0] + 26, p[1] + 11, sub, i === 0 && strict ? 'sw-sub accent' : 'sw-sub');
+          txt(nodeLayer, p[0] + 30, p[1] - 1, name, 'sw-name');
+          txt(nodeLayer, p[0] + 30, p[1] + 11, sub, i === 0 && strict ? 'sw-sub accent' : 'sw-sub');
         } else {
-          txt(nodeLayer, p[0] - 24, p[1] - 40, name, 'sw-name');
-          txt(nodeLayer, p[0] - 24, p[1] - 28, sub, i === 0 && strict ? 'sw-sub accent' : 'sw-sub');
+          txt(nodeLayer, p[0] - 24, p[1] - 44, name, 'sw-name');
+          txt(nodeLayer, p[0] - 24, p[1] - 32, sub, i === 0 && strict ? 'sw-sub accent' : 'sw-sub');
         }
       });
 
@@ -680,7 +724,7 @@
         const bar = document.createElement('div');
         bar.className = vertical ? 'sw-focusbar' : 'sw-chip';
         bar.innerHTML = vertical
-          ? `<span>${esc(label.join(' → '))}${t && t.speed_mbs > 0.01 ? ' · ' + mbps(t.speed_mbs) : ''}</span><button type="button" aria-label="Show all streams">✕</button>`
+          ? `<span>${esc(label.join(' → '))}${t && t.speed_mbs > 0.01 ? ' · ' + mbps(realS(t)) : ''}</span><button type="button" aria-label="Show all streams">✕</button>`
           : `<b>${esc(label[0] || '')}</b><span>${label[1] ? ' · ' + esc(label[1]) : ''}</span><button type="button" class="sw-showall">Show all ✕</button>`;
         bar.onclick = () => toggleFocus(focusKey);
         ui.appendChild(bar);
@@ -688,7 +732,16 @@
     }
     svg.addEventListener('click', () => { if (focusKey) toggleFocus(focusKey); });
 
-    if (!torrents.length) drawIdleCard();
+    if (!torrents.length) drawIdleCard(vertical);
+    // The idle ring around the cache → FUSE pipe, and the movement between it and the graph.
+    // A stadium track around the pipe: half-length `a` along it, half-width `b` across.
+    const geo = vertical
+      ? { cx: cacheP[0], cy: (cacheP[1] + fuseP[1]) / 2, b: Math.min(62, W * 0.2), vertical, W, H }
+      : { cx: (cacheP[0] + fuseP[0]) / 2, cy: cacheP[1], a: Math.min((fuseP[0] - cacheP[0]) / 2 + 90, W * 0.2), b: Math.min(70, H * 0.16), vertical, W, H };
+    // Phone: the track and its label must fit the height left below the pipe, which shrinks with the screen.
+    if (vertical) geo.a = Math.max(geo.b + 20, Math.min((fuseP[1] - cacheP[1]) / 2 + 70, H - 34 - geo.cy));
+    geo.band = P((F.peers + F.peersEnd) / 2, 0.45);
+    orbitSync(torrents.length > 0, geo, spots);
   }
 
   function recentRows() {
@@ -704,33 +757,13 @@
     });
   }
   // Idle (desktop): the engine stays drawn; a card lists the last streams.
-  function drawIdleCard() {
-    const c = document.createElement('div'); c.className = 'sw-idle';
+  function drawIdleCard(vertical) {
+    const c = document.createElement('div'); c.className = vertical ? 'sw-idle v' : 'sw-idle';
     const rows = recentRows();
     c.innerHTML = `<div class="sw-d-title">No active stream</div><div class="small faint">The engine is idle. The graph fills when a player opens a file.</div>`
-      + (rows.length ? `<hr><div class="label">Recent</div>` + rows.map(([a, b]) => `<div class="sw-d-row"><span>${esc(a)}</span><span class="mono">${esc(b)}</span></div>`).join('') : '');
+      + (rows.length ? `<hr><div class="label">Recent</div>` + rows.map(([a, b]) => `<div class="sw-d-row${vertical ? ' col' : ''}"><span>${esc(a)}</span><span class="mono">${esc(b)}</span></div>`).join('') : '');
     ui.appendChild(c);
   }
-  // Idle (phone): one engine row and the last streams, instead of an empty tall graph.
-  function drawIdlePhone() {
-    const h = data.health || {};
-    const act = Math.max(0, Math.min(1, (h.fuse_active_pct || 0) / 100)), stale = Math.max(0, Math.min(1 - act, (h.fuse_stale_pct || 0) / 100));
-    const cols = 16, lit = Math.round(cols * (act + stale)), actC = Math.round(cols * act);
-    let dots = '';
-    for (let c = 0; c < cols; c++) for (const r of [-4.5, 0, 4.5]) {
-      const cls = c < actC ? 'sw-dot act' : c < lit ? 'sw-dot stale' : 'sw-dot off';
-      dots += `<circle cx="${70 + c * 9}" cy="${23 + r}" r="1.6" class="${cls}"/>`;
-    }
-    const rows = recentRows();
-    ui.innerHTML = `<div class="sw-idle v"><div class="sw-d-title">No active stream</div>`
-      + `<svg viewBox="0 0 300 64" width="100%" height="64" aria-hidden="true"><g class="sw-gauge"><path d="M40 23 L260 23" class="sw-gauge-rim" stroke-width="20"/><path d="M40 23 L260 23" class="sw-gauge-free" stroke-width="18"/>${dots}</g>`
-      + `<rect x="30" y="13" width="20" height="20" rx="4" class="sw-box"/><rect x="250" y="13" width="20" height="20" rx="4" class="sw-box"/>`
-      + `<text x="40" y="54" class="sw-name" text-anchor="middle">GoStorm</text><text x="260" y="54" class="sw-name" text-anchor="middle">raCache</text></svg>`
-      + (rows.length ? `<hr><div class="label">Recent</div>` + rows.map(([a, b]) => `<div class="sw-d-row col"><span>${esc(a)}</span><span class="mono">${esc(b)}</span></div>`).join('') : '')
-      + `</div>`;
-    [...host.children].filter(n => n.tagName.toLowerCase() === 'svg').forEach(n => n.remove());
-  }
-
   async function fetchMetrics() {
     try {
       const r = await fetch('/metrics');
@@ -740,8 +773,8 @@
         if (typeof m.shield_active === 'boolean') {
           engine = { active: m.shield_active, last: m.shield_last_corruption || 0, need: m.shield_need_s || 30 };
         }
-      }
-    } catch (_) { }
+      } else transport = null;   // a failed answer must not keep old connection counts on screen
+    } catch (_) { transport = null; }
   }
 
   async function fetchExtras() {
@@ -768,16 +801,246 @@
     } catch (_) { }
   }
 
+  // ---------- idle orbit ----------
+  // With no active torrent, the peer connections no torrent accounts for (/metrics peer_conns_*)
+  // run a stadium track around the cache → FUSE pipe. When a stream starts they leave in a queue
+  // for the spots the graph draws its peers at; when the last one ends they come back. The track
+  // sits under the graph, the dots above it, in layers of their own so the 2.5 s redraws do not
+  // restart them.
+  const ORBIT_MAX = 16, TURN_MS = 36000, TO_GRAPH_MS = 600, TO_RING_MS = 800, FRAME_MS = 33;
+  const orbit = { back: null, front: null, svgB: null, svgF: null, dots: [], geo: null, mode: 'off', t0: 0, epoch: performance.now(),
+    spots: [], raf: 0, active: null, label: null, last: 0, onScreen: true, wasHidden: false, count: null };
+  const ease = k => k < 0 ? 0 : k > 1 ? 1 : k * k * (3 - 2 * k);
+  // Point at fraction u along the track, clockwise, as [x, y]; the track runs along the pipe.
+  function trackAt(u) {
+    const g = orbit.geo, a = g.a, b = g.b, run = 2 * (a - b), arc = Math.PI * b, total = 2 * run + 2 * arc;
+    let d = (((u % 1) + 1) % 1) * total, s, t;          // s along the pipe, t across it
+    if (d < run) { s = -(a - b) + d; t = -b; }
+    else if ((d -= run) < arc) { const k = -Math.PI / 2 + d / b; s = (a - b) + b * Math.cos(k); t = b * Math.sin(k); }
+    else if ((d -= arc) < run) { s = (a - b) - d; t = b; }
+    else { d -= run; const k = Math.PI / 2 + d / b; s = -(a - b) + b * Math.cos(k); t = b * Math.sin(k); }
+    return g.vertical ? [g.cx - t, g.cy + s] : [g.cx + s, g.cy + t];
+  }
+  function trackPath() {
+    let p = '';
+    for (let i = 0; i <= 96; i++) { const [x, y] = trackAt(i / 96); p += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1); }
+    return p + 'Z';
+  }
+  const lap = (d, now) => d.a + (reducedMotion() ? 0 : (now - orbit.epoch) / TURN_MS);
+  // New dots take the middle of the widest gap, so the others never jump.
+  function freeAngle() {
+    const as = orbit.dots.map(d => ((d.a % 1) + 1) % 1).sort((x, y) => x - y);
+    if (!as.length) return 0.02;
+    let best = 0, at = as[0] + 0.5;
+    as.forEach((v, i) => { const nx = i + 1 < as.length ? as[i + 1] : as[0] + 1; if (nx - v > best) { best = nx - v; at = v + (nx - v) / 2; } });
+    return at % 1;
+  }
+  // Only connections no torrent accounts for are drawn: a torrent with active peers is already in
+  // the graph (the collector counts it as active), so at rest these are the remaining sockets.
+  function orbitDots(n) {
+    const want = n ? Math.min(ORBIT_MAX, n) : 0;
+    const utp = transport && (transport.tcp + transport.utp) ? transport.utp / (transport.tcp + transport.utp) : 0;
+    while (orbit.dots.length > want) orbit.dots.pop().node.remove();
+    for (let i = orbit.dots.length; i < want; i++) {
+      const r = rng('orbit' + i);
+      const d = { a: freeAngle(), size: 3.2, born: reducedMotion() ? 0 : performance.now() };
+      d.utp = r() < utp;
+      d.node = d.utp ? el('rect', { class: 'sw-peer' }) : el('circle', { class: 'sw-peer' });
+      dotLayer().appendChild(d.node);
+      // A peer that connects mid-flight appears on the track, not in the Peers column.
+      const [tx, ty] = trackAt(lap(d, performance.now()));
+      d.from = [tx, ty, 0];
+      orbit.dots.push(d);
+    }
+    orbit.label.textContent = n ? `${n} peer connection${n === 1 ? '' : 's'} · no torrent active` : '';
+    placeLabel();
+  }
+  // Phone: the track is centred on the pipe and crosses the Tentacle / FUSE labels, so the dots
+  // run under the graph, where the labels' panel halo masks them. Desktop: above the graph.
+  const dotLayer = () => orbit.geo && orbit.geo.vertical ? orbit.svgB : orbit.svgF;
+  // Centred under the track, but never past the svg's edges (narrow phones).
+  function placeLabel() {
+    const g = orbit.geo;
+    let w = 0;
+    try { w = orbit.label.getComputedTextLength(); } catch (_) { }
+    orbit.label.setAttribute('x', Math.max(4 + w / 2, Math.min(g.W - 4 - w / 2, g.cx)).toFixed(1));
+    orbit.label.setAttribute('y', Math.min(g.H - 6, g.cy + (g.vertical ? g.a : g.b) + 22).toFixed(1));
+  }
+  // No connections, or metrics unreachable: no track at all.
+  const showTrack = n => { orbit.back.hidden = orbit.front.hidden = !n; return !!n; };
+  function place(d, x, y, op) {
+    if (d.utp) {
+      const sz = d.size * 1.8;
+      d.node.setAttribute('x', (x - sz / 2).toFixed(1)); d.node.setAttribute('y', (y - sz / 2).toFixed(1));
+      if (!d.sized) { d.node.setAttribute('width', sz.toFixed(1)); d.node.setAttribute('height', sz.toFixed(1)); }
+    } else {
+      d.node.setAttribute('cx', x.toFixed(1)); d.node.setAttribute('cy', y.toFixed(1));
+      if (!d.sized) d.node.setAttribute('r', d.size.toFixed(2));
+    }
+    d.sized = true;
+    d.node.style.opacity = op.toFixed(2);
+    d.x = x; d.y = y; d.op = op;
+  }
+  function orbitFrame(now) {
+    orbit.raf = 0;
+    if (!orbit.front || orbit.mode === 'off') return;
+    if (host.hidden) { orbit.wasHidden = true; return; }       // Timeline view: resumes on the next draw
+    const moving = orbit.mode === 'to-graph' || orbit.mode === 'to-ring';
+    // Idle and off screen (scrolled away): nothing to draw. Idle: ~30 fps is plenty for 36 s a turn.
+    if (!moving && !orbit.onScreen) return;                     // the IntersectionObserver restarts it
+    if (!moving && now - orbit.last < FRAME_MS) { orbit.raf = requestAnimationFrame(orbitFrame); return; }
+    orbit.last = now;
+    const k = moving ? (now - orbit.t0) / (orbit.mode === 'to-graph' ? TO_GRAPH_MS : TO_RING_MS) : 1;
+    orbit.dots.forEach((d, i) => {
+      const [tx, ty] = trackAt(lap(d, now));
+      const spot = orbit.spots.length ? orbit.spots[i % orbit.spots.length] : orbit.geo.band;
+      const from = d.from || [spot[0], spot[1], 0.8];
+      // Staggered: the dots leave (and come back) one after another, like a queue through the pipe.
+      const lag = d.lag || 0;
+      const e = ease((k - lag) / 0.6);
+      let x = tx, y = ty, op = 0.8;
+      if (orbit.mode === 'to-graph') {
+        x = from[0] + (spot[0] - from[0]) * e; y = from[1] + (spot[1] - from[1]) * e;
+        op = from[2] + (0.8 - from[2]) * e;
+        if (k > 0.8) op *= Math.max(0, 1 - (k - 0.8) / 0.2);
+      } else if (orbit.mode === 'to-ring') {
+        x = from[0] + (tx - from[0]) * e; y = from[1] + (ty - from[1]) * e; op = from[2] + (0.8 - from[2]) * e;
+      }
+      const fade = d.born ? Math.min(1, (now - d.born) / 900) : 1;   // a peer that connects fades in
+      place(d, x, y, op * fade);
+    });
+    const ke = ease(k);
+    orbit.track.style.opacity = orbit.mode === 'idle' ? 1 : orbit.mode === 'to-ring' ? ke : 1 - ke;
+    orbit.label.style.opacity = orbit.mode === 'idle' ? 1 : orbit.mode === 'to-ring' ? ke : 0;
+    if (moving && k >= 1) {
+      orbit.dots.forEach(d => { d.from = null; });
+      if (orbit.mode === 'to-graph') { orbit.mode = 'off'; orbit.back.hidden = orbit.front.hidden = true; return; }
+      orbit.mode = 'idle';
+    }
+    if (orbit.mode === 'idle' && reducedMotion()) return;     // drawn still
+    orbit.raf = requestAnimationFrame(orbitFrame);
+  }
+  function orbitStart() { if (!orbit.raf && orbit.mode !== 'off') orbit.raf = requestAnimationFrame(orbitFrame); }
+  function orbitBox(cls) {
+    const b = document.createElement('div');
+    b.className = 'sw-orbit ' + cls;
+    const svg = el('svg', { 'aria-hidden': 'true' }, b);
+    return [b, svg];
+  }
+  function orbitSync(active, geo, spots) {
+    if (!orbit.front) {
+      [orbit.back, orbit.svgB] = orbitBox('back');
+      [orbit.front, orbit.svgF] = orbitBox('front');
+      orbit.label = el('text', { class: 'sw-sub', 'text-anchor': 'middle' }, orbit.svgF);
+      orbit.track = el('path', { class: 'sw-orbit-track' }, orbit.svgB);   // under the pipe and the boxes
+      host.insertBefore(orbit.back, host.firstChild);   // painted under the graph (z-index -1)
+      host.appendChild(orbit.front);
+      if ('IntersectionObserver' in window) {
+        new IntersectionObserver(es => { orbit.onScreen = es.some(x => x.isIntersecting); if (orbit.onScreen) orbitStart(); }).observe(host);
+      }
+    }
+    const wasActive = orbit.active;
+    orbit.active = active;
+    orbit.geo = geo;
+    [orbit.svgB, orbit.svgF].forEach(svg => {
+      svg.setAttribute('viewBox', `0 0 ${geo.W} ${geo.H}`);
+      svg.setAttribute('width', '100%');
+      svg.setAttribute('height', geo.H);
+    });
+    orbit.track.setAttribute('d', trackPath());
+    placeLabel();
+    const layer = dotLayer();
+    orbit.dots.forEach(d => { if (d.node.parentNode !== layer) layer.appendChild(d.node); });   // a resize can switch layouts
+    if (active && orbit.mode !== 'to-graph') orbit.spots = spots;   // fixed while the dots fly to them
+    // First draw, back from the Timeline view, or reduced motion: no flight.
+    const instant = reducedMotion() || wasActive === null || orbit.wasHidden;
+    orbit.wasHidden = false;
+    // A flight starts from where each dot is now (a reversal mid-way does not jump).
+    const fromHere = () => orbit.dots.forEach(d => { d.from = d.x != null ? [d.x, d.y, d.op] : null; });
+    // A queue: the dots nearest the Peers side (left; top on the phone) move first.
+    const queue = () => {
+      const key = d => d.x == null ? 0 : geo.vertical ? d.y : d.x;
+      const order = [...orbit.dots].sort((p, q) => key(p) - key(q));
+      order.forEach((d, r) => { d.lag = order.length > 1 ? r / (order.length - 1) * 0.4 : 0; });
+    };
+    if (active) {
+      if (wasActive === false && !instant && orbit.mode !== 'off') { fromHere(); queue(); orbit.mode = 'to-graph'; orbit.t0 = performance.now(); }
+      else if (orbit.mode !== 'to-graph') { orbit.mode = 'off'; orbit.back.hidden = orbit.front.hidden = true; }
+    } else {
+      orbit.count = transport ? transport.tcp + transport.utp : null;
+      orbitDots(orbit.count);
+      if (!showTrack(orbit.count)) { orbit.mode = 'off'; return; }
+      if (wasActive === true && !instant) {
+        // Coming back from the graph the dots are the peers already on screen: no fade-in.
+        orbit.dots.forEach(d => { d.born = 0; d.from = orbit.mode === 'to-graph' && d.x != null ? [d.x, d.y, d.op] : null; });
+        queue();
+        orbit.mode = 'to-ring'; orbit.t0 = performance.now();
+      } else if (orbit.mode !== 'to-ring') orbit.mode = 'idle';
+    }
+    orbitStart();
+  }
+  // The peer count changes with the metrics poll; the graph signature leaves it out (a change would
+  // cross-fade the whole graph), so the ring follows it here.
+  function orbitRecount() {
+    if (orbit.active !== false || !orbit.front) return;
+    const n = transport ? transport.tcp + transport.utp : null;
+    if (n === orbit.count) return;
+    orbit.count = n;
+    orbitDots(n);
+    if (!showTrack(n)) { orbit.mode = 'off'; return; }
+    if (orbit.mode === 'off') orbit.mode = 'idle';
+    orbitStart();
+  }
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) orbitStart(); });
+
+  // Polls come every 2.5 s. When one changes speeds alone, the graph eases from what is on screen
+  // to it over TWEEN_MS, in cut redraws that keep every motion's phase; any change of shape
+  // cross-fades as before. The data stay the engine's: only the steps between are drawn.
+  const TWEEN_MS = 1000, TWEEN_STEP_MS = 250;
+  let onScreen = null, tweenTimer = null;
+  const lerp = (a, b, f) => (a == null || b == null) ? b : a + (b - a) * f;
+  function mixSpeeds(from, to, f) {
+    const byHash = new Map((from.torrents || []).map(t => [t.hash, t]));
+    return { ...to, torrents: (to.torrents || []).map(t => {
+      const o = byHash.get(t.hash);
+      if (!o) return t;
+      const ob = new Map((o.peer_rates || []).map(p => [p.id, p]));
+      // real: the engine's numbers, for the labels; only widths and durations are eased.
+      return { ...t, real: { s: t.speed_mbs, u: t.up_mbs || 0 }, speed_mbs: lerp(o.speed_mbs, t.speed_mbs, f), up_mbs: lerp(o.up_mbs || 0, t.up_mbs || 0, f),
+        peer_rates: t.peer_rates && t.peer_rates.map(p => {
+          const q = ob.get(p.id);
+          return q ? { ...p, real_kbps: p.kbps, real_up: p.up_kbps || 0, kbps: lerp(q.kbps, p.kbps, f), up_kbps: lerp(q.up_kbps || 0, p.up_kbps || 0, f) } : p;
+        }) };
+    }) };
+  }
+  function easeTo(d) {
+    clearInterval(tweenTimer); tweenTimer = null;
+    const from = onScreen;
+    if (!from || !host || host.hidden || reducedMotion() || signature(from, false) !== signature(d, false)) {
+      data = onScreen = d; draw(); return;
+    }
+    const t0 = Date.now();
+    const step = () => {
+      const f = Math.min(1, (Date.now() - t0) / TWEEN_MS);
+      data = onScreen = f < 1 ? mixSpeeds(from, d, 1 - (1 - f) * (1 - f)) : d;
+      draw(false, true);
+      if (f >= 1) { clearInterval(tweenTimer); tweenTimer = null; }
+    };
+    step();
+    tweenTimer = setInterval(step, TWEEN_STEP_MS);
+  }
+
   window.Swarm = {
     mount(node) {
       host = node;
       host.classList.add('sw-host');
       fetchMetrics().then(() => draw());
       fetchExtras().then(() => draw());
-      setInterval(() => { if (!host.hidden) fetchMetrics().then(() => draw()); }, 5000);
-      setInterval(() => { if (!host.hidden) fetchExtras().then(() => draw()); }, 15000);
+      // Inside a tween these redraws cut like its frames: a cross-fade would be cut off halfway.
+      setInterval(() => { if (!host.hidden) fetchMetrics().then(() => { draw(false, !!tweenTimer); orbitRecount(); }); }, 2500);
+      setInterval(() => { if (!host.hidden) fetchExtras().then(() => draw(false, !!tweenTimer)); }, 15000);
     },
-    update(d) { data = d; draw(); },
+    update(d) { easeTo(d); },
     redraw: () => draw(true),
     details, closeDetails, closeOrphan, hoverable, mbps,
   };

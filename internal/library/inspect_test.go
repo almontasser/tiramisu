@@ -30,7 +30,7 @@ func (f *fakeGoStorm) RemoveTorrent(ctx context.Context, hash string) error {
 	return nil
 }
 
-func (f *fakeGoStorm) ListTorrents(ctx context.Context) ([]TorrentStats, error) { return nil, nil }
+func (f *fakeGoStorm) ListTorrentRefs(ctx context.Context) ([]TorrentRef, error) { return nil, nil }
 
 func files(paths ...string) []FileStat {
 	out := make([]FileStat, 0, len(paths))

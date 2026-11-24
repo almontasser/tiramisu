@@ -55,7 +55,7 @@ fi
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
-# GoStorm keeps its settings in $ROOT_PATH/config.db and Tiramisu its state in
+# Tentacle keeps settings.json (and a not yet imported config.db) in $ROOT_PATH, Tiramisu its state in
 # $STATE_DIR. Unmounted, both vanish on "docker rm" and every setting silently
 # returns to its default, which is hard to attribute after the fact.
 for dir in "$ROOT_PATH" "$STATE_DIR"; do
@@ -114,9 +114,10 @@ if mountpoint -q "$MOUNT_PATH" 2>/dev/null; then
   fi
 fi
 
+# The configuration lives in STATE/tiramisu.db: config.json is read once, on the first
+# start (or as a drop-in), then renamed. Its absence is not an error.
 if [ ! -f "$CONFIG_PATH" ]; then
-  echo "Missing required config file at $CONFIG_PATH" >&2
-  exit 1
+  echo "No config file at $CONFIG_PATH: using the configuration saved in the state DB (defaults on a first start)." >&2
 fi
 
 tiramisu_pid=""

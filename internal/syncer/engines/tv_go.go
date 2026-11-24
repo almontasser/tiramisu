@@ -49,6 +49,7 @@ type TVGoEngine struct {
 	registryFile string
 	db           *metadb.DB // V1.7.1: Optional SQLite backend
 	audioReg     library.AudioRegistry
+	release      ReleaseFunc
 
 	processedThisRun map[string]bool
 	stats            TVSyncStats
@@ -120,6 +121,7 @@ type TVEngineConfig struct {
 	// Mode chooses the series a run covers; nil covers every series.
 	Mode            func() TVSyncMode
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -145,6 +147,7 @@ type TVEngineConfig struct {
 	// <= 0 means every season.
 	MaxSeasons    int
 	AudioRegistry library.AudioRegistry
+	Release       ReleaseFunc
 }
 
 // TV thresholds
@@ -294,7 +297,7 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 	}
 
 	e := &TVGoEngine{
-		gostorm:          NewGoStormClient(cfg.GoStormURL),
+		gostorm:          NewGoStormClient(cfg.Torrents, cfg.GoStormURL),
 		tmdb:             tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio:        torrentio.NewClient(cfg.TorrentioURL, torrentioOptions),
 		prowlarr:         newProwlarrClient(cfg.ProwlarrCfg),
@@ -313,6 +316,7 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 		registryFile:     regFile,
 		db:               db,
 		audioReg:         cfg.AudioRegistry,
+		release:          cfg.Release,
 		processedThisRun: make(map[string]bool),
 		knownTitles:      make(map[int][]string),
 		blacklistFile:    blFile,
@@ -332,23 +336,24 @@ func NewTVGoEngine(cfg TVEngineConfig, db *metadb.DB) *TVGoEngine {
 }
 
 // removeStub deletes a stub file/dir, invalidates its FUSE cache state, and removes the
-// underlying torrent from GoStorm. hash may be empty (e.g. for a plain directory); a
-// failed RemoveTorrent doesn't block the stub deletion.
+// underlying torrent from Tentacle. hash may be empty (e.g. for a plain directory); a
+// failed release doesn't undo the stub deletion.
 func (e *TVGoEngine) removeStub(ctx context.Context, path, hash string) {
-	if hash != "" {
-		if _, err := e.dropTorrent(ctx, hash); err != nil {
-			e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
-		}
-		// Same reason as the movie engine: the counter outlives the release otherwise.
-		// An upgrade leaves the replaced hash standing at the threshold for good, and
-		// whoever reads that table next is looking at a release nothing points at.
-		if e.db != nil {
-			if err := e.db.ClearMetadataFailure(hash); err != nil {
-				e.logger.Printf("[TVSync] WARNING: failed to clear metadata failures for %s: %v", hash, err)
-			}
+	// Stub first, torrent last: see MovieGoEngine.removeStub. The release keeps a pack
+	// that other episodes' stubs or tv_episodes rows still cite.
+	e.removeStubFile(path)
+	if hash == "" {
+		return
+	}
+	released, err := e.dropTorrent(ctx, hash)
+	if err != nil {
+		e.logger.Printf("[TVSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
+	}
+	if released && e.db != nil {
+		if err := e.db.ClearMetadataFailure(hash); err != nil {
+			e.logger.Printf("[TVSync] WARNING: failed to clear metadata failures for %s: %v", hash, err)
 		}
 	}
-	e.removeStubFile(path)
 }
 
 // removeStubFile drops the stub without touching the engine, for callers that share one
@@ -467,7 +472,7 @@ func (e *TVGoEngine) Run(ctx context.Context) error {
 		e.saveRegistry()
 	}
 	// B6.1: rehydrate before cleanup — if an MKV file exists on disk but its
-	// torrent is missing from GoStorm, restore it first. cleanupOrphanedFiles
+	// torrent is missing from Tentacle, restore it first. cleanupOrphanedFiles
 	// runs after so it cannot delete a file that rehydrate still needs.
 	e.rehydrateMissingTorrents(ctx)
 	if e.mergeRegistryFromDB() {
@@ -560,7 +565,7 @@ func (e *TVGoEngine) saveRegistry() {
 }
 
 func (e *TVGoEngine) populateRegistryFromExisting() {
-	var torrents []TorrentStats
+	var torrents []TorrentRef
 	var tsLoaded bool
 
 	e.walkRoots(func(path string, info os.FileInfo, err error) error {
@@ -592,9 +597,9 @@ func (e *TVGoEngine) populateRegistryFromExisting() {
 		// Try to read full hash from file content first
 		fullHash := e.readHashFromMKV(path)
 		if fullHash == "" {
-			// Fallback: resolve via GoStorm lookup
+			// Fallback: resolve via Tentacle lookup
 			if !tsLoaded {
-				torrents, _ = e.gostorm.ListTorrents(context.Background())
+				torrents, _ = e.gostorm.ListTorrentRefs(context.Background())
 				tsLoaded = true
 			}
 			for _, t := range torrents {
@@ -614,6 +619,16 @@ func (e *TVGoEngine) populateRegistryFromExisting() {
 			FilePath:     path,
 			Source:       "existing",
 			Created:      info.ModTime().Unix(),
+		}
+		// Persisted too, or the episode lives only in this run's memory: kept by the
+		// cleanup, invisible to everything that reads tv_episodes (reaper, gaps, checks).
+		if e.db != nil && len(fullHash) == 40 {
+			if err := e.db.UpsertEpisode(key, metadb.EpisodeEntry{
+				EpisodeKey: key, QualityScore: 1, Hash: fullHash, FilePath: path,
+				Source: "existing", Created: info.ModTime().Unix(),
+			}); err != nil {
+				e.logger.Printf("[TVSync] Warning: failed to register %s: %v", filename, err)
+			}
 		}
 
 		return nil
@@ -1501,11 +1516,14 @@ func (e *TVGoEngine) processFullpack(ctx context.Context, showName, showIMDB, ta
 			continue
 		}
 		if e.createMKV(epPath, streamURL, vf.Length, magnet) {
-			if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
+			// The new row replaces the old one first, or the old row would still claim
+			// the replaced torrent and the release would keep it.
+			existing, ok := e.registry[key]
+			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack", showIMDB)
+			if ok && existing.FilePath != "" && existing.FilePath != epPath {
 				e.removeStub(ctx, existing.FilePath, existing.Hash)
 				e.stats.Upgrades++
 			}
-			e.registerEpisode(key, stream.QualityScore, hash, epPath, "fullpack", showIMDB)
 			e.processedThisRun[key] = true
 			created++
 			e.logger.Printf("Created: %s", epFilename)
@@ -1578,16 +1596,18 @@ func (e *TVGoEngine) processSingle(ctx context.Context, showName, showIMDB, targ
 		return 0
 	}
 	if e.createMKV(epPath, streamURL, bestFile.Length, magnet) {
-		if existing, ok := e.registry[key]; ok && existing.FilePath != "" && existing.FilePath != epPath {
+		existing, ok := e.registry[key]
+		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single", showIMDB)
+		if ok && existing.FilePath != "" && existing.FilePath != epPath {
 			e.removeStub(ctx, existing.FilePath, existing.Hash)
 			e.stats.Upgrades++
 		}
-		e.registerEpisode(key, stream.QualityScore, hash, epPath, "single", showIMDB)
 		e.processedThisRun[key] = true
 		e.logger.Printf("Created: %s", epFilename)
 		return 1
 	}
-
+	// No stub came of it: the torrent goes unless something else cites it.
+	_, _ = e.dropTorrent(ctx, hash)
 	return 0
 }
 
@@ -1734,7 +1754,7 @@ func (e *TVGoEngine) cleanupOrphanedFiles(ctx context.Context) {
 }
 
 func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
-	torrents, err := e.gostorm.ListTorrents(ctx)
+	torrents, err := e.gostorm.ListTorrentRefs(ctx)
 	if err != nil {
 		return
 	}
@@ -1814,7 +1834,7 @@ func (e *TVGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 // Returns how many torrents were actually removed; a torrent withheld because
 // audio still owns it is not counted.
 func (e *TVGoEngine) cleanupOrphanedTorrents(ctx context.Context) int {
-	torrents, err := e.gostorm.ListTorrents(ctx)
+	torrents, err := e.gostorm.ListTorrentRefs(ctx)
 	if err != nil {
 		return 0
 	}

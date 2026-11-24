@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Tiramisu Installer
-# Tiramisu + GoStorm (Unified Engine)
+# Tiramisu + Tentacle (Unified Engine)
 # Target: auto-detected at install time
 # ==============================================================================
 set -e
@@ -481,6 +481,14 @@ generate_config_json() {
     local output_path="${INSTALL_DIR}/config.json"
     local example_path="${INSTALL_DIR}/config.json.example"
 
+    # The configuration lives in STATE/tiramisu.db once Tiramisu has started: a config.json
+    # written now would be imported over it as a drop-in. Only a fresh install gets one.
+    if [ -f "$output_path" ] || [ -f "${INSTALL_DIR}/STATE/tiramisu.db" ]; then
+        print_ok "Existing configuration kept (STATE/tiramisu.db or config.json)"
+        CONFIG_WRITTEN=false
+        return
+    fi
+
     if [ ! -f "$example_path" ]; then
         print_err "config.json.example not found — cannot generate config."
         exit 1
@@ -491,6 +499,7 @@ generate_config_json() {
     sed -i "s|\"physical_source_path\": \".*\"|\"physical_source_path\": \"${STORAGE_PATH}\"|" "$output_path"
     sed -i "s|\"fuse_mount_path\": \".*\"|\"fuse_mount_path\": \"${FUSE_MOUNT}\"|" "$output_path"
 
+    CONFIG_WRITTEN=true
     print_ok "config.json written to ${output_path}"
     print_info "Configure Plex, TMDB, NAT-PMP, ports, and scheduler from the Control Panel at :9080/control"
 }
@@ -629,7 +638,7 @@ ExecStartPost=/bin/sleep 2'
 
     sudo tee /etc/systemd/system/tiramisu.service > /dev/null <<SERVICE_EOF
 [Unit]
-Description=Tiramisu + GoStorm (Unified Streaming Engine)
+Description=Tiramisu + Tentacle (Unified Streaming Engine)
 After=network-online.target systemd-resolved.service nss-lookup.target local-fs.target remote-fs.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -967,7 +976,11 @@ show_summary() {
     echo ""
 
     printf "  %sFiles written:%s\n" "$PTEAL" "$PRST"
-    printf "    %s%s/config.json%s\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    if [ "${CONFIG_WRITTEN:-false}" = "true" ]; then
+        printf "    %s%s/config.json%s (imported into STATE/tiramisu.db at first start)\n" "$BOLD" "$INSTALL_DIR" "$NC"
+    else
+        printf "    configuration kept (STATE/tiramisu.db)\n"
+    fi
     printf "    %s/etc/systemd/system/tiramisu.service%s\n" "$BOLD" "$NC"
     echo ""
 

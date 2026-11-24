@@ -156,8 +156,43 @@ hole. Filing the episode yourself with `/api/library/add` closes its gap too: a
 gap is cleared whenever the episode has a live release again, whoever put it
 there.
 
+### Consistency check and orphan torrents (v1.12.1)
+
+`diagnostics` compares what the engine holds with what the library references
+(stubs, `tv_episodes`, audio projections, the inode map) and changes nothing.
+`cached=1` returns the last result instead of walking the stubs again; the
+Dashboard reads it that way.
+
+```bash
+curl -s 'http://127.0.0.1:9080/api/library/diagnostics' | jq '.checks[] | {id, count, removable}'
+curl -s 'http://127.0.0.1:9080/api/library/diagnostics?cached=1'
+```
+
+`orphans` lists the torrents nothing references, older than `min_age_days`
+(default 7), oldest first. `dry_run` defaults to `true`; with `false` each one is
+checked again just before it is removed. At most `max` per call (default 50, up
+to 1000). It refuses (409) when `movies/` or `tv/` is missing or has no stub,
+when a stub cannot be read, or when more than 25% of the torrents look
+unreferenced. `counters_only` clears the failure counters of torrents no longer
+in the engine and removes no torrent.
+
+```bash
+curl -s -X POST -d '{}' http://127.0.0.1:9080/api/library/orphans | jq '{candidates, selected: .selected[:5]}'
+curl -s -X POST -d '{"dry_run":false,"max":50}' http://127.0.0.1:9080/api/library/orphans | jq '{released: (.released|length), kept, failed}'
+```
+
+`release` removes one torrent only if nothing references it, for a client that
+hydrated one with `inspect` and filed nothing from it (404 when the engine does
+not hold it). A `remove` whose torrent the engine kept reports it in
+`torrent_errors`; the orphan collection takes it later.
+
+```bash
+curl -s -X POST -d '{"hash":"<40-char info hash>"}' http://127.0.0.1:9080/api/library/release
+```
+
 > [!WARNING]
-> `/api/library/add` and `/api/library/remove` write and delete files in the
+> `/api/library/add`, `/api/library/remove`, `/api/library/orphans` and
+> `/api/library/release` write and delete files or torrents in the
 > library. Turn on [sign-in](#sign-in-and-api-tokens) before exposing `:9080`
 > beyond a trusted network.
 
@@ -206,9 +241,86 @@ host, start it again. It clears the user, the sessions and the tokens and turns
 sign-in off. With Docker, start the container once with `TIRAMISU_RESET_AUTH=1`
 and remove the variable afterwards: while it is set, sign-in cannot be turned on.
 
-The user, sessions and tokens live in `STATE/tiramisu.db`, never in
-`config.json`. If sign-in is on and that database cannot be read, `:9080` answers
+The user, sessions and tokens live in `STATE/tiramisu.db`, apart from the
+configuration and never in its history. If sign-in is on and that database cannot be read, `:9080` answers
 `503` (webhooks excepted) instead of opening up.
+
+---
+
+## HTTPS
+
+`:9080` can serve HTTPS itself: **Control Panel → Access → HTTPS**, switch it on,
+**Apply & restart**. It is off by default, and a reverse proxy in front keeps
+working either way. The card then walks through the rest: download the CA,
+trust it on each device, move your clients to `https://`.
+
+**Certificate.** Tiramisu creates a local CA once (`STATE/tls/ca.pem`, ECDSA
+P-256, valid 10 years) and uses it to sign the server certificate
+(`STATE/tls/cert.pem`, 365 days). Devices trust the CA once; the server
+certificate renews on its own (expiry, a new IPv4 address, new extra hostnames)
+without anyone noticing. It covers the hostname, `<hostname>.local`, `localhost`,
+`127.0.0.1`, `::1`, the host's IPv4 addresses (IPv6 addresses rotate and are left
+out, and so are VPN tunnels, link-local addresses and Docker bridges) and
+`https.extra_hostnames`. The CA is
+downloaded from the card as `tiramisu-ca.crt` (also `GET /api/auth/tls/cert`):
+compare its SHA-256 with the one on the card before trusting it. Your own
+certificate (Let's Encrypt or any public CA) can replace it: set
+`https.cert_file` and `https.key_file`; renewed files are picked up within a
+minute, and if they cannot be read Tiramisu falls back to the local CA and logs
+`[TLS] ERROR`.
+
+**One port, both schemes.** TLS and plain HTTP share `:9080`. With HTTPS on, plain
+HTTP is answered like this:
+
+| Plain HTTP request | Sign-in off at start-up | Sign-in on at start-up |
+|---|---|---|
+| From the Tiramisu host itself (loopback or its own addresses) | served | served |
+| From a proxy listed in `auth_trusted_proxies` | served | served |
+| `/plex/webhook`, `/webhook` | served | served |
+| A page in a browser | `308` to `https://` | `308` to `https://` |
+| Anything else from the LAN | served | `403 {"error":"use https"}` |
+
+So the `http://127.0.0.1:9080` examples in this guide keep working on the host,
+and Plex and Jellyfin need no change. From another machine use `https://` and
+point the client at the CA:
+
+```bash
+curl --cacert tiramisu-ca.crt -H "Authorization: Bearer $TIRAMISU_TOKEN" \
+  https://<host>:9080/api/health
+```
+
+| Client | How it trusts the CA |
+|---|---|
+| macOS (Safari, Chrome, the menu bar app) | Open `tiramisu-ca.crt` → Keychain Access → Trust → *Always Trust* |
+| iOS / iPadOS | Install the profile, then enable full trust in *Settings → General → About → Certificate Trust Settings* |
+| Node clients (Claude Code and other MCP clients) | `export NODE_EXTRA_CA_CERTS=/path/to/tiramisu-ca.crt` |
+| Python (`requests`, `httpx`) | `export REQUESTS_CA_BUNDLE=/path/to/tiramisu-ca.crt` and `SSL_CERT_FILE=…`; `httpx` ignores the system store and uses `certifi` unless `SSL_CERT_FILE` is set |
+| curl | `--cacert tiramisu-ca.crt` |
+
+The macOS menu bar app picks `http://` or `https://` by itself: it moves to
+`https://` when the plain address answers `use https`, and back when HTTPS is
+turned off.
+
+- **Restart.** The setting is read at start-up, and so is the sign-in state the
+  plain-HTTP rule uses: turning sign-in on while HTTPS runs leaves plain HTTP open
+  until the next restart, and the card says so.
+- **Tokens seen in clear.** With HTTPS on, a valid token that still arrives over
+  plain HTTP from another machine is listed in the card (step 4) with its IP:
+  switch that client and consider revoking the token.
+- **HSTS** is never sent with the local CA (it would lock browsers out before the
+  CA is trusted). With your own certificate it is sent for 180 days: turning
+  HTTPS off afterwards keeps browsers on `https://` until it expires.
+- **Session cookie.** It is `__Host-tiramisu_session` over HTTPS and
+  `tiramisu_session` over plain HTTP, so turning HTTPS off does not lock you out.
+- **Docker.** The container's own IP and hostname change on every re-creation and
+  are not what clients use: add the host's IP or name to `https.extra_hostnames`.
+- **Reverse proxy.** With HTTPS on, a proxy on another machine must be listed in
+  `auth_trusted_proxies` (its IP, not a whole subnet: a subnet exempts the whole
+  LAN from the rule above).
+
+`GET /api/auth/tls` returns whether HTTPS runs, the certificate in use and
+whether a restart is pending; with sign-in on it needs a browser session, like the
+rest of `/api/auth/*` (tokens are refused).
 
 **Secrets are write-only.** `GET /api/config` never returns `plex.token`,
 `tmdb_api_key` or `prowlarr.api_key`: it reports whether each is set in
@@ -216,15 +328,58 @@ The user, sessions and tokens live in `STATE/tiramisu.db`, never in
 
 ---
 
+## Configuration history
+
+Every save of the configuration is a version in `STATE/tiramisu.db`; the last 50
+are kept. `GET /api/config/history` lists them newest first, each with its source
+(`ui`, `api`, `internal`, `import`, `cli`, `rollback`, `default`), the user or token
+name that saved it, the keys it changed against the version before, and whether
+those changes need a restart. Keys and tokens show as changed, never their values.
+
+```bash
+curl -s http://192.168.1.2:9080/api/config/history?limit=5 | jq '.[] | {id, source, actor, changes}'
+curl -s -X POST -H 'Content-Type: application/json' -d '{"id": 41}' \
+  http://192.168.1.2:9080/api/config/rollback
+```
+
+`GET /api/config/history/41/restore` answers what a rollback to 41 would change,
+without saving: the Control Panel shows it before you apply. A rollback saves
+version 41 again as the newest: nothing is deleted, so it can be
+rolled back too. It brings back the keys and tokens that version had, keeps the
+install's telemetry id, and answers with the new version, what changed and whether
+`POST /api/restart` is needed. With sign-in on, the history and the rollback answer
+only a signed-in Control Panel session: a token gets `403`, because a rollback can
+turn HTTPS off or change the trusted proxies.
+
+### Tentacle settings history
+
+The Tentacle settings (cache size, connections, peer port…) have their own
+history, shown in the same Control Panel page: `GET /api/tentacle/history`,
+`GET /api/tentacle/history/{id}/restore` and `POST /api/tentacle/rollback` work like the
+configuration routes above, with the same access rule. The older `/api/gostorm/*`
+routes and the `gostorm` key of `/api/health` still answer, as aliases for existing
+scripts. Only manual saves become
+versions (Control Panel, `POST /api/tentacle/settings` with `set` or `def`, a restore):
+the peer port NAT-PMP sets and the defaults written at start-up do not.
+`StoreSettingsInJson`, and `PeersListenPort` while NAT-PMP is on, are
+never compared, and a save or a restore keeps their current value: with NAT-PMP the
+peer port is the one the VPN forwards, not the one in the form. A restore applies at once: timeout, retrackers, read-ahead, Responsive and Shield apply live, other keys reconnect the BitTorrent client (playback in progress stops), and disk warmup and the save path wait for a restart (the answer then has `"restart": true`).
+Changes to the disconnect timeout, retrackers mode, Responsive mode, Adaptive
+Shield and read-ahead apply live; any other change reconnects the BitTorrent client, and playback
+in progress stops.
+
+---
+
 ## MCP Server
 
-Tiramisu serves its library tools over MCP at `http://<host>:9080/mcp`
-(Streamable HTTP). An agent searches releases with the deployment's own scoring
+Tiramisu serves its library tools over MCP at `http://<host>:9080/mcp`, or
+`https://<host>:9080/mcp` with [HTTPS](#https) on (Streamable HTTP). An agent searches releases with the deployment's own scoring
 profile, the same pipeline the sync uses, files the one you pick, lists and
 removes entries:
 
 - Claude Code: `claude mcp add --transport http tiramisu http://<host>:9080/mcp`
-  (with sign-in on, add `--header "Authorization: Bearer tmr_..."`)
+  (with sign-in on, add `--header "Authorization: Bearer tmr_..."`; with HTTPS on,
+  use `https://` and set `NODE_EXTRA_CA_CERTS` to the CA file)
 - Any MCP client that speaks Streamable HTTP: point it at the same URL.
 
 | Tool | What it does |
@@ -241,7 +396,7 @@ removes entries:
 
 Searches and adds run as jobs: indexer searches can take minutes. The agent
 always asks before adding or removing. It changes the scoring profile only for
-one search and only when you ask, and never writes it to `config.json`.
+one search and only when you ask, and never saves it in the configuration.
 
 ```
 add the latest Dummy Bunny movie in 4K
@@ -260,44 +415,37 @@ The MCP server needs v1.11.5 or later.
 
 ## API Quick Reference
 
-Two JSON APIs, one per layer: the GoStorm engine at `:8090` manages torrents and
-settings, the Tiramisu side at `:9080` exposes metrics (and the Library API, in
-its own section above). Handy for scripts, and for checking what is happening
-without opening the web UI.
+Everything goes through `:9080`: the engine runs inside the Tiramisu process and
+has no API port of its own. Up to v1.12 the GoStorm engine also answered on
+`:8090`; since v1.13.0 nothing listens there, so scripts that called it move to
+the routes below (and to the Library API, in its own section above). Handy for
+scripts, and for checking what is happening without opening the web UI.
 
-### GoStorm API (`:8090`)
-
-The GoStorm API listens on `127.0.0.1` only: run these commands on the Tiramisu
-host (or inside the container). Only the engine itself calls it. To reach it from
-the network, as before v1.11.15, set `"gostorm_listen_ip": "all"` in
-`config.json`; it has no authentication, so do that only on a trusted network.
+### Engine (`:9080`)
 
 ```bash
-# List all torrents (count)
+# Torrents in memory, with speed and peers
+curl -s http://127.0.0.1:9080/api/torrents | \
+  jq '.[] | {title: .title[:50], speed_mbs, peers, status}'
+
+# How full each torrent's piece cache in RAM is (v1.13.0: cache_filled and
+# cache_capacity, in bytes; the Tentacle station in Live Swarm draws this ratio)
+curl -s http://127.0.0.1:9080/api/torrents | \
+  jq '.[] | {title: .title[:50], cache_pct: (100 * .cache_filled / .cache_capacity | floor)}'
+
+# Read the Tentacle settings
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"list"}' http://127.0.0.1:8090/torrents | jq length
+  -d '{"action":"get"}' http://127.0.0.1:9080/api/tentacle/settings | jq
 
-# Add a torrent
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"add","link":"magnet:?xt=urn:btih:...","title":"Film Title (Year)"}' \
-  http://127.0.0.1:8090/torrents
-
-# Active torrents (in RAM, not DB)
+# Change some: "set" changes only the keys in "sets". "def" restores the defaults.
 curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"active"}' http://127.0.0.1:8090/torrents | \
-  jq '.[] | {title: .title[:50], speed_mbps: ((.download_speed//0)/1048576|round), peers: (.active_peers//0)}'
-
-# Read settings
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"get"}' http://127.0.0.1:8090/settings | jq
-
-# Remove a torrent
-curl -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"rem","hash":"<infohash>"}' http://127.0.0.1:8090/torrents
+  -d '{"action":"set","sets":{"ConnectionsLimit":25}}' \
+  http://127.0.0.1:9080/api/tentacle/settings
 ```
 
-The engine also accepts `drop` (unload from RAM, keep it in the DB) and `wipe`
-(remove every torrent, rarely what you want).
+Torrents are added and removed through the Library API, which also writes or
+removes the stub; with [sign-in](#sign-in-and-api-tokens) on, add
+`-H "Authorization: Bearer tmr_..."` to every call.
 
 Removing a title means removing its stub, not just its torrent. Two ways do it
 properly, and deleting the stub from the source directory is neither: that
@@ -316,6 +464,9 @@ rm /mnt/tiramisu-mkv-virtual/movies/<file>.mkv
 ```
 
 ### Tiramisu API (`:9080`)
+
+The examples run on the Tiramisu host. From another machine with [HTTPS](#https)
+on, use `https://<host>:9080` with `--cacert tiramisu-ca.crt`.
 
 ```bash
 # Key metrics fields

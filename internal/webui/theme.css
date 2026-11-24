@@ -36,6 +36,7 @@
   --sig-green: #2E7A4C;  --sig-green-bg: rgba(46, 158, 91, .15);
   --accent-hi: #F8B6A4;
   --term: #15181B;
+  --term-hi: #FFFFFF;
   --term-text: #C6CDD2;
   --term-dim: #69737B;
   --area: rgba(18, 21, 24, .06);
@@ -63,6 +64,7 @@
   --sig-green: #6FD39A;  --sig-green-bg: rgba(61, 203, 116, .14);
   --accent-hi: #FFC2B0;
   --term: #08090A;
+  --term-hi: #FFFFFF;
   --term-text: #B6BEC4;
   --term-dim: #566069;
   --area: rgba(230, 234, 237, .07);
@@ -95,7 +97,7 @@ button, input, select { font: inherit; color: inherit; }
   color: var(--ink3);
 }
 .label.ink { color: var(--ink); }
-.h1 { font-size: 32px; font-weight: 350; letter-spacing: -.015em; line-height: 1.1; margin: 0; }
+.h1 { font-size: 32px; font-weight: 300; letter-spacing: -.015em; line-height: 1.1; margin: 0; }
 .kpi { font-size: 46px; font-weight: 300; letter-spacing: -.035em; line-height: 1; }
 .kpi-s { font-size: 30px; font-weight: 300; letter-spacing: -.025em; line-height: 1; }
 .muted { color: var(--ink2); }
@@ -226,7 +228,7 @@ button, input, select { font: inherit; color: inherit; }
 }
 .lamp.off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--ink3); }
 .lamp.err { background: var(--accent); }
-/* Engine health in the rail: green when online (the only place green is used). */
+/* Engine health in the rail: green when online. Green also marks a completed step (restart, sign-in). */
 #rail-lamp.run { background: var(--ok); }
 #rail-lamp.run::after { border-color: var(--ok); }
 .lamp.run::after {
@@ -285,7 +287,8 @@ button, input, select { font: inherit; color: inherit; }
   padding: 0;
   flex: 0 0 auto;
 }
-.key:hover { border-color: var(--accent-ink); color: var(--accent-ink); }
+.key:hover { border-color: var(--ink); color: var(--ink); }
+.key[data-kill]:hover { border-color: var(--accent-ink); color: var(--accent-ink); }
 
 /* ---------- segmented ---------- */
 .seg {
@@ -324,6 +327,8 @@ button, input, select { font: inherit; color: inherit; }
 }
 .chip-tag.fill { background: var(--ink); border-color: var(--ink); color: var(--inv); }
 .chip-tag.accent { border-color: var(--accent-ink); color: var(--accent-ink); }
+/* On the ink change bar the darker accent-ink would not read: the bright accent does. */
+.chip-tag.accent.on-dark { border-color: var(--accent); color: var(--accent); }
 .chip-tag.soft { background: var(--well); border-color: transparent; }
 /* Signal chips (stream badges): tinted fill, coloured text, no frame. */
 .chip-tag.sig-yellow { background: var(--sig-yellow-bg); border-color: transparent; color: var(--sig-yellow); }
@@ -337,7 +342,7 @@ button, input, select { font: inherit; color: inherit; }
   align-items: center;
   gap: 6px;
   font-size: 11px;
-  font-weight: 450;
+  font-weight: 500;
   margin-bottom: 6px;
 }
 .input {
@@ -375,7 +380,7 @@ button, input, select { font: inherit; color: inherit; }
   transform: rotate(45deg);
   pointer-events: none;
 }
-.input.mono input { font-family: var(--sans); font-size: 13px; }
+.input.mono input { font-family: var(--mono); font-size: 12px; }
 .input input[type="time"]::-webkit-calendar-picker-indicator { display: none; }
 .input input[readonly], .input input:disabled { color: var(--ink3); }
 .field.is-disabled { opacity: .45; }
@@ -495,7 +500,7 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 .terminal .ln { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .terminal .ts { color: var(--term-dim); }
 .terminal .err { color: var(--accent); }
-.terminal .warn { color: #fff; font-weight: 500; }
+.terminal .warn { color: var(--term-hi); font-weight: 500; }
 .terminal .ok { color: var(--term-text); font-weight: 500; }
 
 /* ---------- change bar ---------- */
@@ -561,7 +566,7 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 .sw-gauge-free { stroke: var(--well); }
 .sw-dot.act { fill: var(--ink); }
 .sw-dot.stale { fill: var(--ink3); }
-.sw-host { position: relative; }
+.sw-host { position: relative; isolation: isolate; }
 .sw-old { position: absolute; left: 0; top: 0; width: 100%; pointer-events: none; transition: opacity .6s ease; }
 .sw-new { animation: sw-fade-in .6s ease; }
 @keyframes sw-fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -570,7 +575,7 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 .sw-ui > * { pointer-events: auto; }
 .sw-ui.v { position: static; display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
 .sw-ui.v:empty { display: none; }
-.sw-card { position: absolute; z-index: 5; width: 250px; font: 400 12px/1.4 var(--sans); color: var(--ink); padding: 10px 12px; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.12); display: flex; flex-direction: column; gap: 4px; }
+.sw-card { position: absolute; z-index: 5; width: 250px; font: 400 12px/1.4 var(--sans); color: var(--ink); padding: 10px 12px; background: var(--panel); border: 1px solid var(--hair2); border-radius: 6px; display: flex; flex-direction: column; gap: 4px; }
 .sw-d-title { font-weight: 500; font-size: 13px; color: var(--ink); }
 .sw-d-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--ink); }
 .sw-d-sub { font-size: 11px; line-height: 15px; color: var(--ink2); margin: -2px 0 6px; overflow-wrap: anywhere; }
@@ -589,6 +594,12 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 .sw-focusbar button { border: 0; background: transparent; color: var(--ink2); font-size: 14px; cursor: pointer; }
 .sw-idle { position: absolute; left: 0; top: 34px; width: min(42%, 420px); display: flex; flex-direction: column; gap: 8px; padding: 16px 18px; background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; }
 .sw-idle.v { position: static; width: auto; border: 0; padding: 0; }
+.sw-orbit { position: absolute; left: 0; top: 0; width: 100%; pointer-events: none; }
+/* The idle track passes under the pipe and the boxes: the host is its own stacking context. */
+.sw-orbit.back { z-index: -1; }
+.sw-orbit svg { display: block; overflow: visible; }
+.sw-orbit .sw-orbit-track { fill: none; stroke: var(--hair2); stroke-width: 1; stroke-dasharray: 2 5; }
+.sw-orbit text { font-family: var(--sans); }
 .sw-idle hr { border: 0; border-top: 1px solid var(--hair); margin: 2px 0; width: 100%; }
 .swarm .sw-dim { opacity: .15 !important; }
 .sw-focus { fill: none; stroke: var(--ink); stroke-width: 2; }
@@ -600,6 +611,13 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 .sw-dot.off { fill: var(--hair2); opacity: .45; }
 
 .sw-box.strict { fill: var(--accent); }
+.sw-station { fill: var(--panel); stroke: var(--ink); stroke-width: 3; }
+.sw-station.strict { fill: var(--accent); stroke: var(--accent); }
+.sw-meter-track, .sw-meter { fill: none; stroke-width: 5.4; stroke-linecap: butt; }
+.sw-meter-track { stroke: var(--hair2); }
+.sw-meter { stroke: var(--ink); }
+.sw-meter-track.strict { stroke: var(--panel); opacity: .35; }
+.sw-meter.strict { stroke: var(--panel); }
 /* Nodes sit on the pipes with a gap in the panel colour, the same cut in light and dark. */
 .sw-ring { fill: none; stroke: var(--hair2); stroke-width: 2; }
 .sw-ring-arc { fill: none; stroke: var(--ink); stroke-width: 2; }
@@ -710,3 +728,46 @@ input.danger, .input input.danger { color: var(--accent-ink); }
 /* Segmented control across its container, options in equal halves/thirds */
 .seg.full { display: flex; }
 .seg.full button { flex: 1; justify-content: center; text-align: center; }
+
+/* ---------- restart (restart.js) ---------- */
+.rs-dialog { border: 1px solid var(--hair); border-radius: 8px; padding: 0; background: var(--panel); color: var(--ink); width: min(480px, calc(100vw - 32px)); box-shadow: 0 16px 48px rgba(0,0,0,.18); }
+.rs-dialog::backdrop { background: rgba(18, 21, 24, .5); }
+.rs-dialog .card-head .title { font-size: 15px; font-weight: 500; }
+.rs-dialog .card-body { gap: 18px; }
+.rs-dialog p { margin: 0; color: var(--ink2); }
+.rs-foot { display: flex; align-items: center; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--hair); background: var(--well); }
+.rs-foot > .small, .rs-foot > .spacer { flex: 1; }
+.rs-changes { display: flex; flex-direction: column; gap: 6px; padding: 12px 16px; background: var(--well); border-radius: 4px; overflow-wrap: anywhere; }
+.rs-what { display: flex; flex-direction: column; gap: 6px; color: var(--ink2); }
+.rs-what .label { color: var(--ink3); }
+.rs-centre { display: flex; flex-direction: column; align-items: center; gap: 14px; text-align: center; }
+.rs-big { font-size: 15px; font-weight: 500; }
+.rs-sub { max-width: 400px; }
+.rs-sub:empty { display: none; }
+.rs-ring { position: relative; width: 132px; height: 132px; }
+.rs-ring svg { width: 132px; height: 132px; }
+.rs-ring circle { fill: none; stroke-width: 4; }
+.rs-ring .track { stroke: var(--hair); }
+.rs-ring .arc { stroke: var(--ink); stroke-linecap: butt; transition: stroke-dashoffset 1s linear, stroke .3s; }
+.rs-ring[data-state="late"] .arc { stroke: var(--sig-yellow); }
+.rs-ring[data-state="err"] .arc { stroke: var(--accent); }
+.rs-ring .num { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.rs-ring .n { font-size: 30px; font-weight: 300; letter-spacing: -.8px; font-variant-numeric: tabular-nums; }
+.rs-ring .label { color: var(--ink3); }
+.rs-steps { display: flex; flex-direction: column; gap: 10px; }
+.rs-step { display: flex; align-items: center; gap: 10px; color: var(--ink3); }
+.rs-step .txt { flex: 1; }
+.rs-step[data-state="ok"], .rs-step[data-state="run"] { color: var(--ink); }
+.rs-step[data-state="run"] .txt { font-weight: 500; }
+.rs-step[data-state="ok"] .lamp { background: var(--ok); }
+.rs-term { margin: 0; padding: 14px 16px; background: var(--term); color: var(--term-text); border-radius: 4px; font-family: var(--mono); font-size: 11px; line-height: 16px; white-space: pre-wrap; }
+.rs-banner { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 6px; margin-bottom: 8px; transition: opacity .4s; }
+.rs-banner.ok { background: var(--sig-green-bg); }
+.rs-banner.ok .lamp { background: var(--ok); }
+.rs-banner.late { background: var(--sig-yellow-bg); }
+.rs-banner.late .lamp { background: var(--sig-yellow); }
+.rs-banner.err { background: var(--panel); box-shadow: inset 0 0 0 1px var(--accent); }
+.rs-banner .txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.rs-banner .title { font-weight: 500; }
+.rs-banner .small { color: var(--ink2); }
+.rs-banner.gone { opacity: 0; }

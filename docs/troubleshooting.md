@@ -20,9 +20,8 @@ If empty, force a Plex/Jellyfin library scan. The scan reads the first MB of eac
 
 Check active torrent status:
 ```bash
-curl -s -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"active"}' http://127.0.0.1:8090/torrents | \
-  jq '.[] | {title: .title[:50], speed_mbps: ((.download_speed//0)/1048576|round), peers: (.active_peers//0)}'
+curl -s http://127.0.0.1:9080/api/torrents | \
+  jq '.[] | {title: .title[:50], speed_mbs, peers, status}'
 ```
 
 If peer count < 3 and you are routing through WireGuard, check NAT-PMP configuration.
@@ -60,18 +59,18 @@ If you are routing BitTorrent traffic through WireGuard, enable NAT-PMP to resto
 Without an open inbound port, peers cannot initiate connections: the engine
 relies solely on outbound ones.
 
-**If you are not using a VPN, forward the peer port on your router.** Tiramisu
-asks the router for the mapping over UPnP on its own, but many routers ship with
-UPnP disabled (and some ISP routers do not offer it at all). When that request
-fails nothing is logged as an error: the port simply stays closed and peer
-counts stay low.
+**If you are not using a VPN, make sure the peer port is open on your router.**
+The engine asks the router for a mapping over UPnP at start (unless
+`DisableUPNP` is set, or Tiramisu's NAT-PMP manages the port). If your router
+has UPnP turned off, forward the port yourself. Without a mapping the port
+simply stays closed and peer counts stay low; nothing is logged as an error.
 
-1. Pin the port. In the Control Panel, set **GoStorm → `PeersListenPort`** to a
+1. Pin the port. In the Control Panel, set **Tentacle → Listen Port** to a
    fixed high port (e.g. `64407`). Left at `0` the engine picks a new random port
    on every start, which no static forward can follow.
 2. Forward that same port to the machine running Tiramisu, **both TCP and UDP**.
-3. Verify from outside your network that the port is open: a closed port and a
-   working UPnP mapping look identical from the inside.
+3. Verify from outside your network that the port is open: from the inside, a
+   closed port and an open one look the same.
 
 A router that drops the unforwarded traffic *and* logs every drop can also wear
 out its own flash storage over time; if your router has a firewall logging
@@ -156,12 +155,55 @@ stays closed instead of opening up. Restore the database, or reset as above.
 </details>
 
 <details>
+<summary><b>Tiramisu stops at start with "config.db (BBolt) was never imported"</b></summary>
+
+Up to v1.11.17 the torrent list and the engine settings were in `config.db` (BBolt),
+next to the binary (in Docker, in `/state`). Later versions up to v1.12 import it into
+`STATE/tiramisu.db` on their first start; v1.13.0 no longer reads it, and stops rather
+than start with an empty torrent list and default settings. `config.db` is left
+untouched, so nothing is lost. Start v1.12.03 once (Docker: the
+`mrrobotogit/tiramisu:v1.12.03` image with the same volumes) to import it, then
+v1.13.0 again. A `config.db` left behind after an import is ignored (the log says
+so) and can be deleted.
+
+</details>
+
+<details>
 <summary><b>Scripts or tools get 401, or cannot reach <code>:8090</code></b></summary>
 
 With sign-in on, every call to `:9080` needs an API token
 (`-H "Authorization: Bearer tmr_..."`), created in **Control Panel → Access**.
-The GoStorm API on `:8090` listens on `127.0.0.1` only since v1.11.15: run its
-commands on the host, or set `"gostorm_listen_ip": "all"` in `config.json`.
+Since v1.13.0 nothing listens on `:8090`: the engine runs in-process and is reached
+through `:9080` only. Move scripts to the Library API, `/api/torrents` and
+`/api/tentacle/settings` (see [API Quick Reference](api.md#api-quick-reference)).
+
+</details>
+
+<details>
+<summary><b>HTTPS: the browser says the connection is not private, or a client gets <code>403 use https</code></b></summary>
+
+With HTTPS on (**Control Panel → Access → HTTPS**), each device has to trust
+Tiramisu's local CA once:
+
+- **Browser warning** ("not private", `NET::ERR_CERT_AUTHORITY_INVALID`): the device
+  does not trust the CA yet. Accept the warning once, download `tiramisu-ca.crt`
+  from the card, check its SHA-256 against the card, and trust it (macOS: Keychain
+  Access → *Always Trust*; iOS: install the profile, then enable it in
+  *Settings → General → About → Certificate Trust Settings*).
+- **Still "not secure" with the CA trusted**: the address you use is not in the
+  certificate (a Tailscale IP or `*.ts.net` name, another hostname). Add it to
+  **Extra hostnames** in the card (Advanced), then Apply & restart: the CA stays the
+  same, nothing to reinstall.
+- **`403 {"error":"use https"}`** on an API call: the client still uses `http://`
+  from another machine while sign-in is on. Switch it to `https://`.
+- **`CERTIFICATE_VERIFY_FAILED`** in a Python client although the CA is in the
+  system store: `httpx` and `requests` use `certifi`. Set `SSL_CERT_FILE` and
+  `REQUESTS_CA_BUNDLE` to the CA file or to the system bundle
+  (`/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu). Node clients need
+  `NODE_EXTRA_CA_CERTS`.
+- **The card says the certificate files could not be read**: the paths in
+  `https.cert_file` / `https.key_file` are wrong or not readable by the service
+  user; Tiramisu is serving the local CA meanwhile (`[TLS] ERROR` in the log).
 
 </details>
 
@@ -174,8 +216,9 @@ Paths below use the defaults set by `install.sh`. All are configurable during in
 | Path | Purpose |
 |------|---------|
 | `~/Tiramisu/tiramisu` | Production binary |
-| `~/Tiramisu/config.json` | Live configuration (edit → `sudo systemctl restart tiramisu`) |
-| `~/Tiramisu/STATE/tiramisu.db` | SQLite state database: inode map, sync caches, episode registry, scheduler state |
+| `~/Tiramisu/STATE/tiramisu.db` | SQLite state database: the configuration and its history, the torrent list and Tentacle settings, inode map, sync caches, episode registry, scheduler state, sign-in |
+| `~/Tiramisu/STATE/config.last.json` | Copy of the configuration, rewritten at every save: the way back if the database cannot be opened |
+| `~/Tiramisu/config.json.imported-*` | A `config.json` already imported, kept as it was |
 | `~/Tiramisu/logs/` | All service logs (`tiramisu.log`, `movies-sync.log`, `tv-sync.log`, `watchlist-sync.log`) |
 | `/mnt/tiramisu-mkv-virtual/` | FUSE mount point (served to Plex/Jellyfin -> Samba) |
 | `/etc/systemd/system/tiramisu.service` | systemd service definition |

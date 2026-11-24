@@ -42,6 +42,7 @@ type TVSyncerConfig struct {
 	// TVModeAll.
 	Mode            func() TVSyncMode
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -61,6 +62,7 @@ type TVSyncerConfig struct {
 	MaxSeasons      int
 	DB              *metadb.DB // V1.7.1: Optional SQLite backend
 	AudioRegistry   library.AudioRegistry
+	Release         ReleaseFunc
 	// InvalidatePath, when set, is called after removing a stub file/dir so the FUSE
 	// layer drops its cached state for it (see main.invalidateSyncRemovedPath).
 	InvalidatePath func(string)
@@ -92,6 +94,7 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		Name:            name,
 		Mode:            cfg.Mode,
 		GoStormURL:      cfg.GoStormURL,
+		Torrents:        cfg.Torrents,
 		TMDBAPIKey:      cfg.TMDBAPIKey,
 		TorrentioURL:    cfg.TorrentioURL,
 		PlexURL:         cfg.PlexURL,
@@ -111,6 +114,7 @@ func NewTVSyncer(cfg TVSyncerConfig) *TVSyncer {
 		MaxSeasons:      cfg.MaxSeasons,
 		InvalidatePath:  cfg.InvalidatePath,
 		AudioRegistry:   cfg.AudioRegistry,
+		Release:         cfg.Release,
 	}
 
 	engine := NewTVGoEngine(engineCfg, cfg.DB)

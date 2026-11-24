@@ -21,7 +21,9 @@ type WatchlistSyncer struct {
 type WatchlistSyncerConfig struct {
 	DB              *metadb.DB
 	AudioRegistry   library.AudioRegistry
+	Release         ReleaseFunc
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -51,6 +53,7 @@ func NewWatchlistSyncer(cfg WatchlistSyncerConfig) *WatchlistSyncer {
 
 	engineCfg := WatchlistConfig{
 		GoStormURL:      cfg.GoStormURL,
+		Torrents:        cfg.Torrents,
 		TMDBAPIKey:      cfg.TMDBAPIKey,
 		TorrentioURL:    cfg.TorrentioURL,
 		PlexURL:         cfg.PlexURL,
@@ -64,6 +67,7 @@ func NewWatchlistSyncer(cfg WatchlistSyncerConfig) *WatchlistSyncer {
 		Language:        cfg.Language,
 		DB:              cfg.DB,
 		AudioRegistry:   cfg.AudioRegistry,
+		Release:         cfg.Release,
 	}
 
 	return &WatchlistSyncer{

@@ -59,6 +59,7 @@ type MovieGoEngine struct {
 
 	db       *metadb.DB
 	audioReg library.AudioRegistry
+	release  ReleaseFunc
 	// deadTitles holds the IMDB ids whose current release stopped resolving its
 	// metadata. They are re-searched this run, and dropped only if nothing live
 	// turns up.
@@ -96,6 +97,7 @@ type BlacklistData struct {
 // MovieEngineConfig holds config for the movie engine.
 type MovieEngineConfig struct {
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -110,6 +112,7 @@ type MovieEngineConfig struct {
 	// AudioRegistry lets the host say "audio is configured but its registry is
 	// unavailable", which a nil DB cannot express and must not be read as "no audio".
 	AudioRegistry library.AudioRegistry
+	Release       ReleaseFunc
 	Language      config.LanguageConfig
 	Weights       config.MovieWeights
 	// InvalidatePath, when set, is called after removing a stub file so the FUSE
@@ -174,7 +177,7 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 	logger := log.New(io.MultiWriter(os.Stdout, logFile), "[MovieSync] ", log.LstdFlags)
 
 	e := &MovieGoEngine{
-		gostorm:   NewGoStormClient(cfg.GoStormURL),
+		gostorm:   NewGoStormClient(cfg.Torrents, cfg.GoStormURL),
 		tmdb:      tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio: torrentio.NewClient(cfg.TorrentioURL, torrentioOptions),
 		prowlarr:  newProwlarrClient(cfg.ProwlarrCfg),
@@ -205,6 +208,7 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 
 	e.db = cfg.DB
 	e.audioReg = cfg.AudioRegistry
+	e.release = cfg.Release
 	e.noMKVCache = e.loadNoMKVCache()
 	e.noStreamsCache = e.loadCache(e.noStreamsCFile)
 	e.recheckCache = e.loadCache(e.recheckCFile)
@@ -218,26 +222,29 @@ func NewMovieGoEngine(cfg MovieEngineConfig) *MovieGoEngine {
 	return e
 }
 
-// removeStub deletes a stub file, invalidates its FUSE cache state, and removes the
-// underlying torrent from GoStorm. hash may be empty; a RemoveTorrent error doesn't
-// block the stub deletion.
+// removeStub deletes a stub file, invalidates its FUSE cache state, then releases the
+// torrent if nothing else references it. The stub goes first: a crash in between leaves
+// an orphan torrent, never a stub without one that rehydrate would bring back.
 func (e *MovieGoEngine) removeStub(ctx context.Context, path, hash string) {
-	if hash != "" {
-		if _, err := e.dropTorrent(ctx, hash); err != nil {
-			e.logger.Printf("[MovieSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
-		}
-		// The failure counter outlives the release otherwise: if this hash is ever
-		// selected again, a stale count already past the threshold would condemn it
-		// before it has had a chance to fail.
-		if e.db != nil {
-			if err := e.db.ClearMetadataFailure(hash); err != nil {
-				e.logger.Printf("[MovieSync] WARNING: failed to clear metadata failures for %s: %v", hash, err)
-			}
-		}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		e.logger.Printf("[MovieSync] WARNING: failed to remove %s: %v", filepath.Base(path), err)
 	}
-	os.Remove(path)
 	if e.invalidatePath != nil {
 		e.invalidatePath(path)
+	}
+	if hash == "" {
+		return
+	}
+	released, err := e.dropTorrent(ctx, hash)
+	if err != nil {
+		e.logger.Printf("[MovieSync] WARNING: failed to remove torrent %s for %s: %v", hash, filepath.Base(path), err)
+	}
+	// The failure counter outlives the release otherwise: if this hash is ever selected
+	// again, a stale count already past the threshold would condemn it.
+	if released && e.db != nil {
+		if err := e.db.ClearMetadataFailure(hash); err != nil {
+			e.logger.Printf("[MovieSync] WARNING: failed to clear metadata failures for %s: %v", hash, err)
+		}
 	}
 }
 
@@ -726,17 +733,17 @@ func (e *MovieGoEngine) evaluateTitle(ctx context.Context, imdbID, title, releas
 			continue
 		}
 
-		// Remove existing if upgrading
-		if existingPath != "" {
-			e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
-			e.removeStub(ctx, existingPath, existing.hash)
-		}
-
 		filename := e.buildMovieFilename(title, releaseDate, c)
 		mkvPath := filepath.Join(e.moviesDir, filename)
 		streamURL := fmt.Sprintf("%s/stream?link=%s&index=%d&play", e.gostorm.baseURL, hash, bestFile.ID)
 
 		if e.createMKV(mkvPath, streamURL, bestFile.Length, magnet, imdbID) {
+			// The old release goes only once the new one exists: a failed create no
+			// longer leaves the title with nothing.
+			if existingPath != "" && existingPath != mkvPath {
+				e.logger.Printf("[MovieSync] Upgrade: removing %s", filepath.Base(existingPath))
+				e.removeStub(ctx, existingPath, existing.hash)
+			}
 			res := "4K"
 			if !c.Is4K {
 				res = "1080p"
@@ -1084,7 +1091,7 @@ func (e *MovieGoEngine) isBlacklisted(title string) bool {
 }
 
 func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
-	torrents, err := e.gostorm.ListTorrents(ctx)
+	torrents, err := e.gostorm.ListTorrentRefs(ctx)
 	if err != nil {
 		return
 	}
@@ -1157,7 +1164,7 @@ func (e *MovieGoEngine) rehydrateMissingTorrents(ctx context.Context) {
 }
 
 func (e *MovieGoEngine) cleanupOrphanedFiles(ctx context.Context) {
-	torrents, err := e.gostorm.ListTorrents(ctx)
+	torrents, err := e.gostorm.ListTorrentRefs(ctx)
 	if err != nil {
 		return
 	}

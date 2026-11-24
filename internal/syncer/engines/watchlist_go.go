@@ -43,6 +43,7 @@ type WatchlistGoEngine struct {
 	logger     *log.Logger
 	db         *metadb.DB
 	audioReg   library.AudioRegistry
+	release    ReleaseFunc
 
 	weights       config.MovieWeights
 	preferredLang *regexp.Regexp
@@ -54,7 +55,9 @@ type WatchlistConfig struct {
 	// torrent. Optional: nil means no audio is configured.
 	DB              *metadb.DB
 	AudioRegistry   library.AudioRegistry
+	Release         ReleaseFunc
 	GoStormURL      string
+	Torrents        Backend // the engine (stub URLs still use GoStormURL)
 	TMDBAPIKey      string
 	TorrentioURL    string
 	PlexURL         string
@@ -80,7 +83,7 @@ func NewWatchlistGoEngine(cfg WatchlistConfig) *WatchlistGoEngine {
 	logger := log.New(io.MultiWriter(os.Stdout, logFile), "[WatchlistSync] ", log.LstdFlags)
 
 	return &WatchlistGoEngine{
-		gostorm:    NewGoStormClient(cfg.GoStormURL),
+		gostorm:    NewGoStormClient(cfg.Torrents, cfg.GoStormURL),
 		tmdb:       tmdb.NewClient(cfg.TMDBAPIKey),
 		torrentio:  torrentio.NewClient(cfg.TorrentioURL, "sort=qualitysize|qualityfilter=480p,720p,scr,cam"),
 		prowlarr:   prowlarrClient,
@@ -94,6 +97,7 @@ func NewWatchlistGoEngine(cfg WatchlistConfig) *WatchlistGoEngine {
 		logger:     logger,
 		db:         cfg.DB,
 		audioReg:   cfg.AudioRegistry,
+		release:    cfg.Release,
 
 		weights:       cfg.Weights,
 		preferredLang: CompileLanguageRegex(cfg.Language.PreferredTerms, cfg.Language.PreferredFlags),
@@ -202,6 +206,8 @@ func (e *WatchlistGoEngine) Run(ctx context.Context) error {
 
 			mkvPath, err := e.createMKV(hash, candidate.Title, bestFile.ID, bestFile.Length, magnet, item.IMDBID, item.Title, item.Year)
 			if err != nil || mkvPath == "" {
+				// No stub came of it: the torrent goes unless something else cites it.
+				_, _ = e.dropTorrent(ctx, hash)
 				continue
 			}
 

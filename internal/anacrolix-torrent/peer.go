@@ -77,20 +77,16 @@ type (
 		// by t.cl's lock.
 		requestMeanLatency *expAvgMeasurement
 		// gradient2Limit, when Gradient2 is on, sizes the request queue from the closed-loop
-		// Netflix Gradient2 limiter. Lazily created. Guarded by t.cl's lock.
+		// Gradient2 limiter. Lazily created. Guarded by t.cl's lock.
 		gradient2Limit *gradient2
 		// gradient2Window wraps gradient2Limit when Gradient2Windowed is on. Guarded by t.cl's lock.
 		gradient2Window *windowedGradient2
-		// Recent-throughput EWMA for outlier ejection (see maybeEjectOutlierPeer); unlike
+		// Recent-throughput EWMA for /metrics (see samplePeerEwma); unlike
 		// downloadRate()'s lifetime average, this reflects current behavior. Guarded by t.cl's lock.
 		ewmaRate         float64
 		ewmaSeeded       bool // false until first sample - distinguishes "no data" from a real zero rate
 		ewmaLastBytes    int64
 		ewmaLastSampleAt time.Time
-		// ewmaPressureSeen is true when the most recent sample was taken while the torrent was
-		// demanding throughput (warmup or playback pressure). Only then does the rate reflect
-		// what the peer can give rather than what we happened to ask for.
-		ewmaPressureSeen bool
 
 		// Stuff controlled by the local peer.
 		needRequestUpdate    string
@@ -121,6 +117,9 @@ type (
 		peerInterested bool
 		peerChoking    bool
 		peerRequests   map[Request]*peerRequestState
+		// Unread requests in arrival order, the order alloclim grants their reservations. Entries
+		// removed or replaced in peerRequests are skipped when popped.
+		peerRequestOrder []queuedPeerRequest
 		// True while the single request-serving goroutine is running. Guarded by the client lock.
 		peerRequestServerRunning bool
 		PeerPrefersEncryption    bool // as indicated by 'e' field in extension handshake
@@ -138,6 +137,11 @@ type (
 	}
 
 	PeerSource string
+
+	queuedPeerRequest struct {
+		r     Request
+		state *peerRequestState
+	}
 
 	peerRequestState struct {
 		data             []byte
@@ -363,6 +367,7 @@ func (p *Peer) close() {
 	for _, prs := range p.peerRequests {
 		prs.allocReservation.Drop()
 	}
+	p.peerRequestOrder = nil
 	p.peerImpl.onClose()
 	if p.t != nil {
 		p.t.decPeerPieceAvailability(p)

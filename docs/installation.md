@@ -35,7 +35,6 @@ docker run -d \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --cap-add NET_ADMIN \
-  -v /path/to/config.json:/config.json \
   -v /path/to/state:/state \
   -v /mnt/tiramisu-mkv-real:/mnt/tiramisu-mkv-real \
   -v /mnt/tiramisu-mkv-virtual:/mnt/tiramisu-mkv-virtual:rshared \
@@ -45,21 +44,23 @@ docker run -d \
 
 Or use `--privileged` as a simpler alternative to the individual capabilities (e.g. on a Raspberry Pi where the container is fully trusted). In practice `--cap-add SYS_ADMIN`/`NET_ADMIN` alone have been reported insufficient on some Ubuntu hosts — if the container starts cleanly but the virtual directory stays empty, use `--privileged`.
 
-`config.json` must be volume-mounted at `/config.json` (the default `MKV_PROXY_CONFIG_PATH`). Use `config.json.example` as the starting point. Do not mount it `:ro`: the Control Panel writes settings back to this file, and a read-only mount makes every save fail.
+The configuration lives in `/state/STATE/tiramisu.db`: no config file is required, and a first start without one uses the defaults, set from the Control Panel. To start from a file, put a `config.json` (from `config.json.example`) in the `/state` directory: it is imported on the first start and renamed `config.json.imported-<date>`. A `config.json` mounted at `/config.json`, as older versions required, still works: it is imported once and then ignored until it changes, so it can be removed. See [config.json: import only](configuration.md#configjson-import-only).
 
 **Mount a volume on `/state`.** Everything that must outlive the container lives there:
 
 | Path | Holds |
 |------|-------|
-| `/state/config.db` | Torrent list, and GoStorm settings when `StoreSettingsInJson` is off |
-| `/state/settings.json` | GoStorm settings: peer port, cache size, connection limit |
-| `/state/STATE/` | Inode map and sync caches |
+| `/state/STATE/` | The configuration and its history (`tiramisu.db`, with `config.last.json` as a copy), the torrent list and the Tentacle settings (peer port, cache size, connection limit), inode map and sync caches |
 | `/state/logs/` | Log files the Control Panel tails |
 | `/state/blocklist` | The downloaded IP blocklist |
+
+Upgrading to v1.13.0 keeps everything: the same `tiramisu.db`, library and stubs. A `/state/settings.json` from an older install is imported on the first start and renamed `settings.json.migrated-<date>`. Up to v1.11.17 the torrent list was in `/state/config.db` (BBolt), and later versions up to v1.12 import it on their first start. v1.13.0 no longer reads it: if a `config.db` was never imported, the start stops and says so. Run `mrrobotogit/tiramisu:v1.12.03` once with the same volumes, then the new image. A `config.db` left behind after an import is ignored and can be deleted.
 
 Mount a host directory there and everything survives `docker rm`. Without that volume the peer port, the torrent list and every other setting are discarded when the container is removed, and the next `docker run` starts from the defaults; the container prints a warning on startup when it detects this. `/state` is the default, so `TIRAMISU_ROOT_PATH` only needs setting to move the whole directory elsewhere, and `TIRAMISU_STATE_DIR` / `TIRAMISU_LOG_DIR` default to `STATE/` and `logs/` underneath it.
 
 Do not mount a named or anonymous Docker volume expecting the warning to catch a mistake: an anonymous volume looks mounted, but a fresh `docker run` attaches a new empty one. Use a host path.
+
+**HTTPS in Docker.** If you turn on HTTPS (**Control Panel → Access → HTTPS**), add the host's IP or name to **Extra hostnames**: the container's own address is not what your devices use, and it changes on every re-creation. The local CA and the certificate live in `/state/STATE/tls/`, so they survive updates and devices do not have to trust a new CA. The port mapping stays `-p 9080:9080`.
 
 **Updating the container.** Unmount the virtual directory between removing the old container and starting the new one: Docker refuses to bind-mount over the FUSE mount the previous container left behind.
 

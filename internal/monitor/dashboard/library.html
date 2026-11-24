@@ -785,7 +785,7 @@
   async function railStatus() {
     try {
       const h = await (await fetch('/api/health')).json();
-      const ok = h.gostorm && h.gostorm.ok;
+      const eng = h.tentacle || h.gostorm, ok = eng && eng.ok;
       el('rail-lamp').className = 'lamp ' + (ok ? 'run' : 'err pulse');
       el('rail-state').textContent = ok ? 'Engine online' : 'Engine unreachable';
     } catch (e) { }

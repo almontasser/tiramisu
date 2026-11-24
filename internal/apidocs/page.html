@@ -86,17 +86,18 @@
       <a href="/control#streaming"><span class="num">01</span>Streaming &amp; FUSE</a>
       <a href="/control#network"><span class="num">02</span>Network &amp; VPN</a>
       <a href="/control#sources"><span class="num">03</span>Sources &amp; Media</a>
-      <a href="/control#engine"><span class="num">04</span>Engine</a>
+      <a href="/control#engine"><span class="num">04</span>Tentacle</a>
       <a href="/control#release"><span class="num">05</span>Release Selection</a>
       <a href="/control#scheduler"><span class="num">06</span>Scheduler</a>
       <a href="/control#access"><span class="num">07</span>Access</a>
+      <a href="/control#history"><span class="num">08</span>History</a>
     </nav>
     <nav class="nav">
       <span class="label">Reference</span>
       <a href="/api-docs" class="active"><span class="num">{}</span>API</a>
     </nav>
     <div class="rail-foot">
-      <div class="row"><span class="lamp run" id="rail-lamp"></span><span class="small" style="font-weight:500" id="rail-state">Engine online</span></div>
+      <div class="row"><span class="lamp run" id="rail-lamp"></span><span class="small" style="font-weight:500" id="rail-state">Tentacle online</span></div>
       <span class="mono faint small" id="rail-version">—</span>
       <a class="row" id="rail-update" hidden href="https://github.com/MrRobotoGit/tiramisu/releases/latest" target="_blank" rel="noopener"><span class="chip-tag">Update</span><span class="txt small"></span></a>
       <hr>
@@ -117,7 +118,7 @@
       <button type="button" class="btn sm menu-btn" onclick="TiramisuUI.toggleRail(true)" aria-label="Open navigation">≡</button>
       <span class="crumb hide-sm">Reference &nbsp;/&nbsp; API</span>
       <span class="spacer"></span>
-      <div class="search hide-sm"><div class="input"><span class="faint" aria-hidden="true">⌕</span><input type="search" id="filter" placeholder="Filter endpoints…" autocomplete="off" aria-label="Filter endpoints"><span class="kbd">/</span></div></div>
+      <div class="search hide-sm"><div class="input"><svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true" style="flex:0 0 13px"><circle cx="5.5" cy="5.5" r="4.5" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".6"/><path d="M9 9l3.2 3.2" stroke="currentColor" stroke-width="1.3" opacity=".6"/></svg><input type="search" id="filter" placeholder="Filter endpoints…" autocomplete="off" aria-label="Filter endpoints"><span class="kbd">/</span></div></div>
       <a class="btn sm ghost" href="https://github.com/MrRobotoGit/tiramisu/blob/main/docs/api.md" target="_blank" rel="noopener"><span class="ico">↗</span><span class="hide-sm">api.md on GitHub</span></a>
     </header>
 
@@ -175,7 +176,7 @@ mcp_servers:
         <div class="codes" style="flex-basis:100%"><span class="label">Any endpoint</span>{{range .Common}}<span><b>{{.Code}}</b>{{.Desc}}</span>{{end}}</div>
       </div>
 
-      <div class="input filter-m"><span class="faint" aria-hidden="true">⌕</span><input type="search" id="filter-m" placeholder="Filter endpoints…" autocomplete="off" aria-label="Filter endpoints"></div>
+      <div class="input filter-m"><svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true" style="flex:0 0 13px"><circle cx="5.5" cy="5.5" r="4.5" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".6"/><path d="M9 9l3.2 3.2" stroke="currentColor" stroke-width="1.3" opacity=".6"/></svg><input type="search" id="filter-m" placeholder="Filter endpoints…" autocomplete="off" aria-label="Filter endpoints"></div>
 
       <nav class="jump" aria-label="Groups">
         <span class="label">Jump to</span>
@@ -271,9 +272,9 @@ mcp_servers:
   fetch('/api/health').then(r => r.ok ? r.json() : null).then(h => {
     if (!h) return;
     TiramisuUI.setUptime(h.uptime);
-    const ok = h.gostorm && h.gostorm.ok;
+    const ok = h.tentacle && h.tentacle.ok;
     document.getElementById('rail-lamp').className = 'lamp ' + (ok ? 'run' : 'err pulse');
-    document.getElementById('rail-state').textContent = ok ? 'Engine online' : 'Engine unreachable';
+    document.getElementById('rail-state').textContent = ok ? 'Tentacle online' : 'Tentacle unreachable';
   }).catch(() => { }).finally(() => TiramisuUI.checkUpdate());
 })();
 </script>

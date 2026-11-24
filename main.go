@@ -24,8 +24,6 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,23 +32,20 @@ import (
 	"time"
 	"tiramisu/internal/apidocs"
 	"tiramisu/internal/auth"
+	"tiramisu/internal/bridge"
 	"tiramisu/internal/cache"
 	"tiramisu/internal/catalog"
 	"tiramisu/internal/catalog/mediaserver"
 	"tiramisu/internal/config"
+	"tiramisu/internal/engine"
+	engset "tiramisu/internal/engine/settings"
+	"tiramisu/internal/enginehost"
 	"tiramisu/internal/geoip"
-	server "tiramisu/internal/gostorm"
-	"tiramisu/internal/gostorm/native"
-	"tiramisu/internal/gostorm/settings"
-	"tiramisu/internal/gostorm/torr"
-	torrstor "tiramisu/internal/gostorm/torr/storage/torrstor"
-	torrutils "tiramisu/internal/gostorm/torr/utils"
-	tsutils "tiramisu/internal/gostorm/utils"
-	"tiramisu/internal/gostorm/web"
 	"tiramisu/internal/library"
 	"tiramisu/internal/lockmgr"
 	"tiramisu/internal/mcp"
 	"tiramisu/internal/metadb"
+	"tiramisu/internal/mkvinfo"
 	"tiramisu/internal/monitor/clients"
 	"tiramisu/internal/monitor/collector"
 	"tiramisu/internal/monitor/dashboard"
@@ -61,6 +56,7 @@ import (
 	"tiramisu/internal/prowlarr"
 	"tiramisu/internal/ratelimit"
 	"tiramisu/internal/registry"
+	"tiramisu/internal/streamer"
 	syncercache "tiramisu/internal/syncer/cache"
 	"tiramisu/internal/syncer/engines"
 	"tiramisu/internal/syncer/scheduler"
@@ -69,10 +65,9 @@ import (
 	"tiramisu/internal/updater"
 	"tiramisu/internal/vfs"
 	"tiramisu/internal/warmup"
+	"tiramisu/internal/webtls"
 	"tiramisu/internal/webui"
 
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
@@ -96,13 +91,23 @@ var globalDirCache *vfs.DirCache
 
 // Global peer-based preloader (FASE 2 - Performance)
 var peerPreloader *preload.PeerPreloader
-var nativeBridge *native.NativeClient
+var nativeBridge *bridge.NativeClient
+
+// eng is the in-process engine; nil in tests and simulators (its lookups are nil-safe).
+var eng *engine.Engine
+var engineHost *enginehost.Host
+
+// engineStateDir holds config.db, settings.json, trackers.txt and the blocklist (--path).
+var engineStateDir string
 
 var globalCleanupManager *CleanupManager
 var globalTorrentRemover *TorrentRemover
 var globalConfig atomic.Pointer[config.Config]
 
 func gc() *config.Config { return globalConfig.Load() }
+
+// configBoot holds the state DB and the configuration store opened at start-up.
+var configBoot *config.Boot
 
 // Global Prowlarr client for indexer queries (nil when disabled).
 var prowlarrClient *prowlarr.Client
@@ -124,7 +129,7 @@ var tailFillTargets sync.Map // path -> tailFillTarget
 type PlaybackState struct {
 	mu     sync.RWMutex
 	Path   string
-	Hash   string // InfoHash for GoStorm priority management
+	Hash   string // InfoHash for Tentacle priority management
 	ImdbID string // IMDB ID from MKV line 4, used for webhook matching
 	// ExternalID/ExternalIDNamespace carry the audio projection's registered
 	// identity ("musicbrainz", "asin", ...) so a music webhook can match the
@@ -135,6 +140,7 @@ type PlaybackState struct {
 	ConfirmedAt         time.Time // Set when Plex webhook arrives
 	IsHealthy           bool      // Confirmed by Plex
 	IsStopped           bool      // Set on explicit media.stop webhook
+	stopIgnoredAt       time.Time // media.stop guarded while a handle was open; applied if the last one closes soon after
 	// V750: Inferred playback detection (self-healing when webhook is lost)
 	ReadCount   int64
 	LastSeekOff int64
@@ -192,6 +198,34 @@ func (ps *PlaybackState) LastSignOfLife() time.Time {
 		return ps.ConfirmedAt
 	}
 	return ps.OpenedAt
+}
+
+// ignoredStopWindow bounds how long a guarded media.stop waits for the last handle to close.
+const ignoredStopWindow = 15 * time.Second
+
+// deferredStopGrace: after the last close a guarded stop waits this long and is dropped if the file
+// reopens, since Plex closes and reopens mid-playback (V306).
+var deferredStopGrace = 5 * time.Second
+
+func (ps *PlaybackState) confirmedAfter(t time.Time) bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	return ps.ConfirmedAt.After(t)
+}
+
+func (ps *PlaybackState) noteIgnoredStop(now time.Time) {
+	ps.mu.Lock()
+	ps.stopIgnoredAt = now
+	ps.mu.Unlock()
+}
+
+// takeIgnoredStop consumes a guarded media.stop still within the window and not superseded by a later confirmation.
+func (ps *PlaybackState) takeIgnoredStop(now time.Time) bool {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	at := ps.stopIgnoredAt
+	ps.stopIgnoredAt = time.Time{}
+	return !at.IsZero() && now.Sub(at) <= ignoredStopWindow && !ps.ConfirmedAt.After(at)
 }
 
 func (ps *PlaybackState) GetStatus() bool {
@@ -437,7 +471,7 @@ var pumpCreationMu sync.Mutex
 // NativePumpState tracks a shared pump across multiple handles for the same file.
 type NativePumpState struct {
 	cancel           context.CancelFunc
-	reader           *native.NativeReader
+	reader           *bridge.NativeReader
 	path             string
 	refCount         int32
 	playerOff        int64       // last known player position, saved on handle release
@@ -504,20 +538,13 @@ func resolveTargetFile(url string, targetSize int64, physicalPath string) (strin
 
 	section, _ := library.SectionForPath(physicalSourcePath, physicalPath)
 
-	// The engine's list is shared state, so it is copied before sorting. IDs are
-	// assigned from the sorted order, the same way GoStorm assigns them. Audio never
-	// reads this list - its identity comes from the registry - so a music scan does
-	// not pay for a copy and sort of the whole resident file list on every Open.
+	// The engine lists the files in ID order (fileorder). Audio never reads this list - its
+	// identity comes from the registry - so a music scan does not pay for it on every Open.
 	var files []library.TorrentFile
 	if !library.IsAudioSection(section) {
-		if t := web.BTS.GetTorrent(metainfo.NewHashFromHex(hashStr)); t != nil {
-			resident := append([]*torrent.File(nil), t.Files()...)
-			sort.Slice(resident, func(i, j int) bool {
-				return tsutils.CompareStrings(resident[i].Path(), resident[j].Path())
-			})
-			files = make([]library.TorrentFile, 0, len(resident))
-			for i, f := range resident {
-				files = append(files, library.TorrentFile{Index: i + 1, Path: f.Path(), Length: f.Length()})
+		if t := eng.Get(hashStr); t != nil {
+			for _, f := range t.Files() {
+				files = append(files, library.TorrentFile{Index: f.ID, Path: f.Path, Length: f.Length})
 			}
 		}
 	}
@@ -1188,19 +1215,13 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 	forceCloseVirtualFile(fullPath)
 	tailFillTargets.Delete(fullPath)
 
-	// Extract hash and remove torrent from GoStorm
-	success, blacklisted, err := globalTorrentRemover.RemoveTorrentFromFile(fullPath)
+	// Blacklist first, the torrent last: a crash in between leaves at most an orphan
+	// torrent, never a stub without one that the next sync would rehydrate.
+	hash, blacklisted, err := globalTorrentRemover.IdentifyAndBlacklist(fullPath)
 	if err != nil {
-		logger.Printf("UNLINK ERROR: failed to remove torrent: %v", err)
-		// Continue with file deletion even if torrent removal fails
-	} else if success {
-		logger.Printf("UNLINK: torrent successfully removed from GoStorm")
-	} else if blacklisted {
-		// Also reached when an audio projection still owns the torrent, which the
-		// guard logs with its own reason.
-		logger.Printf("UNLINK: torrent not removed (already gone, or still referenced), but hash was blacklisted")
-	} else {
-		logger.Printf("UNLINK: torrent not removed and hash not blacklisted (see the warning above)")
+		logger.Printf("UNLINK ERROR: cannot identify the torrent: %v", err)
+	} else if !blacklisted {
+		logger.Printf("UNLINK: hash not blacklisted (see the warning above)")
 	}
 
 	// Delete physical .mkv file
@@ -1210,6 +1231,17 @@ func (d *VirtualDirNode) Unlink(ctx context.Context, name string) syscall.Errno 
 	}
 
 	registry.RemoveFromRegistry(fullPath)
+	if hash != "" {
+		released, err := globalTorrentRemover.ReleaseHash(hash)
+		switch {
+		case err != nil:
+			logger.Printf("UNLINK ERROR: torrent %s not removed: %v", hash[:8], err)
+		case released:
+			logger.Printf("UNLINK: torrent successfully removed from Tentacle")
+		default:
+			logger.Printf("UNLINK: torrent %s kept, still referenced", hash[:8])
+		}
+	}
 	globalDirCache.Delete(d.physicalPath)
 	// Same reason as the sync removal path: a lookup by exact path is answered from
 	// the metadata cache, which would keep serving this file for the whole TTL.
@@ -1376,8 +1408,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			state.mu.Unlock()
 
 			if isHealthy && recentlyConfirmed && state.Hash != "" {
-				hHash := metainfo.NewHashFromHex(state.Hash)
-				if t := web.BTS.GetTorrent(hHash); t != nil {
+				if t := eng.Get(state.Hash); t != nil {
 					if !t.IsPriority.Load() {
 						t.IsPriority.Store(true)
 						logger.Printf("[NativeBridge] Priority RESTORED for Silent Re-Open: %s", state.Hash)
@@ -1492,7 +1523,7 @@ type MkvHandle struct {
 	monitorStarted   bool
 	lastGlobalUpdate time.Time
 
-	nativeReader *native.NativeReader
+	nativeReader *bridge.NativeReader
 	hash         string
 	magnet       string
 	fileID       int
@@ -1524,6 +1555,10 @@ type MkvHandle struct {
 	streamedOnce   atomic.Bool  // read sequentially like a player at least once
 	openedAt       time.Time    // set once at Open
 	wakeWait       *pendingWake // activation still running when Open returned; set once
+	bitrateKnown    atomic.Bool  // the film bitrate reached the pump reader
+	bitrateTried    atomic.Int64 // unix nanos of the last header parse attempt
+	mp4HeadTried    atomic.Bool  // an MP4's larger head was searched for its moov once
+	mp4TailTried    atomic.Bool  // an MP4's SSD tail was searched for its moov once
 }
 
 // pendingWake is a torrent activation Open stopped waiting for.
@@ -1711,9 +1746,9 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 		// return (before the teardown defer) leaked the master slot.
 		pumpReader := nativeBridge.NewStreamReader(finalHash, fileIdx, h.size)
 		h.nativeReader = pumpReader
-		if tr := torr.PeekTorrent(finalHash); tr != nil && tr.Torrent != nil {
-			if info := tr.Torrent.Info(); info != nil && info.PieceLength > 0 {
-				pl := int64(info.PieceLength)
+		if t := eng.Get(finalHash); t != nil {
+			if ts := t.Store(); ts != nil && ts.PieceLen() > 0 {
+				pl := ts.PieceLen()
 				pumpReader.SetPieceLen(pl)
 				raCache.SetPieceLen(h.path, pl)
 			}
@@ -1833,7 +1868,7 @@ func (h *MkvHandle) startNativePump(finalHash string, fileIdx int) {
 // nativePump reads continuously from the Native pipe and fills raCache.
 // sharedState guards against orphan-delete in defer. pumpReader is captured by the caller
 // so a concurrent Release cannot nil it out from under the goroutine.
-func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeReader, startOffset int64, sharedState *NativePumpState) {
+func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *bridge.NativeReader, startOffset int64, sharedState *NativePumpState) {
 	// The master slot must be returned on every exit, including the early return below.
 	// It used to be released only by the teardown defer, which the nil-reader return path
 	// never reached, leaking one slot per event.
@@ -2050,7 +2085,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 						// pumpReader, not h.nativeReader: Release nils the field while the pump
 						// keeps its captured copy alive, so the field can be nil right here.
 						pumpReader.Interrupt()
-						torrstor.ResetShield()
+						eng.ResetShield(h.hash)
 						lastRevival = now
 						watchSamples = watchSamples[:0]
 						logger.Printf("[StarvationWatchdog] Revival: pump %dMB vs player %dMB (rates %.1f/%.1f MB/s) — interrupt+shield reset",
@@ -2116,6 +2151,65 @@ func probePumpParked(confirmedOrInferred bool, playerOff, offset, chunkSize int6
 }
 
 // nativePumpChunk reads a single chunk from the Native pipe into raCache.
+// filmHeaderProbe is how much of the file head the MKV Info lookup reads.
+const filmHeaderProbe = 256 << 10
+
+// filmBitrateOf reads the film's duration from the SSD head or the read-ahead cache (a var: the
+// FUSE simulator serves no real MKV). An MP4 named .mkv keeps it in its moov, in the head or at
+// the end of the file.
+var filmBitrateOf = func(h *MkvHandle) (int64, bool) {
+	head := make([]byte, filmHeaderProbe)
+	n := 0
+	warm := warmup.DiskWarmup != nil && h.usesWarmup && h.hash != ""
+	if warm {
+		n, _ = warmup.DiskWarmup.ReadAt(h.hash, h.fileID, head, 0)
+	}
+	if n < len(head) {
+		n = max(n, raCache.CopyTo(h.path, 0, int64(len(head))-1, head))
+	}
+	if b, ok := mkvinfo.Bitrate(head[:n], h.size); ok || n < 8 || string(head[4:8]) != "ftyp" {
+		return b, ok
+	}
+	// MP4: the moov sits in a larger head (fast-start) or at the end of the file. Each is
+	// searched once, when its 16 MB are on the SSD; an MP4 without a duration stays unknown.
+	if !warm {
+		return 0, false
+	}
+	span := min(warmup.TailWarmupSize, h.size)
+	if warmup.DiskWarmup.GetAvailableRange(h.hash, h.fileID) >= span && h.mp4HeadTried.CompareAndSwap(false, true) {
+		big := make([]byte, span)
+		nb, _ := warmup.DiskWarmup.ReadAt(h.hash, h.fileID, big, 0)
+		if b, ok := mkvinfo.BitrateOf(big[:nb], nil, h.size); ok {
+			return b, ok
+		}
+	}
+	if warmup.DiskWarmup.TailReady(h.hash, h.fileID) && h.mp4TailTried.CompareAndSwap(false, true) {
+		tail := make([]byte, span)
+		m, _ := warmup.DiskWarmup.ReadTail(h.hash, h.fileID, tail, h.size-span, h.size)
+		return mkvinfo.BitrateOf(nil, tail[:m], h.size)
+	}
+	return 0, false
+}
+
+// applyFilmBitrate gives the pump's stream the film's bitrate (size / MKV duration), from the
+// SSD head or the read-ahead cache, retried every few seconds until the header is local.
+func (h *MkvHandle) applyFilmBitrate(r *bridge.NativeReader) {
+	if h.bitrateKnown.Load() || !strings.HasSuffix(h.path, ".mkv") {
+		return
+	}
+	now := time.Now().UnixNano()
+	if last := h.bitrateTried.Load(); now-last < int64(5*time.Second) || !h.bitrateTried.CompareAndSwap(last, now) {
+		return
+	}
+	b, ok := filmBitrateOf(h)
+	if !ok {
+		return
+	}
+	r.SetBitrate(b)
+	h.bitrateKnown.Store(true)
+	logger.Printf("[Streamer] Film bitrate %.1f MB/s for %s", float64(b)/(1<<20), filepath.Base(h.path))
+}
+
 // pumpLeadLimit caps the pump's lead so the player stays inside the raCache window. The cache
 // holds the last `budget` bytes the pump wrote, i.e. [pumpOff-budget, pumpOff]; the pump stops
 // only once diff EXCEEDS the limit, so its settled lead is limit+chunkSize. With limit == budget
@@ -2142,7 +2236,7 @@ func pumpLeadLimit(budget, chunkSize int64) int64 {
 	return lead
 }
 
-func (h *MkvHandle) nativePumpChunk(r *native.NativeReader, offset, chunkSize, playerOff int64) (stop bool, nextOffset int64) {
+func (h *MkvHandle) nativePumpChunk(r *bridge.NativeReader, offset, chunkSize, playerOff int64) (stop bool, nextOffset int64) {
 	// Don't pump beyond file size
 	if offset >= h.size {
 		return true, offset
@@ -2172,10 +2266,12 @@ func (h *MkvHandle) nativePumpChunk(r *native.NativeReader, offset, chunkSize, p
 	// via the same mechanism already used for warmup - see SetPlaybackPressure. Called on every
 	// chunk like SetWarmupActive already is; both just store atomics, cheap either way.
 	if h.hash != "" {
-		if tr := torr.PeekTorrent(h.hash); tr != nil && tr.Torrent != nil {
-			tr.Torrent.SetPlaybackPressure(diff < budget*20/100, offset)
+		if t := eng.Get(h.hash); t != nil {
+			t.SetPlaybackPressure(diff < budget*20/100, offset)
 		}
 	}
+	r.SetPlayerLead(diff) // the streamer's stall risk counts what the pump already holds
+	h.applyFilmBitrate(r)
 
 	end := offset + chunkSize
 	if end > h.size {
@@ -2267,31 +2363,32 @@ func pieceMapFor(hash string) *piecemap.Map {
 	if h == nil || isAudioSectionPath(h.path) {
 		return nil
 	}
-	tr := torr.PeekTorrent(hash)
-	if tr == nil || tr.Torrent == nil || tr.Torrent.Info() == nil {
+	tr := eng.Get(hash)
+	if tr == nil || tr.Store() == nil {
 		return nil
 	}
-	var file *torrent.File
-	files := tr.Torrent.Files()
-	if i := h.fileID - 1; i >= 0 && i < len(files) && files[i].Length() == h.size {
-		file = files[i]
-	} else {
-		for _, f := range files {
-			if f.Length() == h.size {
-				file = f
-				break
-			}
+	var file *engine.File
+	files := tr.Files()
+	for i := range files {
+		if files[i].ID == h.fileID && files[i].Length == h.size {
+			file = &files[i]
+			break
+		}
+	}
+	for i := range files {
+		if file == nil && files[i].Length == h.size {
+			file = &files[i]
 		}
 	}
 	if file == nil {
 		return nil
 	}
 	src := piecemap.Source{
-		Hash: hash, PieceLen: int64(tr.Torrent.Info().PieceLength), FileOffset: file.Offset(), FileSize: h.size, PlayerOff: off,
+		Hash: hash, PieceLen: tr.Store().PieceLen(), FileOffset: file.Offset, FileSize: h.size, PlayerOff: off,
 		// What the engine keeps ahead of a player: the FUSE read-ahead budget plus the piece cache.
 		SpanBytes: int64(gc().ReadAheadBudget),
 		Window: func(first, n int) []piecemap.Piece {
-			ws := tr.Torrent.PieceWindow(first, n)
+			ws := tr.PieceWindow(first, n)
 			out := make([]piecemap.Piece, len(ws))
 			for i, p := range ws {
 				out[i] = piecemap.Piece{Complete: p.Complete, Length: p.Length, Missing: p.Missing, Deadline: p.Deadline}
@@ -2313,8 +2410,8 @@ func pieceMapFor(hash string) *piecemap.Map {
 			return e <= head || (tailFrom >= 0 && o >= tailFrom) || ram(o, e)
 		}
 	}
-	if settings.BTsets != nil {
-		src.SpanBytes += settings.BTsets.CacheSize
+	if eng != nil {
+		src.SpanBytes += eng.Config().CacheSize
 	}
 	return piecemap.Build(src)
 }
@@ -2329,8 +2426,8 @@ func (h *MkvHandle) boostColdStart(off int64) {
 		return
 	}
 	go func() {
-		if tr := torr.PeekTorrent(h.hash); tr != nil {
-			tr.BoostColdStart()
+		if t := eng.Get(h.hash); t != nil {
+			t.BoostColdStart()
 		}
 	}()
 }
@@ -2725,8 +2822,8 @@ func forceTorrentWarmupActive(hash string, fileID int) {
 	if warmup.DiskWarmup == nil {
 		return
 	}
-	if tr := torr.PeekTorrent(hash); tr != nil && tr.Torrent != nil {
-		tr.Torrent.SetWarmupActive(true, fileID)
+	if t := eng.Get(hash); t != nil {
+		t.SetWarmupActive(true, t.EngineFileIndex(fileID))
 	}
 }
 
@@ -3061,7 +3158,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 							if fetchEnd-goOff+1 < limit {
 								limit = fetchEnd - goOff + 1
 							}
-							n, err := nativeBridge.FetchBlock(goHash, goFileID, goOff, (*bufPtr)[:limit])
+							n, err := nativeBridge.PrefetchBlock(goHash, goFileID, goOff, (*bufPtr)[:limit])
 							if err == nil && n > 0 {
 								raCache.Put(h.path, goOff, goOff+int64(n)-1, (*bufPtr)[:n])
 								logger.Printf("[WarmLanding] Pre-fetched chunk at %dMB for new handle", goOff/(1024*1024))
@@ -3107,7 +3204,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 		// The pump follows the primary: a secondary's seek has nothing of the pump to interrupt.
 		if h.isPrimaryHandle.Load() && (ps == nil || !ps.interruptPending.Swap(true)) {
 			seekReader.Interrupt()
-			torrstor.ResetShield()
+			eng.ResetShield(h.hash)
 			h.state.Store(stateStreaming)
 			logger.Printf("[V286b] Interrupt pump for seek+shield reset: %dMB → %dMB (%s→%s)",
 				prevOff/(1024*1024), off/(1024*1024), stateName(stateWarmup), stateName(stateStreaming))
@@ -3142,7 +3239,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 							if fetchEnd-goOff+1 < limit {
 								limit = fetchEnd - goOff + 1
 							}
-							n, err := nativeBridge.FetchBlock(goHash, goFileID, goOff, (*bufPtr)[:limit])
+							n, err := nativeBridge.PrefetchBlock(goHash, goFileID, goOff, (*bufPtr)[:limit])
 							if err == nil && n > 0 {
 								raCache.Put(h.path, goOff, goOff+int64(n)-1, (*bufPtr)[:n])
 								logger.Printf("[WarmLanding] Pre-fetched chunk at %dMB for seek target", goOff/(1024*1024))
@@ -3197,8 +3294,8 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			return fuse.ReadResultData(dest[:n]), 0
 		}
 
-		// On SSD tail miss, use stateless FetchBlock to preserve head pump.
-		nFetch, err := nativeBridge.FetchBlock(h.hash, h.fileID, off, dest)
+		// On SSD tail miss, a blocking demand read beside the head pump (the FUSE read waits on it).
+		nFetch, err := nativeBridge.FetchBlockBlocking(h.hash, h.fileID, off, dest)
 		if err == nil && nFetch > 0 {
 			if h.usesWarmup && warmup.DiskWarmup != nil {
 				warmup.DiskWarmup.WriteTail(h.hash, h.fileID, dest[:nFetch], off, h.size)
@@ -3256,7 +3353,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 									limit = fetchEnd - goStart + 1
 								}
 
-								n, err := nativeBridge.FetchBlock(goHash, goFileID, goStart, (*bufPtr)[:limit])
+								n, err := nativeBridge.PrefetchBlock(goHash, goFileID, goStart, (*bufPtr)[:limit])
 								if err == nil && n > 0 {
 									raCache.Put(h.path, goStart, goStart+int64(n)-1, (*bufPtr)[:n])
 								}
@@ -3357,9 +3454,8 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 
 							logger.Printf("[Pump] Upgraded on-the-fly for confirmed playback: %s", filepath.Base(h.path))
 
-							hHash := metainfo.NewHashFromHex(h.hash)
-							if t := web.BTS.GetTorrent(hHash); t != nil {
-								t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
+							if eng.Get(h.hash) != nil {
+								nativeBridge.SetAggressive(h.hash, true, GetEffectiveConcurrencyLimit())
 								logger.Printf("[Pump] Aggressive mode enabled on-the-fly for: %s", h.hash[:8])
 							}
 
@@ -3441,9 +3537,13 @@ pumpSlotResolved:
 			// The leader re-caches its window as it fills, so poll instead of waiting for the
 			// whole window: a follower one FUSE block behind the leader gets its bytes after one
 			// fill step, not after the remaining 15MB.
+			// While blocked here the leader's window stays a demand (FetchAhead demotes it once
+			// its head is delivered); awaitDone releases that on every way out of the wait.
+			awaitDone := nativeBridge.AwaitFill(h.hash, h.fileID, off)
 			leaderDone := false
 			for {
 				if nCopy := raCache.CopyTo(h.path, off, end, dest); nCopy > 0 {
+					awaitDone()
 					fetchFlightDedupCount.Add(1)
 					timing.UsedCache = true
 					timing.BytesRead = nCopy
@@ -3462,10 +3562,12 @@ pumpSlotResolved:
 				case <-fl.done:
 					leaderDone = true // one more CopyTo, then fall through
 				case <-fuseCtx.Done():
+					awaitDone()
 					return nil, syscall.EINTR
 				case <-time.After(20 * time.Millisecond):
 				}
 			}
+			awaitDone()
 			// Leader failed or missed our range — fetch directly, don't re-register.
 		} else {
 			var once sync.Once
@@ -3620,7 +3722,7 @@ DATA_READY:
 								limit = fetchEnd - goStart + 1
 							}
 
-							n, err := nativeBridge.FetchBlock(goHash, goFileID, goStart, (*bufPtr)[:limit])
+							n, err := nativeBridge.PrefetchBlock(goHash, goFileID, goStart, (*bufPtr)[:limit])
 							if err == nil && n > 0 {
 								raCache.Put(h.path, goStart, goStart+int64(n)-1, (*bufPtr)[:n])
 							}
@@ -3687,7 +3789,19 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			// This survives long pauses, buffering gaps, and Apple TV re-reads without
 			// killing the pump and causing freeze on resume.
 			if pbVal, ok := playbackRegistry.Load(h.path); ok {
-				if pbState := pbVal.(*PlaybackState); pbState.IsHealthy {
+				if pbState := pbVal.(*PlaybackState); pbState.GetStatus() && pbState.takeIgnoredStop(time.Now()) {
+					// The stop was guarded only because this handle was still open.
+					path, closed := h.path, time.Now()
+					logger.Printf("[PLEX] Deferred STOP: last handle closed for %s, applying in %s unless it reopens", filepath.Base(path), deferredStopGrace)
+					time.AfterFunc(deferredStopGrace, func() {
+						if anyLiveHandleFor(path) || pbState.confirmedAfter(closed) || !pbState.GetStatus() {
+							logger.Printf("[PLEX] Deferred STOP dropped: %s reopened or confirmed again", filepath.Base(path))
+							return
+						}
+						applyPlexStop(path, pbState, "media.stop (deferred)")
+					})
+					goto skipGrace
+				} else if pbState.IsHealthy {
 					logger.Printf("[V306] Healthy playback — pump stays alive (no grace period) for %s", filepath.Base(h.path))
 					// Stop any pending grace timer from a previous release cycle
 					if oldTimer, ok := pumpTimers.LoadAndDelete(h.path); ok {
@@ -3730,6 +3844,13 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 			})
 			pumpTimers.Store(h.path, t)
 			logger.Printf("[V420] Last handle closed: Shared Pump entering %s grace period for %s", graceDuration, filepath.Base(h.path))
+			// No media.stop may follow (scan, players without webhooks): fill the tail once idle.
+			if v, ok := tailFillTargets.Load(h.path); ok && warmup.DiskWarmup != nil {
+				tgt, path := v.(tailFillTarget), h.path
+				warmup.DiskWarmup.EnsureTailWhenIdle(tgt.hash, tgt.fileID, tgt.size, func() bool {
+					return !anyLiveHandleFor(path) && !hashInPlayback(tgt.hash)
+				})
+			}
 		}
 
 	skipGrace:
@@ -3787,17 +3908,15 @@ func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
 		if val, ok := playbackRegistry.Load(h.path); ok {
 			state := val.(*PlaybackState)
 			if state.Hash != "" {
-				hHash := metainfo.NewHashFromHex(state.Hash)
-
 				// O(1): controlla se altri file dello stesso torrent sono ancora aperti.
 				if globalOpenTracker.IsHashOpen(state.Hash) {
 					// Another file from the same torrent is still open, keep priority.
 					return
 				}
 
-				if t := web.BTS.GetTorrent(hHash); t != nil {
+				if t := eng.Get(state.Hash); t != nil {
 					t.IsPriority.Store(false)
-					t.SetAggressiveMode(false, 0)
+					nativeBridge.SetAggressive(state.Hash, false, 0) // aggrOn is sticky in the streamer
 
 					// Fast-drop scanner handles never confirmed by webhook.
 					scannerDrop := false
@@ -3900,6 +4019,15 @@ type ReadAheadCache struct {
 	isEvicting       int32 // atomic flag prevents concurrent global evictions
 
 	pieceLens sync.Map // path → int64 adaptive chunk size (aligned to piece boundary)
+
+	readers func(path string) []raReader // open readers of a path, for eviction; nil = activeHandles
+}
+
+// raReader is one open handle's position as eviction sees it.
+type raReader struct {
+	off     int64
+	primary bool
+	tail    bool // reading the SSD tail: needs nothing from raCache
 }
 
 // SetPieceLen stores the aligned chunk size for path derived from piece length.
@@ -4235,14 +4363,22 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	// 2. Add new data
 	shard.total += dataSize
 	newUsed := atomic.AddInt64(&c.used, dataSize)
-	responsiveOnly := torrstor.IsResponsive()
+	responsiveOnly := eng.Responsive()
 	shard.buffers[key] = &RaBuffer{start, end, dataCopy, time.Now().UnixNano(), sessID, responsiveOnly}
 
-	// Evict from this shard while over budget; keep last item to avoid evicting the chunk just added.
-	for newUsed > globalLimit && len(shard.order) > 1 {
-		v := shard.order[0]
-		shard.order = shard.order[1:]
-		if old, ok := shard.buffers[v]; ok {
+	// Evict from this shard while over budget, least needed first; never the chunk just added.
+	exhausted := false
+	if newUsed > globalLimit {
+		readers := make(map[string]raPathReaders)
+		for newUsed > globalLimit {
+			i := c.pickVictim(shard, key, globalLimit, readers)
+			if i < 0 {
+				exhausted = true
+				break
+			}
+			v := shard.order[i]
+			shard.order = append(shard.order[:i], shard.order[i+1:]...)
+			old := shard.buffers[v]
 			evictedSize := int64(len(old.data))
 			shard.total -= evictedSize
 			delete(shard.buffers, v)
@@ -4252,7 +4388,7 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 	}
 
 	// Local shard exhausted: trigger global eviction to free stale data from other shards.
-	if newUsed > globalLimit && len(shard.order) <= 1 {
+	if newUsed > globalLimit && exhausted {
 		c.muContext.Lock()
 		ap := c.activePath
 		sid := c.currentSessionID
@@ -4279,6 +4415,116 @@ func (c *ReadAheadCache) Put(p string, start, end int64, d []byte) {
 		}
 		shard.order = newOrder
 	}
+}
+
+// raPathReaders is one path's open readers, resolved once per eviction pass.
+type raPathReaders struct {
+	open          bool  // any handle open on the path
+	anchor        int64 // primary player position as the pump follows it
+	anchorUnknown bool  // the only primaries read the SSD tail
+	secondaries   []int64
+}
+
+func (c *ReadAheadCache) pathReaders(path string) raPathReaders {
+	src := c.readers
+	if src == nil {
+		src = handleReaders
+	}
+	var pr raPathReaders
+	primary, tailPrimary := false, false
+	for _, r := range src(path) {
+		pr.open = true
+		off := max(r.off, 0)
+		switch {
+		case r.tail:
+			if r.primary {
+				tailPrimary = true
+			}
+		case r.primary:
+			primary = true
+			pr.anchor = max(pr.anchor, off)
+		default:
+			pr.secondaries = append(pr.secondaries, off)
+		}
+	}
+	// Mirrors the pump: no streaming primary means it fills from 0, a tail-only one hides its position.
+	pr.anchorUnknown = !primary && tailPrimary
+	return pr
+}
+
+// handleReaders lists the open handles on path; reads only atomics, safe under a shard lock.
+func handleReaders(path string) []raReader {
+	var rs []raReader
+	activeHandles.Range(func(key, _ interface{}) bool {
+		h, ok := key.(*MkvHandle)
+		if ok && h.path == path {
+			off := atomic.LoadInt64(&h.lastOff)
+			rs = append(rs, raReader{off: off, primary: h.isPrimaryHandle.Load(), tail: shouldServeTailFromSSD(off, h.size, warmup.TailWarmupSize)})
+		}
+		return true
+	})
+	return rs
+}
+
+// Eviction tiers, lowest evicted first.
+const (
+	raTierUnneeded      = iota // no open handle, behind every reader, or beyond what any reader needs
+	raTierPrimaryAhead         // pump lead ahead of the primary, farthest first
+	raTierSecondaryNext        // the chunk a secondary is reading and the next one
+	raTierPrimaryNext          // the chunk the primary is reading and the next one
+)
+
+// pickVictim returns the index in s.order of the chunk to evict, or -1 if only keep is left.
+func (c *ReadAheadCache) pickVictim(s *raShard, keep string, budget int64, cache map[string]raPathReaders) int {
+	best, bestTier, bestStart := -1, 0, int64(0)
+	for i := 0; i < len(s.order); i++ {
+		k := s.order[i]
+		b, ok := s.buffers[k]
+		if !ok {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			i--
+			continue
+		}
+		if k == keep {
+			continue
+		}
+		path := k[:strings.LastIndexByte(k, ':')]
+		pr, ok := cache[path]
+		if !ok {
+			pr = c.pathReaders(path)
+			cache[path] = pr
+		}
+		tier := raChunkTier(pr, b.start, b.end, c.ChunkSize(path), budget)
+		if tier == raTierUnneeded {
+			return i // oldest unneeded chunk
+		}
+		if best < 0 || tier < bestTier || (tier == bestTier && tier == raTierPrimaryAhead && b.start > bestStart) {
+			best, bestTier, bestStart = i, tier, b.start
+		}
+	}
+	return best
+}
+
+func raChunkTier(pr raPathReaders, start, end, chunk, budget int64) int {
+	if !pr.open {
+		return raTierUnneeded
+	}
+	if pr.anchorUnknown {
+		return raTierPrimaryAhead
+	}
+	tier := raTierUnneeded
+	if end >= pr.anchor && start < pr.anchor+2*chunk {
+		return raTierPrimaryNext
+	}
+	if end >= pr.anchor && start <= pr.anchor+budget {
+		tier = raTierPrimaryAhead
+	}
+	for _, off := range pr.secondaries {
+		if end >= off && start < off+2*chunk {
+			return raTierSecondaryNext
+		}
+	}
+	return tier
 }
 
 // Stats returns read-ahead cache statistics for metrics endpoint
@@ -4478,6 +4724,33 @@ func anyLiveHandleFor(path string) bool {
 			return false
 		}
 		return true
+	})
+	return found
+}
+
+// hashInPlayback reports whether a confirmed playback is reading a file of the torrent.
+func hashInPlayback(hash string) bool {
+	found := false
+	playbackRegistry.Range(func(_, val interface{}) bool {
+		ps := val.(*PlaybackState)
+		ps.mu.RLock()
+		found = ps.Hash == hash && ps.IsHealthy
+		ps.mu.RUnlock()
+		return !found
+	})
+	return found
+}
+
+// hashPlaying reports whether a file of the torrent is in playback, confirmed by a webhook or
+// inferred from its reads (players without webhooks).
+func hashPlaying(hash string) bool {
+	found := false
+	playbackRegistry.Range(func(_, val interface{}) bool {
+		ps := val.(*PlaybackState)
+		if ps.Hash == hash && (ps.GetStatus() || ps.IsInferredPlayback()) {
+			found = true
+		}
+		return !found
 	})
 	return found
 }
@@ -4772,10 +5045,9 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if exactState.Hash != "" {
-				h := metainfo.NewHashFromHex(exactState.Hash)
-				if t := web.BTS.GetTorrent(h); t != nil {
+				if t := eng.Get(exactState.Hash); t != nil {
 					t.IsPriority.Store(true)
-					t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
+					nativeBridge.SetAggressive(exactState.Hash, true, GetEffectiveConcurrencyLimit())
 					if !wasHealthy {
 						logger.Printf("[PLEX] High Priority + Aggressive Mode for: %s", exactState.Hash)
 					}
@@ -4898,50 +5170,55 @@ func handlePlexWebhook(w http.ResponseWriter, r *http.Request) {
 		// ignoring them would leave the pump alive until the 2h idle timeout (V262).
 		if stopMatch != "" && stopState != nil && !matchByBasename && !matchByIdentity && !imdbUnique && anyLiveHandleFor(stopMatch) {
 			logger.Printf("[PLEX] STOP ignored for %s: fuzzy or ambiguous match with handle still open", filepath.Base(stopMatch))
+			stopState.noteIgnoredStop(time.Now())
 		} else if stopMatch != "" && stopState != nil {
-			stopState.mu.Lock()
-			stopState.IsStopped = true
-			stopState.mu.Unlock()
-			stopState.SetHealthy(false) // persists with IsStopped=true
-			logger.Printf("[PLEX] STOP applied for: %s (Event: %s)", filepath.Base(stopMatch), payload.Event)
-
-			if val, ok := activePumps.Load(stopMatch); ok {
-				ps := val.(*NativePumpState)
-				if ps.cancel != nil {
-					ps.cancel()
-				}
-				activePumps.Delete(stopMatch)
-				logger.Printf("[PLEX] STOP: force-terminated pump for %s", filepath.Base(stopMatch))
-			}
-
-			torrstor.ResetShield()
-			logger.Printf("[AdaptiveShield] Shield reset on media.stop")
-
-			// Pull the rest of the tail window now that the pump is gone: piece requests at
-			// the file end would otherwise compete with the sequential download front. Ready
-			// for the next open, which is when the MKV Cues probe needs it.
-			if warmup.DiskWarmup != nil {
-				if v, ok := tailFillTargets.Load(stopMatch); ok {
-					t := v.(tailFillTarget)
-					warmup.DiskWarmup.EnsureTail(t.hash, t.fileID, t.size)
-				}
-			}
-
-			// Deactivate Core Priority unless a sibling episode of the same torrent is
-			// still live (shared hash): priority/aggressive off and the 30s expiry would
-			// hit the stream that is actually playing.
-			if shouldDropTorrentPriority(stopState.Hash, stopMatch) {
-				h := metainfo.NewHashFromHex(stopState.Hash)
-				if t := web.BTS.GetTorrent(h); t != nil {
-					t.IsPriority.Store(false)
-					t.SetAggressiveMode(false, 0) // Back to normal download priority
-					t.AddExpiredTime(30 * time.Second)
-					logger.Printf("[PLEX] STOP detected. Grace period 30s for: %s", stopState.Hash)
-				}
-			}
+			applyPlexStop(stopMatch, stopState, payload.Event)
 		}
 	}
 	w.WriteHeader(200)
+}
+
+// applyPlexStop ends playback for path: state stopped, pump cancelled, shield reset, priority dropped.
+func applyPlexStop(stopMatch string, stopState *PlaybackState, event string) {
+	stopState.mu.Lock()
+	stopState.IsStopped = true
+	stopState.mu.Unlock()
+	stopState.SetHealthy(false) // persists with IsStopped=true
+	logger.Printf("[PLEX] STOP applied for: %s (Event: %s)", filepath.Base(stopMatch), event)
+
+	if val, ok := activePumps.Load(stopMatch); ok {
+		ps := val.(*NativePumpState)
+		if ps.cancel != nil {
+			ps.cancel()
+		}
+		activePumps.Delete(stopMatch)
+		logger.Printf("[PLEX] STOP: force-terminated pump for %s", filepath.Base(stopMatch))
+	}
+
+	eng.ResetShield(stopState.Hash)
+	logger.Printf("[AdaptiveShield] Shield reset on media.stop")
+
+	// Pull the rest of the tail window now that the pump is gone: piece requests at
+	// the file end would otherwise compete with the sequential download front. Ready
+	// for the next open, which is when the MKV Cues probe needs it.
+	if warmup.DiskWarmup != nil {
+		if v, ok := tailFillTargets.Load(stopMatch); ok {
+			t := v.(tailFillTarget)
+			warmup.DiskWarmup.EnsureTail(t.hash, t.fileID, t.size)
+		}
+	}
+
+	// Deactivate Core Priority unless a sibling episode of the same torrent is
+	// still live (shared hash): priority/aggressive off and the 30s expiry would
+	// hit the stream that is actually playing.
+	if shouldDropTorrentPriority(stopState.Hash, stopMatch) {
+		if t := eng.Get(stopState.Hash); t != nil {
+			t.IsPriority.Store(false)
+			nativeBridge.SetAggressive(stopState.Hash, false, 0) // Back to normal download priority
+			t.AddExpiredTime(30 * time.Second)
+			logger.Printf("[PLEX] STOP detected. Grace period 30s for: %s", stopState.Hash)
+		}
+	}
 }
 
 // V750: Persist a PlaybackState to SQLite (best-effort)
@@ -4995,12 +5272,11 @@ func restorePlaybackStates(db *metadb.DB) {
 				LastReadAt:          rec.LastReadAt,
 			}
 			playbackRegistry.Store(rec.Path, ps)
-			// Restore GoStorm priority
+			// Restore Tentacle priority
 			if rec.Hash != "" {
-				hHash := metainfo.NewHashFromHex(rec.Hash)
-				if t := web.BTS.GetTorrent(hHash); t != nil {
+				if t := eng.Get(rec.Hash); t != nil {
 					t.IsPriority.Store(true)
-					t.SetAggressiveMode(true, GetEffectiveConcurrencyLimit())
+					nativeBridge.SetAggressive(rec.Hash, true, GetEffectiveConcurrencyLimit())
 					priorityApplied++
 					logger.Printf("[V750] Priority RESTORED from DB: %s", filepath.Base(rec.Path))
 				}
@@ -5038,6 +5314,8 @@ func main() {
 	var dbPath string
 	flag.StringVar(&dbPath, "path", "", "path to database and config")
 	resetAuth := flag.Bool("reset-auth", false, "clear the :9080 user, sessions and tokens and turn sign-in off")
+	exportCfg := flag.String("export-config", "", "write the saved configuration to a file (- for stdout) and exit")
+	importCfg := flag.String("import-config", "", "save a config.json as the configuration (applied at the next start) and exit")
 	flag.Parse()
 
 	// Default --path to the directory containing the binary (portable install)
@@ -5046,42 +5324,44 @@ func main() {
 			dbPath = filepath.Dir(exe)
 		}
 	}
+	// The engine's legacy state (config.db, settings.json, trackers.txt, blocklist) lives in
+	// --path; older Docker installs wrote it to the working directory: move it first.
+	engineStateDir = dbPath
 	if dbPath != "" {
-		if settings.Args == nil {
-			settings.Args = &settings.ExecArgs{}
-		}
-		settings.Args.Path = dbPath
-		// settings.Path is what the GoStorm layer actually joins against for config.db,
-		// the settings JSON, trackers.txt, accs.db and the blocklist fallback. It was never
-		// assigned, so all of those resolved relative to the working directory: under
-		// systemd that happens to be the install dir, but in Docker it is the image's
-		// WORKDIR, outside every mounted volume - so torrents and GoStorm settings were
-		// lost on "docker rm". Migrate anything already written there before switching.
-		settings.Path = dbPath
-		settings.MigrateFromWorkdir(dbPath)
+		engset.MigrateFromWorkdir(dbPath, logger.Printf)
 	}
 
 	source, mount := flag.Arg(0), flag.Arg(1)
 
-	cfg := config.LoadConfig()
-
-	if dbPath != "" {
-		// If dbPath is a directory, use it as RootPath; if a file, use its parent.
-		if fi, err := os.Stat(dbPath); err == nil && fi.IsDir() {
-			cfg.RootPath = dbPath
-		} else {
-			cfg.RootPath = filepath.Dir(dbPath)
-		}
-	} else {
-		// Default to /home/pi if no flag provided (for backward compat)
-		cfg.RootPath = "/home/pi"
+	// The configuration lives in the state DB: paths first, then the DB, then the configuration.
+	boot, bootErr := config.Prepare(dbPath)
+	if bootErr != nil {
+		config.Fatal(bootErr)
 	}
-
-	globalConfig.Store(&cfg)
 	if *resetAuth {
 		// Before anything starts: a second engine next to the running service would mount FUSE twice.
-		os.Exit(auth.RunResetFlag(gc().StateDBPath, GetStateDir()))
+		os.Exit(auth.RunResetFlag(boot.DBPath, boot.StateDir))
 	}
+	if bootErr := boot.Open(logger, logger.Printf); bootErr != nil {
+		config.Fatal(bootErr)
+	}
+	if *exportCfg != "" || *importCfg != "" {
+		code := 0
+		if *exportCfg != "" {
+			code = config.RunExport(boot.Store, *exportCfg)
+		} else {
+			code = config.RunImport(boot.Store, *importCfg)
+		}
+		boot.DB.Close() // checkpoint: no -wal left behind, owned by whoever ran this
+		config.WarnOwner(boot.DBPath)
+		os.Exit(code)
+	}
+	cfg, _, bootErr := boot.Load()
+	if bootErr != nil {
+		config.Fatal(bootErr)
+	}
+	configBoot = boot
+	globalConfig.Store(&cfg)
 	prowlarrClient = prowlarr.NewClient(gc().Prowlarr)
 	telemetry.SendHeartbeat(*gc(), AppVersion)
 	logger.Printf("[DEBUG] BlockListURL loaded: '%s'", gc().BlockListURL)
@@ -5119,7 +5399,7 @@ func main() {
 				return hash, fileID, hash != ""
 			},
 			func(hash string, fileID int) {
-				if t := torr.PeekTorrent(hash); nativeBridge == nil || (t != nil && t.Torrent != nil) {
+				if nativeBridge == nil || eng == nil || eng.Get(hash) != nil {
 					return
 				}
 				_ = nativeBridge.Wake(context.Background(), "magnet:?xt=urn:btih:"+hash, fileID)
@@ -5139,7 +5419,7 @@ func main() {
 	// block fetch that never receives its first bytes. Wrapping the read in a
 	// context achieves nothing on its own, because the fetch does not consult one.
 	if d := time.Duration(gc().FuseReadTimeoutSeconds) * time.Second; d > 0 {
-		native.FetchReadyTimeout = d
+		bridge.FetchReadyTimeout = d
 	}
 	if uid, gid := library.Owner(); uid >= 0 {
 		logger.Printf("[Startup] writing stubs as %d:%d", uid, gid)
@@ -5157,49 +5437,34 @@ func main() {
 
 	gc().LogConfig(logger)
 
-	// Must precede server.Start(): the engine reads the blocklist while configuring
-	// its client, and a flag set afterwards would leave it unloaded until a refresh.
-	if err := torrutils.SetBlockListFilter(gc().BlockListFilter); err != nil {
-		logger.Printf("[BlockList] %v — loading the list unfiltered", err)
-	}
-	torrutils.SetBlockListEnabled(gc().BlockListEnabled)
-
-	// :8090 is for the engine itself: loopback unless config opens it.
-	if settings.Args == nil {
-		settings.Args = &settings.ExecArgs{}
-	}
-	settings.Args.IP = gc().ApplyGoStormBind(logger.Printf)
+	var peerInfo engine.PeerInfoFunc
 	if gc().PeerGeoIPEnabled {
-		torr.PeerInfo = geoip.Start(context.Background(), GetStateDir(), logger.Printf).PeerInfo
+		peerInfo = geoip.Start(context.Background(), GetStateDir(), logger.Printf).PeerInfo
 	}
+	// engine.md §1.13: legacy import, settings, blocklist, start; Boot returns once ready.
+	logger.Println("Starting the engine...")
+	host, hostErr := enginehost.Boot(enginehost.Options{DB: boot.DB, StateDir: engineStateDir, PortManaged: gc().NatPMP.Enabled,
+		BlockListEnabled: gc().BlockListEnabled, BlockListFilter: gc().BlockListFilter, PeerInfo: peerInfo, Logf: logger.Printf,
+		Playing: hashPlaying})
+	if hostErr != nil {
+		config.Fatal(hostErr)
+	}
+	engineHost, eng, nativeBridge = host, host.Engine, host.Bridge
+	engSets := host.Settings.Current()
 
-	go func() {
-		logger.Println("Starting Embedded GoStorm Engine...")
-		server.Start() // Starts Web Server on 8090 and Engine
-	}()
-	// Give engine a moment to init (hash maps etc)
-	time.Sleep(2 * time.Second)
-
-	warmup.InitDiskWarmup(gc().DiskWarmupQuotaGB)
+	warmup.InitDiskWarmup(gc().DiskWarmupQuotaGB, engSets.UseDisk, engSets.TorrentsSavePath)
 	// Fires synchronously from DiskWarmup's single writeWorker goroutine at the exact moment a
 	// head warmup fetch starts/completes - avoids the race where a caller checking IsWarmingUp()
 	// right after WriteChunk() returns could read stale state, since WriteChunk only enqueues and
 	// returns immediately (see OnWarmupStateChange doc comment in internal/warmup/warmup.go).
-	warmup.OnWarmupStateChange = func(hash string, fileID int, active bool) {
-		if tr := torr.PeekTorrent(hash); tr != nil && tr.Torrent != nil {
-			tr.Torrent.SetWarmupActive(active, fileID)
-		}
-	}
-	// Lets the warmup package pull the tail and head windows itself (EnsureTail, HeadGate);
-	// it cannot import the bridge, so the dependency is injected the same way as the callback above.
-	warmup.Fetch = func(hash string, fileID int, off int64, buf []byte) (int, error) {
-		if nativeBridge == nil {
-			return 0, fmt.Errorf("native bridge unavailable")
-		}
-		return nativeBridge.FetchBlock(hash, fileID, off, buf)
-	}
+	warmup.OnWarmupStateChange = host.WarmupActive
+	// Lets the warmup package pull the tail and head windows itself (EnsureTail, HeadGate): a
+	// prefetch nobody waits on; it cannot import the bridge, so the dependency is injected.
+	warmup.Fetch = nativeBridge.PrefetchBlock
+	warmup.TailFillYield = func(hash string, _ int) bool { return hashInPlayback(hash) }
+	warmup.TailPaused = streamer.ErrPaused
 	go registry.StartRegistryWatchdog(backgroundStopChan)
-	go natpmp.NatpmpLoop(backgroundStopChan, gc().NatPMP, logger)
+	go natpmp.NatpmpLoop(backgroundStopChan, gc().NatPMP, logger, host.PeerPort())
 
 	masterDataSemaphore = make(chan struct{}, gc().MasterConcurrencyLimit)
 	startHandleGC()
@@ -5226,9 +5491,7 @@ func main() {
 
 	catalog.SetRetryDefaults(gc().MaxRetryAttempts, time.Duration(gc().RetryDelayMS)*time.Millisecond)
 
-	nativeBridge = native.NewNativeClient()
-
-	go tuner.Start(context.Background())
+	go tuner.Start(context.Background(), eng)
 
 	if gc().BlockListEnabled && gc().BlockListURL != "" {
 		startBlockListLoop(gc().BlockListURL)
@@ -5248,22 +5511,14 @@ func main() {
 		logger.Printf("WARNING: Failed to initialize inode map: %v (falling back to filename hash)", err)
 	}
 
-	// V1.7.1: Optional SQLite State DB for unified persistence.
-	if gc().EnableStateDB {
-		dbPath := gc().StateDBPath
-		if dbPath == "" {
-			dbPath = filepath.Join(GetStateDir(), "tiramisu.db")
-		}
-		var err error
-		stateDB, err = metadb.New(dbPath, logger)
-		if err != nil {
-			logger.Printf("WARNING: Failed to open StateDB: %v (falling back to JSON)", err)
-			stateDB = nil
-		} else {
-			// Migrate JSON files if needed
+	// The state DB, opened at start-up for the configuration, also holds the engine state.
+	{
+		stateDB = configBoot.DB
+		{
+			// Migrate JSON files if needed; on failure the state falls back to JSON, but the
+			// DB stays open: the configuration lives there.
 			if err := stateDB.MigrateFromJSON(GetStateDir()); err != nil {
 				logger.Printf("WARNING: StateDB migration failed: %v (falling back to JSON)", err)
-				stateDB.Close()
 				stateDB = nil
 			} else {
 				// Wire up DB to InodeMap, then reload from DB (covers boot 2+ where JSON is gone)
@@ -5275,19 +5530,20 @@ func main() {
 				// V750: Restore playback states from previous sessions
 				restorePlaybackStates(stateDB)
 				registry.SetStateDir(GetStateDir())
-				logger.Printf("[StateDB] Active: %s", dbPath)
+				logger.Printf("[StateDB] Active: %s", configBoot.DBPath)
 
 				// V304 ban persistence: restore prior bans (30-day TTL) and persist new ones.
+				var v304Bans []string
 				if ips, err := stateDB.LoadV304Bans(30 * 24 * time.Hour); err != nil {
 					logger.Printf("WARNING: Failed to load V304 bans: %v", err)
 				} else if len(ips) > 0 {
-					torrent.V304LoadBans(ips)
+					v304Bans = ips
 					logger.Printf("[V304] Restored %d persisted peer bans", len(ips))
 				}
 				// Reachability outcomes: the sync engines read the counter to tell a dead
 				// release from a slow one before dropping a title.
 				failDB := stateDB
-				native.ReachabilityOutcome = func(hash string, resolved bool) {
+				bridge.ReachabilityOutcome = func(hash string, resolved bool) {
 					var err error
 					if resolved {
 						// Success is the common case: read first so the usual read costs a
@@ -5312,7 +5568,7 @@ func main() {
 				}
 
 				banDB := stateDB
-				torrent.V304SetOnBan(func(ip string) {
+				engine.SetV304Bans(v304Bans, func(ip string) {
 					if err := banDB.SaveV304Ban(ip); err != nil {
 						logger.Printf("WARNING: Failed to persist V304 ban for %s: %v", ip, err)
 					}
@@ -5379,8 +5635,17 @@ func main() {
 	}()
 
 	// Sign-in on :9080 (opt-in). The state lives in tiramisu.db, never in config.json.
-	authSvc, authTrusted := auth.Start(http.DefaultServeMux, stateDB, GetStateDir(), gc().AuthTrustedProxies, logger.Printf)
+	// The DB opened at start-up, not stateDB: a failed JSON migration leaves sign-in working.
+	authSvc, authTrusted := auth.Start(http.DefaultServeMux, configBoot.DB, GetStateDir(), gc().AuthTrustedProxies, logger.Printf)
 	apidocs.Register(http.DefaultServeMux, authSvc.Enabled)
+	tlsSrv := webtls.New(webtls.Options{
+		Settings: gc().HTTPS, StateDir: GetStateDir(),
+		AccessOn: authSvc.Enabled() || authSvc.FailClosed(), Trusted: authTrusted,
+		Saved: func() config.HTTPSConfig { return gc().HTTPS }, AccessNow: authSvc.Enabled,
+		OnBearer: authSvc.NoteCleartext, Logf: logger.Printf,
+	})
+	tlsSrv.Register(http.DefaultServeMux, func() any { return authSvc.CleartextUses() })
+	authSvc.SetHSTS(tlsSrv.OwnCertificate())
 
 	http.HandleFunc("/plex/webhook", handlePlexWebhook)
 
@@ -5410,29 +5675,18 @@ func main() {
 
 		// Task 4: hedge counters live per-Torrent on the fork - sum trigger count across active
 		// torrents, report circuit breaker as open if any active torrent currently has it tripped.
-		var hedgeTriggerTotal int64
-		deadlinePieces := 0
-		hedgeCircuitOpenAny := false
-		for _, tr := range torr.ListActiveTorrent() {
-			if tr.Torrent == nil {
-				continue
-			}
-			hedgeTriggerTotal += tr.Torrent.HedgeTriggerCount()
-			deadlinePieces += tr.Torrent.PieceDeadlineCount()
-			if tr.Torrent.HedgeCircuitOpen() {
-				hedgeCircuitOpenAny = true
-			}
-		}
+		hedgeTriggerTotal, deadlinePieces, hedgeCircuitOpenAny := eng.HedgeTotals()
 		// Peer view split by transport - conn slots are capped, so a transport is only worth
 		// the share of useful bytes it returns for the share of slots it takes.
-		peerStats := torr.CollectPeerTransportStats()
+		peerStats := eng.CollectPeerTransportStats()
 		// Gradient2 closed-loop state: the dry run reads backing_off/limit_max to see the loop
 		// react to queueing before its 32-request ceiling is raised.
-		g2Stats := torr.CollectGradient2Stats()
-		shieldOn, shieldLastCorr, shieldNeed := torrstor.ShieldStatus()
+		g2Stats := eng.CollectGradient2Stats()
+		shieldOn, shieldLastCorr, shieldNeed := eng.ShieldStatus()
+		blockRejections, blockIPs := engine.BlocklistCounters()
 
-		shortStream, shortFetch := native.ShortReadCounts()
-		repairedStream, unfilledStream := native.ShortReadRepairCounts()
+		shortStream, shortFetch := bridge.ShortReadCounts()
+		repairedStream, unfilledStream := bridge.ShortReadRepairCounts()
 
 		jsonString := func(v string) string { b, _ := json.Marshal(v); return string(b) }
 		w.Header().Set("Content-Type", "application/json")
@@ -5454,8 +5708,8 @@ func main() {
 			natPort,
 			jsonString(updater.LatestVersion()), updater.UpdateAvailable(),
 			warmupBucketsJSON,
-			hedgeTriggerTotal, hedgeCircuitOpenAny, fetchFlightDedupCount.Load(), peerStats.EjectTotal, torr.V304BannedCount(),
-			torrent.IPBlocklistRejections(), torrent.IPBlocklistDistinctIPs(),
+			hedgeTriggerTotal, hedgeCircuitOpenAny, fetchFlightDedupCount.Load(), peerStats.EjectTotal, eng.V304BannedCount(),
+			blockRejections, blockIPs,
 			fuseShortReadCount.Load(), fuseShortReadRepaired.Load(), fuseShortReadFailed.Load(), shortStream, shortFetch, repairedStream, unfilledStream,
 			peerStats.ConnsTCP, peerStats.ConnsUTP, peerStats.RatedTCP, peerStats.RatedUTP,
 			peerStats.UsefulBpsTCP, peerStats.UsefulBpsUTP,
@@ -5470,12 +5724,13 @@ func main() {
 	// catches monitoring outfits from one quietly eating ordinary peers.
 	http.HandleFunc("/metrics/blocklist", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		rejections, distinct := engine.BlocklistCounters()
 		json.NewEncoder(w).Encode(map[string]any{
 			"enabled":      gc().BlockListEnabled,
 			"url":          gc().BlockListURL,
-			"distinct_ips": torrent.IPBlocklistDistinctIPs(),
-			"rejections":   torrent.IPBlocklistRejections(),
-			"top_ranges":   torrent.IPBlocklistTopRanges(25),
+			"distinct_ips": distinct,
+			"rejections":   rejections,
+			"top_ranges":   engine.BlocklistTopRanges(25),
 		})
 	})
 
@@ -5554,63 +5809,41 @@ func main() {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			// A merge: keys left out keep their value, so a partial body cannot zero the ports.
-			newCfg, err := gc().Patch(body)
+			// A merge onto the saved document: keys left out keep their value, and environment
+			// overrides are never written.
+			base, newCfg, err := configBoot.PatchSaved(body)
 			if err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			// Trusted proxies decide whose X-Forwarded-For the login rate limit believes: a
-			// sign-in setting, so only a browser session may change it, not an API token.
-			if authSvc.Enabled() && auth.SessionFrom(r) == "" && !slices.Equal(newCfg.AuthTrustedProxies, gc().AuthTrustedProxies) {
-				http.Error(w, "auth_trusted_proxies changes only from the Control Panel, signed in", http.StatusForbidden)
-				return
+			// Who is trusted and whether traffic is encrypted: only a browser session may change
+			// these, not an API token.
+			if authSvc.Enabled() && auth.SessionFrom(r) == "" {
+				if k := config.SignInOnlyChange(base, newCfg); k != "" {
+					http.Error(w, k+" changes only from the Control Panel, signed in", http.StatusForbidden)
+					return
+				}
 			}
-			if err := newCfg.WriteFile(gc().ConfigPath); err != nil {
+			source, actor := authSvc.Actor(r)
+			cfg, _, _, err := configBoot.SaveConfig(newCfg, source, actor, "")
+			if err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
-			// Reload in memory (V1.4.0 Live Update)
-			oldEnabled := gc().BlockListEnabled
-			oldURL := gc().BlockListURL
-			oldFilter := gc().BlockListFilter
-			cfg := config.LoadConfig()
-			cfg.RootPath = gc().RootPath // comes from --path at start, not from the file
-			globalConfig.Store(&cfg)
-			prowlarrClient = prowlarr.NewClient(gc().Prowlarr)
-
-			newEnabled := gc().BlockListEnabled
-			newURL := gc().BlockListURL
-			torrutils.SetBlockListEnabled(newEnabled)
-			newFilter := gc().BlockListFilter
-			if err := torrutils.SetBlockListFilter(newFilter); err != nil {
-				logger.Printf("[BlockList] %v — loading the list unfiltered", err)
-			}
-			// The filter changes which ranges the same file yields, so re-read it rather
-			// than waiting for the next download.
-			if newEnabled && newFilter != oldFilter {
-				if list, err := torrutils.ReadBlockedIP(); err == nil {
-					torr.SetIPBlocklist(list)
-					logger.Printf("[BlockList] Filter changed, reloaded from the existing file")
-				} else {
-					logger.Printf("[BlockList] WARNING: filter changed but reload failed: %v", err)
-				}
-			}
-			switch {
-			case newEnabled && (!oldEnabled || newURL != oldURL):
-				// was off -> on, or URL changed while staying on: (re)start with fresh URL
-				startBlockListLoop(newURL)
-			case !newEnabled && oldEnabled:
-				// was on -> off: stop future refreshes and clear the ranges already loaded
-				// into the engine, otherwise the file keeps banning peers until a restart.
-				stopBlockListLoop()
-				torr.SetIPBlocklist(nil)
-				logger.Printf("[BlockList] Disabled: cleared from running engine")
-			}
+			applyConfig(cfg)
 			logger.Printf("[Config] Updated via Dashboard API")
 			w.WriteHeader(200)
 		}
 	})
+	configBoot.RegisterHistory(http.DefaultServeMux, config.HistoryDeps{
+		Mu: &configMu, Actor: authSvc.Actor, Apply: applyConfig, Logf: logger.Printf,
+		// Also closes them to the internal token, which the middleware lets through.
+		Allowed: func(r *http.Request) bool { return !authSvc.Enabled() || auth.SessionFrom(r) != "" }})
+	configBoot.RegisterEngineHistory(http.DefaultServeMux, config.EngineHistoryDeps{
+		Actor: authSvc.Actor, Logf: logger.Printf,
+		Allowed: func(r *http.Request) bool { return !authSvc.Enabled() || auth.SessionFrom(r) != "" },
+		Ignored: engineHost.Settings.IgnoredKeys, Current: engineHost.Settings.Document, Restore: engineHost.Restore,
+		NeedsRestart: func(k string) bool { kind, ok := engset.KindOf(k); return ok && kind == engset.KindRestart }})
 
 	http.HandleFunc("/api/prowlarr/search", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -5724,42 +5957,11 @@ func main() {
 		json.NewEncoder(w).Encode(hits)
 	})
 
-	// Same-origin proxy to the GoStorm settings API. The Control Panel must not
-	// build an absolute URL of its own: behind a reverse proxy the GoStorm port is
-	// not exposed, and an http:// call from an https:// page is blocked as mixed
-	// content, which left the whole GoStorm section empty and unsaveable.
-	http.HandleFunc("/api/gostorm/settings", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		base := gc().GoStormBaseURL
-		if base == "" {
-			http.Error(w, "gostorm_url not configured", http.StatusServiceUnavailable)
-			return
-		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-		if err != nil {
-			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		req, err := http.NewRequestWithContext(r.Context(), "POST",
-			strings.TrimRight(base, "/")+"/settings", bytes.NewReader(body))
-		if err != nil {
-			http.Error(w, "build request: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
-		if err != nil {
-			http.Error(w, "gostorm unreachable: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-	})
+	// The Control Panel's engine settings, same-origin and in-process: the body and answers
+	// of the retired :8090 /settings, with source and actor from the session.
+	settingsHandler := engineHost.SettingsHandler(authSvc.Actor)
+	http.HandleFunc("/api/tentacle/settings", settingsHandler)
+	http.HandleFunc("/api/gostorm/settings", settingsHandler) // alias for existing clients
 
 	http.HandleFunc("/api/restart", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
@@ -5782,6 +5984,16 @@ func main() {
 			p.Signal(syscall.SIGTERM)
 		}()
 	})
+
+	// The syncs are built before the library manager, and release torrents through it.
+	var libraryRef atomic.Pointer[library.Manager]
+	releaseTorrent := func(ctx context.Context, hash string) (bool, error) {
+		m := libraryRef.Load()
+		if m == nil {
+			return false, errors.New("library not ready: torrent kept")
+		}
+		return m.ReleaseIfUnused(ctx, hash)
+	}
 
 	// Sync Scheduler (Fase 1)
 	// Routes are always registered so the Control Panel's manual "Run now" works
@@ -5815,6 +6027,7 @@ func main() {
 				Name:            name,
 				Mode:            mode,
 				GoStormURL:      gc().GoStormBaseURL,
+				Torrents:        engines.EngineBackend(eng),
 				TMDBAPIKey:      gc().TMDBAPIKey,
 				TorrentioURL:    gc().TorrentioURL,
 				PlexURL:         gc().Plex.URL,
@@ -5834,6 +6047,7 @@ func main() {
 				MaxSeasons:      gc().TVMaxSeasons,
 				DB:              stateDB,
 				AudioRegistry:   audioOwnershipRegistry(),
+				Release:         releaseTorrent,
 				InvalidatePath:  invalidateSyncRemovedPath,
 			})
 		}
@@ -5841,6 +6055,7 @@ func main() {
 		syncers := map[string]scheduler.Syncer{
 			"movies": engines.NewMoviesSyncer(engines.MoviesSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
+				Torrents:        engines.EngineBackend(eng),
 				TMDBAPIKey:      gc().TMDBAPIKey,
 				TorrentioURL:    gc().TorrentioURL,
 				PlexURL:         gc().Plex.URL,
@@ -5856,6 +6071,12 @@ func main() {
 				InvalidatePath:  invalidateSyncRemovedPath,
 				DB:              stateDB,
 				AudioRegistry:   audioOwnershipRegistry(),
+				Release:         releaseTorrent,
+				AfterRun: func(ctx context.Context) {
+					if oc := gc().OrphanCollection; oc.Enabled && libraryRef.Load() != nil {
+						libraryRef.Load().AutoCollect(ctx, oc.MinAgeDays, oc.MaxPerRun)
+					}
+				},
 			}),
 			// While the anime job is enabled, the TV job leaves anime to it; while it
 			// is not, the TV job covers both, as upstream does. The scheduler never
@@ -5880,8 +6101,10 @@ func main() {
 			}),
 			"watchlist": engines.NewWatchlistSyncer(engines.WatchlistSyncerConfig{
 				GoStormURL:      gc().GoStormBaseURL,
+				Torrents:        engines.EngineBackend(eng),
 				DB:              stateDB,
 				AudioRegistry:   audioOwnershipRegistry(),
+				Release:         releaseTorrent,
 				TMDBAPIKey:      gc().TMDBAPIKey,
 				TorrentioURL:    gc().TorrentioURL,
 				PlexURL:         gc().Plex.URL,
@@ -5930,15 +6153,15 @@ func main() {
 				return filepath.Join(gc().PhysicalSourcePath, "anime")
 			}(),
 			GoStormURL: gc().GoStormBaseURL,
-			GoStorm:    engines.NewGoStormClient(gc().GoStormBaseURL),
+			GoStorm:    engines.NewGoStormClient(engines.EngineBackend(eng), gc().GoStormBaseURL),
+			ReadRange:  nativeBridge.ReadRange,
 			Registry:   registry,
 			// Without this the drop path sees only movie and tv stubs, and removing
 			// the last one for a shared hash takes the torrent out from under any
 			// audio projection still backed by it.
 			//
-			// audioOwnershipRegistry(), not a raw stateDB value: on a boot where
-			// EnableStateDB is true but the DB failed to open, the raw value is nil
-			// and this path would permit exactly that drop.
+			// audioOwnershipRegistry(), not a raw stateDB value: when the state migration
+			// failed the raw value is nil and this path would permit exactly that drop.
 			AudioRegistry: audioOwnershipRegistry(),
 			// The audio sections live beside movies/ and tv/, and the projection
 			// registry is authoritative for what is published under them.
@@ -5955,8 +6178,15 @@ func main() {
 			UnpublishAudioPath: unpublishAudioProjectionLive,
 			// The audio reaper skips albums with an open session: the swarm counter is
 			// only acquitted when that session closes.
-			ActiveSession:  ttffActiveByHash,
+			ActiveSession: ttffActiveByHash,
+			// The library removes through the engine API, which leaves the SSD warmup files.
+			OnRelease: func(hash string) {
+				if warmup.DiskWarmup != nil {
+					warmup.DiskWarmup.RemoveHash(hash)
+				}
+			},
 			InvalidatePath: invalidateSyncRemovedPath,
+			Diagnostics:    diagnosticsDB(),
 			// Read-only view of the holes the reaper left, for a client that can decide
 			// what to do about them.
 			Gaps: func() ([]library.Gap, error) {
@@ -6001,12 +6231,19 @@ func main() {
 			Catalog:      library.NewTMDBCatalog(func() string { return gc().TMDBAPIKey }),
 			MusicSection: gc().Plex.MusicLibraryID,
 		})
+		libraryRef.Store(libMgr)
+		if globalTorrentRemover != nil {
+			globalTorrentRemover.SetRelease(libMgr.ReleaseIfUnused)
+		}
 		libHandler := library.NewHandler(libMgr)
 		http.HandleFunc("/api/library/add", libHandler.Add)
 		http.HandleFunc("/api/library/remove", libHandler.Remove)
 		http.HandleFunc("/api/library/list", libHandler.List)
 		http.HandleFunc("/api/library/inspect", libHandler.Inspect)
 		http.HandleFunc("/api/library/missing", libHandler.Missing)
+		http.HandleFunc("/api/library/diagnostics", libHandler.Diagnostics)
+		http.HandleFunc("/api/library/orphans", libHandler.Orphans)
+		http.HandleFunc("/api/library/release", libHandler.Release)
 		mcp.Register(http.DefaultServeMux, mcp.Deps{
 			Library:  libMgr,
 			Config:   gc,
@@ -6021,8 +6258,9 @@ func main() {
 
 	// Health Monitor + Dashboard (Fase 5)
 	logsDir := gc().LogDir
+	collector.PeerPort = engineHost.PeerPort().Port
 	monCollector := collector.New(
-		"http://127.0.0.1:8090",
+		eng,
 		gc().FuseMountPath,
 		physicalSourcePath,
 		gc().NatPMP.VPNInterface,
@@ -6096,7 +6334,11 @@ func main() {
 	})
 	logger.Printf("[Dashboard] enabled at :%d/dashboard", gc().MetricsPort)
 
-	go http.ListenAndServe(fmt.Sprintf(":%d", gc().MetricsPort), auth.Wrap(authSvc, authTrusted, http.DefaultServeMux))
+	go func() {
+		if err := tlsSrv.ListenAndServe(fmt.Sprintf(":%d", gc().MetricsPort), auth.Wrap(authSvc, authTrusted, http.DefaultServeMux)); err != nil {
+			logger.Printf("[Dashboard] ERROR :%d stopped: %v", gc().MetricsPort, err)
+		}
+	}()
 
 	// Graceful shutdown: saves inode map and sync caches before exit.
 	sigChan := make(chan os.Signal, 1)
@@ -6347,7 +6589,7 @@ func updateBlockList(urlStr string) {
 
 	// Write next to the rest of the state, not next to the binary: in a container the
 	// binary lives in the image layer, so the list was re-downloaded on every start.
-	destDir := settings.Path
+	destDir := engineStateDir
 	if destDir == "" {
 		exePath, err := os.Executable()
 		if err != nil {
@@ -6435,7 +6677,7 @@ func updateBlockList(urlStr string) {
 	// Refuse to install something with no usable ranges. iblocklist serves a captcha page
 	// to anything that looks like a browser, and a downloaded HTML page would otherwise
 	// replace a working blocklist with an empty one, silently.
-	if ranges := torrutils.CountRanges(tmpPath); ranges == 0 {
+	if ranges := engine.CountRangesFile(tmpPath); ranges == 0 {
 		os.Remove(tmpPath)
 		logger.Printf("[BlockList] Refused: %d bytes downloaded but no usable ranges — keeping the previous list", n)
 		return
@@ -6452,8 +6694,8 @@ func updateBlockList(urlStr string) {
 
 	logger.Printf("[BlockList] Updated successfully: %d bytes saved to %s", n, destPath)
 
-	if list, err := torrutils.ReadBlockedIP(); err == nil {
-		torr.SetIPBlocklist(list)
+	if list, err := eng.ReadBlockedIP(); err == nil {
+		eng.SetIPBlocklist(list)
 		logger.Printf("[BlockList] Live-reloaded into running engine")
 	} else {
 		logger.Printf("[BlockList] WARNING: downloaded but failed to reload live: %v", err)
@@ -6628,10 +6870,8 @@ func audioOwnershipRegistry() library.AudioRegistry {
 	if stateDB != nil {
 		return stateDB
 	}
-	if gc().EnableStateDB {
-		return library.UnavailableAudioRegistry{Err: errStateDBUnavailable}
-	}
-	return nil
+	// The state DB is always on now: nil only when its migration failed.
+	return library.UnavailableAudioRegistry{Err: errStateDBUnavailable}
 }
 
 // audioNamespaceState reports the audio namespace readiness to external observers:
@@ -6654,6 +6894,14 @@ func audioNamespaceEntries() int {
 // audioProjectionRegistry returns the projection registry only when it is really
 // open: a typed-nil *metadb.DB would satisfy the interface and then panic.
 func audioProjectionRegistry() library.AudioProjectionRegistry {
+	if stateDB == nil {
+		return nil
+	}
+	return stateDB
+}
+
+// diagnosticsDB is the read-only consistency check's view of the state DB, nil without one.
+func diagnosticsDB() library.DiagnosticsDB {
 	if stateDB == nil {
 		return nil
 	}
@@ -6763,4 +7011,47 @@ func stubMeta(fullPath string) (*vfs.Metadata, error) {
 		return meta, nil
 	}
 	return getOrReadMeta(fullPath)
+}
+
+// applyConfig puts a saved configuration in use and applies what can change live
+// (V1.4.0 Live Update). Callers hold configMu.
+func applyConfig(cfg config.Config) {
+	// Reload in memory (V1.4.0 Live Update)
+	oldEnabled := gc().BlockListEnabled
+	oldURL := gc().BlockListURL
+	oldFilter := gc().BlockListFilter
+	globalConfig.Store(&cfg)
+	prowlarrClient = prowlarr.NewClient(gc().Prowlarr)
+
+	newEnabled := gc().BlockListEnabled
+	newURL := gc().BlockListURL
+	if eng == nil {
+		return
+	}
+	eng.SetBlockListEnabled(newEnabled)
+	newFilter := gc().BlockListFilter
+	if err := eng.SetBlockListFilter(newFilter); err != nil {
+		logger.Printf("[BlockList] %v — loading the list unfiltered", err)
+	}
+	// The filter changes which ranges the same file yields, so re-read it rather
+	// than waiting for the next download.
+	if newEnabled && newFilter != oldFilter {
+		if list, err := eng.ReadBlockedIP(); err == nil {
+			eng.SetIPBlocklist(list)
+			logger.Printf("[BlockList] Filter changed, reloaded from the existing file")
+		} else {
+			logger.Printf("[BlockList] WARNING: filter changed but reload failed: %v", err)
+		}
+	}
+	switch {
+	case newEnabled && (!oldEnabled || newURL != oldURL):
+		// was off -> on, or URL changed while staying on: (re)start with fresh URL
+		startBlockListLoop(newURL)
+	case !newEnabled && oldEnabled:
+		// was on -> off: stop future refreshes and clear the ranges already loaded
+		// into the engine, otherwise the file keeps banning peers until a restart.
+		stopBlockListLoop()
+		eng.SetIPBlocklist(nil)
+		logger.Printf("[BlockList] Disabled: cleared from running engine")
+	}
 }
