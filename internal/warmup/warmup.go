@@ -173,7 +173,35 @@ type DiskWarmupCache struct {
 	tailFills    sync.Map   // path -> true while a sequential tail fill is running
 	warmupStarts sync.Map   // path -> time.Time (STARTING timestamp, for duration histogram)
 	touched      sync.Map   // path -> time.Time of the last mtime refresh on read
+	mids         sync.Map   // mid path -> *midFile (coverage, from the .cov file)
+	midWriting   sync.Map   // mid path -> true while a piece is written to it
 	writeCh      chan warmupWrite
+
+	headMax    int64 // head cap; 0 = FileSize
+	quotaBytes int64 // 0 = diskQuotaGB, else warmupQuota
+	idxMu      sync.Mutex
+	idx        atomic.Pointer[warmIndex] // nil until ServeIndex
+	stop       chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
+}
+
+// headCap is the head size of this cache.
+func (d *DiskWarmupCache) headCap() int64 {
+	if d.headMax > 0 {
+		return d.headMax
+	}
+	return FileSize
+}
+
+func (d *DiskWarmupCache) quota() int64 {
+	if d.quotaBytes > 0 {
+		return d.quotaBytes
+	}
+	if diskQuotaGB > 0 {
+		return diskQuotaGB * 1024 * 1024 * 1024
+	}
+	return warmupQuota
 }
 
 var logf = log.New(os.Stdout, "[DiskWarmup] ", log.LstdFlags)
@@ -189,17 +217,27 @@ func InitDiskWarmup(quotaGB int64, useDisk bool, dir string) {
 	if dir == "" || dir == "/" {
 		return
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return
+	if DiskWarmup = New(dir, FileSize, quotaGB); DiskWarmup != nil {
+		logf.Printf("[DiskWarmup] Active — dir=%s quota=%dGB warmup=%dMB", dir, quotaGB, FileSize/1024/1024)
 	}
 	// The cache dir and its contents are written by this process, which may be
 	// running as root. Hand them to the same owner the stub tree uses so the
 	// operator can prune the cache without sudo.
 	library.ApplyOwner(dir)
+}
 
-	DiskWarmup = &DiskWarmupCache{
-		dir:     dir,
-		writeCh: make(chan warmupWrite, 32),
+// New opens a warmup cache in dir with the head size and quota given (0 = the defaults) and
+// starts its writer and reaper; nil if dir cannot be created.
+func New(dir string, headSize, quotaGB int64) *DiskWarmupCache {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil
+	}
+	d := &DiskWarmupCache{
+		dir:        dir,
+		writeCh:    make(chan warmupWrite, 32),
+		headMax:    headSize,
+		quotaBytes: quotaGB << 30,
+		stop:       make(chan struct{}),
 	}
 
 	// One-shot migration: head files written before the density invariant may hold holes
@@ -212,8 +250,8 @@ func InitDiskWarmup(quotaGB int64, useDisk bool, dir string) {
 		dropHeads = true
 	}
 
-	if total, dropped, residues, err := DiskWarmup.scanExisting(dropHeads); err == nil {
-		atomic.StoreInt64(&DiskWarmup.totalSize, total)
+	if total, dropped, residues, err := d.scanExisting(dropHeads); err == nil {
+		atomic.StoreInt64(&d.totalSize, total)
 		logf.Printf("[DiskWarmup] Initial size: %.1fGB (dropped %d stale cache files, %d residues)", float64(total)/(1<<30), dropped, residues)
 	}
 
@@ -224,10 +262,20 @@ func InitDiskWarmup(quotaGB int64, useDisk bool, dir string) {
 		}
 	}
 
-	go DiskWarmup.writeWorker()
-	go DiskWarmup.handleReaper()
+	d.wg.Add(2)
+	go d.writeWorker()
+	go d.handleReaper()
+	return d
+}
 
-	logf.Printf("[DiskWarmup] Active — dir=%s quota=%dGB warmup=%dMB", dir, quotaGB, FileSize/1024/1024)
+// Close stops the writer and the reaper and closes the open files (tests).
+func (d *DiskWarmupCache) Close() {
+	if d == nil || d.stop == nil {
+		return
+	}
+	d.stopOnce.Do(func() { close(d.stop) })
+	d.wg.Wait()
+	d.handles.Range(func(k, _ any) bool { d.closeHandle(k.(string)); return true })
 }
 
 // scanExisting walks the cache at startup. A tail stays only with its completion marker
@@ -242,6 +290,16 @@ func (d *DiskWarmupCache) scanExisting(dropHeads bool) (total int64, dropped, re
 	}
 	for _, e := range entries {
 		name := e.Name()
+		if strings.HasSuffix(name, midSuffix+covSuffix) {
+			if !fileExists(filepath.Join(dir, strings.TrimSuffix(name, covSuffix))) {
+				os.Remove(filepath.Join(dir, name)) // orphan coverage
+			}
+			continue
+		}
+		if strings.HasSuffix(name, midSuffix) {
+			total += d.loadMid(filepath.Join(dir, name))
+			continue
+		}
 		if strings.HasSuffix(name, tailSuffix+tailDoneSuffix) {
 			if _, serr := os.Stat(filepath.Join(dir, strings.TrimSuffix(name, tailDoneSuffix))); serr != nil {
 				os.Remove(filepath.Join(dir, name)) // orphan marker
@@ -319,14 +377,21 @@ func (d *DiskWarmupCache) markTailDone(path string, ch *cachedHandle) {
 	if f, err := os.Create(path + tailDoneSuffix); err == nil {
 		f.Sync()
 		f.Close()
+		d.indexAdd(path)
 	}
 }
 
 func (d *DiskWarmupCache) handleReaper() {
+	defer d.wg.Done()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		d.reapIdle(handleIdleMax)
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+			d.reapIdle(handleIdleMax)
+		}
 	}
 }
 
@@ -382,6 +447,7 @@ func (d *DiskWarmupCache) dropResidue(path string) {
 		// Written bytes were counted against the quota, so the drop gives them back
 		// instead of leaving the drift to the next full walk in enforceQuotaLocked.
 		atomic.AddInt64(&d.totalSize, -fi.Size())
+		d.indexRemove(path)
 	}
 	d.missing.Store(path, time.Now())
 }
@@ -407,6 +473,17 @@ func (d *DiskWarmupCache) getHandle(path string) (*cachedHandle, error) {
 	return ch, nil
 }
 
+// storeNewHandle caches the handle of a file just created, keeping one a concurrent getHandle
+// stored first.
+func (d *DiskWarmupCache) storeNewHandle(path string, f *os.File) {
+	ch := &cachedHandle{f: f}
+	ch.lastUsedNano.Store(time.Now().UnixNano())
+	if prev, loaded := d.handles.LoadOrStore(path, ch); loaded {
+		prev.(*cachedHandle).lastUsedNano.Store(time.Now().UnixNano())
+		f.Close()
+	}
+}
+
 func (d *DiskWarmupCache) closeHandle(path string) {
 	if val, ok := d.handles.LoadAndDelete(path); ok {
 		ch := val.(*cachedHandle)
@@ -420,9 +497,15 @@ func (d *DiskWarmupCache) closeHandle(path string) {
 }
 
 func (d *DiskWarmupCache) writeWorker() {
-	for w := range d.writeCh {
-		d.processWrite(w.hash, w.fileID, (*w.buf)[:w.len], w.off)
-		warmupWritePool.Put(w.buf)
+	defer d.wg.Done()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case w := <-d.writeCh:
+			d.processWrite(w.hash, w.fileID, (*w.buf)[:w.len], w.off)
+			warmupWritePool.Put(w.buf)
+		}
 	}
 }
 
@@ -434,7 +517,7 @@ func (d *DiskWarmupCache) WriteChunk(hash string, fileID int, data []byte, off i
 // queue is full rather than wait; a background fill blocks instead, because a dropped chunk
 // leaves a hole, and processWrite refuses every write past a hole.
 func (d *DiskWarmupCache) enqueue(hash string, fileID int, data []byte, off int64, block bool) {
-	if off > FileSize || d.writeCh == nil {
+	if off > d.headCap() || d.writeCh == nil {
 		return
 	}
 
@@ -461,6 +544,7 @@ func (d *DiskWarmupCache) enqueue(hash string, fileID int, data []byte, off int6
 }
 
 func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off int64) {
+	FileSize := d.headCap()
 	if off > FileSize {
 		return
 	}
@@ -491,6 +575,9 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 	}
 
 	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if off != 0 {
+			return // removed under this write: [0, off) would be a hole reported as covered
+		}
 		os.MkdirAll(d.dir, 0755)
 
 		d.mu.Lock()
@@ -498,15 +585,14 @@ func (d *DiskWarmupCache) processWrite(hash string, fileID int, data []byte, off
 		d.mu.Unlock()
 		d.missing.Delete(path)
 
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
 		if err != nil {
 			logf.Printf("[DiskWarmup] Error creating file: %v", err)
 			return
 		}
 		library.ApplyOwner(path)
-		newCh := &cachedHandle{f: f}
-		newCh.lastUsedNano.Store(time.Now().UnixNano())
-		d.handles.Store(path, newCh)
+		d.storeNewHandle(path, f)
+		d.indexAdd(path)
 		d.warmupStarts.Store(path, time.Now())
 		logf.Printf("[DiskWarmup] STARTING %s at offset %d", filepath.Base(path), off)
 		if OnWarmupStateChange != nil {
@@ -594,11 +680,12 @@ func (d *DiskWarmupCache) GetAvailableRange(hash string, fileID int) int64 {
 		return 0
 	}
 
-	if fi.Size() > FileSize+(16*1024*1024) {
+	if fi.Size() > d.headCap()+(16*1024*1024) {
 		logf.Printf("[DiskWarmup] CORRUPT CACHE detected (Size: %.1fMB > 128MB) for %s. Removing.", float64(fi.Size())/(1<<20), hash[:8])
 		d.closeHandle(path)
 		d.sizeCache.Delete(path)
 		os.Remove(path)
+		d.indexRemove(path)
 		d.missing.Store(path, time.Now())
 		return 0
 	}
@@ -649,7 +736,7 @@ func (d *DiskWarmupCache) headSize(path string) int64 {
 }
 
 func (d *DiskWarmupCache) ReadAt(hash string, fileID int, buf []byte, off int64) (int, error) {
-	if off > FileSize {
+	if off > d.headCap() {
 		return 0, nil
 	}
 	path := d.filePath(hash, fileID)
@@ -711,16 +798,17 @@ func (d *DiskWarmupCache) WriteTail(hash string, fileID int, data []byte, absolu
 		d.mu.Lock()
 		d.enforceQuotaLocked(tailLen)
 		d.mu.Unlock()
-		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
+		// O_EXCL: a concurrent first write that lost the race must not truncate the winner's bytes.
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			library.ApplyOwner(path)
+			atomic.AddInt64(&d.totalSize, tailLen)
+			d.storeNewHandle(path, f)
+			logf.Printf("[DiskWarmup] TAIL STARTING %s at relOffset %d", filepath.Base(path), relOffset)
+		} else if !os.IsExist(err) {
 			return
 		}
-		library.ApplyOwner(path)
-		atomic.AddInt64(&d.totalSize, tailLen)
-		tailCh := &cachedHandle{f: f}
-		tailCh.lastUsedNano.Store(time.Now().UnixNano())
-		d.handles.Store(path, tailCh)
-		logf.Printf("[DiskWarmup] TAIL STARTING %s at relOffset %d", filepath.Base(path), relOffset)
+
 	}
 
 	ch, err := d.getHandle(path)
@@ -787,6 +875,10 @@ func (d *DiskWarmupCache) RemoveHash(hash string) {
 	prefix := hash + "-"
 	for _, e := range entries {
 		name := e.Name()
+		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, midSuffix) {
+			d.removeMid(filepath.Join(d.dir, name))
+			continue
+		}
 		if strings.HasPrefix(name, prefix) && (strings.HasSuffix(name, warmupSuffix) || strings.HasSuffix(name, tailSuffix)) {
 			fullPath := filepath.Join(d.dir, name)
 
@@ -799,19 +891,26 @@ func (d *DiskWarmupCache) RemoveHash(hash string) {
 			d.touched.Delete(fullPath)
 			d.removeTail(fullPath)
 			os.Remove(fullPath)
+			d.indexRemove(fullPath)
 		}
 	}
 }
 
-func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
-	quota := warmupQuota
-	if diskQuotaGB > 0 {
-		quota = diskQuotaGB * 1024 * 1024 * 1024
-	}
+// enforceQuotaLocked frees room for needed bytes: mid files first, oldest first, then heads and
+// tails by mtime.
+func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) { d.evictLocked(needed, false) }
+
+// roomForMidLocked frees room for a mid piece from other mids only: pieces kept for friends never
+// push out the library's heads and tails. False when the mids cannot make enough room.
+func (d *DiskWarmupCache) roomForMidLocked(needed int64) bool { return d.evictLocked(needed, true) }
+
+// evictLocked frees room for needed bytes, mids first (only mids if onlyMids); true if it did.
+func (d *DiskWarmupCache) evictLocked(needed int64, onlyMids bool) bool {
+	quota := d.quota()
 
 	totalSize := atomic.LoadInt64(&d.totalSize)
 	if totalSize+needed <= quota {
-		return
+		return true
 	}
 
 	entries, _ := os.ReadDir(d.dir)
@@ -820,10 +919,22 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 		size    int64
 		modTime int64
 	}
-	var files []wFile
+	var files, mids []wFile
 	var diskTotal int64
 	for _, e := range entries {
 		name := e.Name()
+		if strings.HasSuffix(name, midSuffix) {
+			path := filepath.Join(d.dir, name)
+			if info, err := e.Info(); err == nil {
+				var n int64 // a sparse file: its coverage, not its apparent size
+				if v, ok := d.mids.Load(path); ok {
+					n = v.(*midFile).cov.size()
+				}
+				mids = append(mids, wFile{path, n, info.ModTime().UnixNano()})
+				diskTotal += n
+			}
+			continue
+		}
 		if !strings.HasSuffix(name, warmupSuffix) && !strings.HasSuffix(name, tailSuffix) {
 			continue
 		}
@@ -835,9 +946,25 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 
 	atomic.StoreInt64(&d.totalSize, diskTotal)
 	if diskTotal+needed <= quota {
-		return
+		return true
 	}
 
+	sort.Slice(mids, func(i, j int) bool { return mids[i].modTime < mids[j].modTime })
+	for _, fi := range mids {
+		if diskTotal+needed <= quota {
+			break
+		}
+		if _, ok := d.midWriting.Load(fi.path); ok {
+			continue
+		}
+		if d.evictMid(fi.path) {
+			diskTotal -= fi.size
+		}
+	}
+	if onlyMids {
+		atomic.StoreInt64(&d.totalSize, diskTotal)
+		return diskTotal+needed <= quota
+	}
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime < files[j].modTime })
 	for _, fi := range files {
 		if diskTotal+needed <= quota {
@@ -852,9 +979,11 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 		d.sizeCache.Delete(fi.path)
 		d.removeTail(fi.path)
 		os.Remove(fi.path)
+		d.indexRemove(fi.path)
 		diskTotal -= fi.size
 	}
 	atomic.StoreInt64(&d.totalSize, diskTotal)
+	return diskTotal+needed <= quota
 }
 
 // Fetch fetches bytes from the torrent for the tail fill and HeadGate. Wired at startup to

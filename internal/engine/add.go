@@ -58,7 +58,13 @@ func (e *Engine) addSpec(spec bt.Spec, meta Meta) (*Torrent, error) {
 		}
 		spec.Trackers = mergeStoredTiers(spec.Trackers, stored.Trackers)
 	}
-	spec.Trackers = applyRetrackers(cfg.RetrackersMode, spec.Trackers, e.trackers(), readTrackersFile(e.deps.StateDir))
+	extra := readTrackersFile(e.deps.StateDir)
+	if bt.InfoPrivate(spec.InfoBytes) {
+		// A private torrent announces only to its own trackers (BEP 27), whatever the mode.
+		spec.Trackers = withoutTrackers(spec.Trackers, e.trackers(), BuiltinTrackers, extra)
+	} else {
+		spec.Trackers = applyRetrackers(cfg.RetrackersMode, spec.Trackers, e.trackers(), extra)
+	}
 
 	e.addMu.Lock()
 	defer e.addMu.Unlock()
@@ -66,8 +72,9 @@ func (e *Engine) addSpec(spec bt.Spec, meta Meta) (*Torrent, error) {
 	if c == nil {
 		return nil, ErrNotConnected
 	}
+	e.dropServed(spec.InfoHash) // hydration takes over from a friends-only torrent
 	if t := e.lookup(spec.InfoHash); t != nil {
-		if _, _, err := c.Add(spec, nil); err != nil {
+		if _, _, err := addHydrating(c, spec, func() (*bt.Torrent, bool, error) { return c.Add(spec, nil) }); err != nil {
 			return nil, err
 		}
 		t.extend(min(cfg.timeout(), 60*time.Second))
@@ -84,7 +91,7 @@ func (e *Engine) addSpec(spec bt.Spec, meta Meta) (*Torrent, error) {
 		cands = append(cands, Meta{Title: row.Title, Category: row.Category, Poster: row.Poster, Data: row.Data})
 	}
 	t.fillMeta(cands...)
-	lt, _, err := c.Add(spec, t.setStore)
+	lt, _, err := addHydrating(c, spec, func() (*bt.Torrent, bool, error) { return c.Add(spec, t.setStore) })
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +104,9 @@ func (e *Engine) addSpec(spec bt.Spec, meta Meta) (*Torrent, error) {
 	}
 	e.torrents[t.hash] = t
 	e.mu.Unlock()
+	if e.friends != nil {
+		e.friendsColdIntentTake(t)
+	}
 	go e.watchInfo(t, spec.DisplayName)
 	return t, nil
 }
@@ -130,8 +140,17 @@ func (e *Engine) watchInfo(t *Torrent, displayName string) {
 		return // closed meanwhile
 	}
 	close(t.working)
+	if e.friendsWanted(t.hash) { // played before the info, or hydrated again during a playback
+		e.goFriends(func() { e.dialFriends(t, dialPlay) })
+	}
+	if t.friendsCold.Load() { // opened cold before the info
+		e.friendsColdDial(t)
+	}
 	t.extend(e.config().timeout())
 	t.mu.Lock()
+	if t.bt.Private() { // a magnet learns it only now: the saved row keeps no public tracker
+		t.tiers = withoutTrackers(t.tiers, e.trackers(), BuiltinTrackers, readTrackersFile(e.deps.StateDir))
+	}
 	stored := t.stored
 	t.mu.Unlock()
 	if !stored {

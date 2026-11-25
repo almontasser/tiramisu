@@ -32,7 +32,7 @@ The FUSE mount is a projection of engine state, not an administrable directory. 
 
 ## House rules
 
-- **Architecture.** New Go files go into an existing package under `internal/`. The repository root is reserved for `main.go`, `version.go` and the legacy files still coupled to `main`; it is not a valid place for new code. Do not introduce new global state: the existing state stays in `main.go` until it is extracted; internal packages export constructors and types, never singletons.
+- **Architecture.** New Go code goes into the package under `internal/` it belongs to. The repository root holds only `main.go`, which calls `app.Run`, and `version.go`. `internal/app` is wiring only (startup, routes, connecting packages) and must not grow: a new feature gets its own package, and code leaving `internal/app` for a package of its own is welcome. Do not introduce new global state: the existing state stays in `internal/app` until it is extracted; internal packages export constructors and types, never singletons.
 - **Root cause, in Go.** Fixes belong in the Go code path. The embedded HTML/JS is a thin layer; a frontend patch over a backend defect will be rejected.
 - **Performance budget.** Raspberry Pi 4 is the baseline. Memory ceilings, read-ahead budget and startup time are part of the contract. Changes to hot paths need measurements: before/after, with the workload and the hardware named.
 - **Dependencies.** Do not add a module without discussing it in an issue first. The anacrolix/torrent fork is vendored and patched in-tree: changes to it are accepted like any other code, while sending patches upstream to anacrolix remains a deliberate maintainer decision, not a side effect of a PR.
@@ -49,7 +49,7 @@ Features removed from the codebase stay removed unless a maintainer asked for th
 Every PR premise is verified against the actual repository code, not only against the file it modifies. Reviewers will check defaults for behavioral impact, test coverage on semantic changes, and alignment with the project's philosophy.
 
 - **Reproduce before you fix.** State the observed behavior, the expected behavior, and how you reproduced both.
-- **Go tests are part of the change.** Behavioral changes and bug fixes come with `*_test.go` coverage: a test that fails without the patch and passes with it. PRs without tests will be asked to add them.
+- **Go tests are part of the change.** Behavioral changes and bug fixes come with `*_test.go` coverage: a test that fails without the patch and passes with it. PRs without tests will be asked to add them. The tests of the infrastructure packages (`internal/config`, `auth`, `webtls`, `blocklist`, `webhook`, `autoremove`, `racache`) are in the repository and run in CI; the engine and streaming tests are kept private and run before every merge.
 - **Numbers, not adjectives.** "Faster", "cleaner", "more robust" are not evidence. Show before/after measurements.
 - **One concern per PR.** A coherent thesis, not a bundle of isolated patches. If two changes cannot be justified together, split them.
 - **LLM-assisted contributions are welcome with evidence per premise.** A plausible patch generated without repository context will be asked for verification or closed. Attach what you ran, what you measured, and what you ruled out.

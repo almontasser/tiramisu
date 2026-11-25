@@ -226,6 +226,13 @@ func (p *Peer) getDesiredRequestState() (desired desiredRequestState) {
 	if t.dataDownloadDisallowed.Bool() {
 		return
 	}
+	if p.friend && len(t.noRequestFrom) != 0 {
+		if pc, ok := p.TryAsPeerConn(); ok {
+			if _, skip := t.noRequestFrom[pc.PeerID]; skip {
+				return
+			}
+		}
+	}
 	input := t.getRequestStrategyInput()
 	requestHeap := desiredPeerRequests{
 		peer:           p,
@@ -422,8 +429,8 @@ func (p *Peer) applyRequestState(next desiredRequestState) {
 		if existing != nil && existing != p {
 			diff := int64(current.Requests.GetCardinality()) + 1 - (int64(existing.uncancelledRequests()) - 1)
 			urgent := requestIsUrgent(t.pieceDeadlines[t.pieceIndexOfRequestIndex(req)], now)
-			if !stealPermitted(p.needRequestUpdate, diff, p.lastUsefulChunkReceived, existing.lastUsefulChunkReceived,
-				peerStalled(existing.lastUsefulChunkReceived, existing.lastStartedExpectingToReceiveChunks, now),
+			if !stealPermitted(p.needRequestUpdate, diff, p.lastUsefulChunkReceived, existing.lastUsefulChunkReceived, p.friend,
+				holderStalled(existing, p, int64(t.chunkSize), now),
 				func() bool { return t.stealRequestGraceElapsed(req, existing, urgent) }) {
 				continue
 			}

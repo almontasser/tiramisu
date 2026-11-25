@@ -46,6 +46,8 @@ type (
 		cryptoMethod    mse.CryptoMethod
 		Discovery       PeerSource
 		trusted         bool
+		friend          bool // Proven friend: set under the client lock when the tm_fp proof checks out.
+		friendInviter   bool // We are the inviter side of the friend pair.
 		closed          chansync.SetOnce
 		// Cancelled when the Peer is closed. Derived from the Torrent's closedCtx. Lets blocked
 		// storage reads and reservation waits abort on peer close (backported from anacrolix/torrent
@@ -108,6 +110,8 @@ type (
 		// and implementation differences, we may receive chunks that are no longer in the set of
 		// requests actually want. This could use a roaring.BSI if the memory use becomes noticeable.
 		validReceiveChunks map[RequestIndex]int
+		// hedgesPending are hedge duplicates sent to this peer and not yet answered. Client lock.
+		hedgesPending map[RequestIndex]struct{}
 		// Indexed by metadata piece, set to true if posted and pending a
 		// response.
 		metadataRequests []bool
@@ -664,6 +668,10 @@ func (c *Peer) remoteRejectedRequest(r RequestIndex) bool {
 	// The update after a refusal must not add requests to this peer; after the ack of our own
 	// cancel (a steal, a seek) it must.
 	reason := "Peer.remoteRejectedRequest"
+	if _, ok := c.hedgesPending[r]; ok { // a refused hedge did not help
+		delete(c.hedgesPending, r)
+		c.t.recordHedgeOutcome(false)
+	}
 	if c.deleteRequest(r) {
 		c.decPeakRequests()
 		// Only a request the peer held counts as a drop: a Reject that acknowledges our own
@@ -801,6 +809,10 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 
 	cl := t.cl
 
+	if _, ok := c.hedgesPending[req]; ok {
+		delete(c.hedgesPending, req)
+		t.recordHedgeOutcome(!t.haveChunk(ppReq))
+	}
 	// Do we actually want this chunk?
 	if t.haveChunk(ppReq) {
 		// panic(fmt.Sprintf("%+v", ppReq))

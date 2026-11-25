@@ -357,9 +357,21 @@ func WriteStubData(path string, data []byte) error {
 	if old, err := os.ReadFile(path); err == nil && bytes.Equal(old, data) {
 		return nil
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp") // one per writer
+	if err != nil {
 		return err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(tmp, 0644)
+	}
+	if werr != nil {
+		os.Remove(tmp)
+		return werr
 	}
 	chownPath(tmp)
 	if err := os.Rename(tmp, path); err != nil {
@@ -367,6 +379,7 @@ func WriteStubData(path string, data []byte) error {
 		return err
 	}
 	StubChanged(path)
+	notifyStub(path)
 	return nil
 }
 

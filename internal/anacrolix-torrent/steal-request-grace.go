@@ -97,7 +97,7 @@ func (t *Torrent) stealRequestGraceElapsed(req RequestIndex, holder *Peer, urgen
 // stealPermitted decides whether a peer may take a request another peer holds. diff is the
 // stealer's queue depth after the steal minus the holder's after losing it. Backported from
 // upstream 41fc76adf and 23d8abf90.
-func stealPermitted(reason string, diff int64, stealerLast, holderLast time.Time, holderStalled bool, graceElapsed func() bool) bool {
+func stealPermitted(reason string, diff int64, stealerLast, holderLast time.Time, stealerFriend, holderStalled bool, graceElapsed func() bool) bool {
 	// An update caused by a cancel comes from a steal: stealing back would ping-pong the request.
 	if reason == "Peer.cancel" {
 		return false
@@ -109,8 +109,8 @@ func stealPermitted(reason string, diff int64, stealerLast, holderLast time.Time
 		return graceElapsed()
 	}
 	// Don't steal from the poor: only for one more request than the holder keeps, and on a tie
-	// only if the stealer received a useful chunk more recently.
-	if diff > 1 || (diff == 1 && !stealerLast.After(holderLast)) {
+	// only if the stealer received a useful chunk more recently or is a friend.
+	if diff > 1 || (diff == 1 && !stealerFriend && !stealerLast.After(holderLast)) {
 		return false
 	}
 	return graceElapsed()
@@ -119,6 +119,34 @@ func stealPermitted(reason string, diff int64, stealerLast, holderLast time.Time
 // holderStallAfter is how long a peer may hold requests without delivering a useful chunk before
 // its requests may be stolen whatever the queue sizes.
 const holderStallAfter = 2 * time.Second
+
+// holderStalled reports whether holder's requests may be taken whatever the queue sizes: it has
+// delivered nothing for holderStallAfter, or for longer than both the stealer would take to serve
+// one more chunk and its own mean latency (a silent peer at the read head costs that much, not 2s).
+func holderStalled(holder, stealer *Peer, chunk int64, now time.Time) bool {
+	expecting := holder.lastStartedExpectingToReceiveChunks
+	if peerStalled(holder.lastUsefulChunkReceived, expecting, now) {
+		return true
+	}
+	if expecting.IsZero() {
+		return false
+	}
+	wait, ok := hedgeEta(stealer, chunk)
+	if !ok {
+		// Rates are sampled after a while: before that, the stealer's own request latency.
+		if wait, ok = stealer.meanLatency(); !ok {
+			return false
+		}
+	}
+	if d, ok := holder.meanLatency(); ok && d > wait {
+		wait = d
+	}
+	last := holder.lastUsefulChunkReceived
+	if expecting.After(last) {
+		last = expecting
+	}
+	return now.Sub(last) > wait
+}
 
 // peerStalled reports a peer expecting chunks that has delivered none for holderStallAfter.
 func peerStalled(lastUseful, expectingSince, now time.Time) bool {

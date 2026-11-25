@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,7 @@ type JobState struct {
 	Running    bool      `json:"running"`
 	LastError  string    `json:"last_error,omitempty"`
 	LastStatus string    `json:"last_status,omitempty"`
+	HeldBy     string    `json:"held_by,omitempty"` // the library master holding the job; never stored
 }
 
 // Syncer is the interface all sync engines must implement.
@@ -51,7 +53,32 @@ type Scheduler struct {
 	state   *StateStore
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+	after   atomic.Pointer[func(name string)]
+	hold    atomic.Pointer[func() string]
+	ended   chan struct{} // closed and replaced when a job ends (guarded by mu)
 }
+
+// jobEnded wakes whoever waits for jobs to stop.
+func (s *Scheduler) jobEnded() {
+	s.mu.Lock()
+	if s.ended != nil {
+		close(s.ended)
+	}
+	s.ended = make(chan struct{})
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) endedCh() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended == nil {
+		s.ended = make(chan struct{})
+	}
+	return s.ended
+}
+
+// SetAfterJob runs f after every job, whatever its outcome.
+func (s *Scheduler) SetAfterJob(f func(name string)) { s.after.Store(&f) }
 
 // SchedulerConfig mirrors the config.go struct to avoid import cycles.
 type SchedulerConfig struct {
@@ -132,6 +159,9 @@ func (s *Scheduler) TriggerRun(name string) error {
 	if !ok {
 		return fmt.Errorf("unknown job: %s", name)
 	}
+	if s.heldBy(name) != "" {
+		return ErrHeld
+	}
 
 	jt := s.state.Tracker(name)
 	s.mu.Lock()
@@ -168,7 +198,12 @@ func (s *Scheduler) StopJob(name string) error {
 
 // Status returns a snapshot of all job states.
 func (s *Scheduler) Status() map[string]JobState {
-	return s.state.Status()
+	st := s.state.Status()
+	for name, js := range st {
+		js.HeldBy = s.heldBy(name)
+		st[name] = js
+	}
+	return st
 }
 
 // conflicting returns a running job that name must not overlap, or "". The
@@ -198,7 +233,7 @@ func (s *Scheduler) tick() {
 
 		for _, name := range names {
 			jt := s.state.Tracker(name)
-			if !shouldRun(cfg, name, jt.Snapshot()) {
+			if s.heldBy(name) != "" || !shouldRun(cfg, name, jt.Snapshot()) {
 				continue
 			}
 
@@ -332,12 +367,26 @@ func (s *Scheduler) runJob(ctx context.Context, cancel context.CancelFunc, synce
 			if !released {
 				s.forget(name)
 				jt.SetRunning(false)
+				s.jobEnded()
 			}
 			jt.SetStatus("failed", fmt.Sprintf("panic: %v", r))
 			s.state.Save()
 		}
 	}()
 
+	// Checked again here, after the cancel is registered: a hold that came since the first check
+	// found no job to stop.
+	if master := s.heldBy(name); master != "" {
+		s.forget(name)
+		jt.SetRunning(false)
+		released = true
+		jt.SetStatus("held", "")
+		s.state.Save()
+		cancel()
+		s.jobEnded()
+		log.Printf("[Scheduler] %s held by the library master %s", name, master)
+		return
+	}
 	s.state.Save()
 	log.Printf("[Scheduler] %s started", name)
 	defer cancel()
@@ -348,9 +397,13 @@ func (s *Scheduler) runJob(ctx context.Context, cancel context.CancelFunc, synce
 	s.forget(name)
 	jt.SetRunning(false)
 	released = true
+	defer s.jobEnded()
 	if err != nil && ctx.Err() == nil {
 		log.Printf("[Scheduler] %s failed: %v", name, err)
 		jt.SetStatus("failed", err.Error())
+	} else if master := s.heldBy(name); ctx.Err() != nil && master != "" {
+		log.Printf("[Scheduler] %s stopped: held by the library master %s", name, master)
+		jt.SetStatus("held", "")
 	} else if ctx.Err() != nil {
 		log.Printf("[Scheduler] %s stopped by user", name)
 		jt.SetStatus("stopped", "")
@@ -360,6 +413,9 @@ func (s *Scheduler) runJob(ctx context.Context, cancel context.CancelFunc, synce
 	}
 
 	s.state.Save()
+	if f := s.after.Load(); f != nil {
+		(*f)(name)
+	}
 }
 
 // updateNextRuns recomputes every job's NextRun except the blocked ones: those
