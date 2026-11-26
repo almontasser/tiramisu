@@ -39,6 +39,10 @@ type PeerConn struct {
 	// be wrapping WebRTC, uTP, or TCP etc. Used in writing the conn status for peers.
 	connString string
 
+	// unchokeKey is the client family and role this connection is filed under by
+	// unchoke-deadline.go, fixed on first use so its waits stay under one key.
+	unchokeKey string
+
 	// See BEP 3 etc.
 	PeerID             PeerID
 	PeerExtensionBytes pp.PeerExtensionBits
@@ -199,6 +203,9 @@ func (cn *PeerConn) utp() bool {
 }
 
 func (cn *PeerConn) onClose() {
+	if peerClosedHook != nil {
+		peerClosedHook(cn, time.Now())
+	}
 	if cn.uploadTimer != nil {
 		cn.uploadTimer.Stop()
 	}
@@ -867,6 +874,9 @@ func (c *PeerConn) mainReadLoop() (err error) {
 				break
 			}
 			c.peerChoking = false
+			if peerUnchokedHook != nil {
+				peerUnchokedHook(c, time.Now())
+			}
 			preservedCount := 0
 			c.requestState.Requests.Iterate(func(x RequestIndex) bool {
 				if !c.peerAllowedFast.Contains(c.t.pieceIndexOfRequestIndex(x)) {
